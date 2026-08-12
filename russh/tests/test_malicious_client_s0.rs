@@ -669,3 +669,75 @@ async fn s1_auth_success_idle_survives_handshake_deadline() -> Result<(), anyhow
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. S2a: healthy continuous-read client keeps growing across HWM (P0-2)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Silent but continuously reading client; server floods. Byte counter must keep
+// rising well past OUTBOUND_HIGH_WATERMARK (128 KiB) for several seconds — proves
+// Writer drain wakes Session ship/intake (no permanent HWM stall).
+
+#[cfg(feature = "_test_hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2a_healthy_continuous_read_grows_past_hwm() -> Result<(), anyhow::Error> {
+    let _ = env_logger::builder().is_test(false).try_init();
+
+    // Large peer window so the stall cannot be "legal window=0".
+    let down_window = 8 * 1024 * 1024u32;
+    let pkt = 32 * 1024u32;
+    let hwm = 128 * 1024u64;
+
+    let progress = Progress::new();
+    let addr = free_addr();
+    let server = FloodServer::new(
+        progress.clone(),
+        FloodServerConfig {
+            window_size: down_window,
+            maximum_packet_size: pkt,
+            rekey_write_limit: usize::MAX / 4,
+            first_channel_mode: ServerMode::FloodForever,
+            write_progress_deadline: Duration::from_secs(30),
+            write_min_drain: None,
+            rekey_deadline: Duration::from_secs(30),
+            ..FloodServerConfig::default()
+        },
+    );
+    let _srv = server.spawn(addr);
+    wait_listening(addr).await;
+
+    let mut client_cfg = default_client_config();
+    client_cfg.window_size = down_window;
+    client_cfg.maximum_packet_size = pkt;
+    let (session, _ctrl) = connect_faulty(addr, client_cfg, progress.clone()).await?;
+    let channel = session.channel_open_session().await?;
+    let _drainer = spawn_channel_drainer(channel);
+
+    // Cross HWM at least once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while progress.total() < hwm * 2 {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        progress.total() >= hwm * 2,
+        "must cross 2×HWM under healthy continuous read; got {}",
+        progress.total()
+    );
+
+    // Then keep growing for several samples (not a one-shot burst then stall).
+    let mut last = progress.total();
+    for i in 0..6 {
+        sleep(Duration::from_millis(200)).await;
+        let now = progress.total();
+        eprintln!("s2a hwm-growth sample{i}: {last} → {now}");
+        assert!(
+            progress.session_alive() && now > last,
+            "bytes must keep growing after crossing HWM (sample {i}: {last} → {now})"
+        );
+        last = now;
+    }
+    Ok(())
+}

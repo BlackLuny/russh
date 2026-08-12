@@ -74,7 +74,8 @@ impl DisconnectCauseSlot {
     }
 }
 
-/// Single-structure write-progress snapshot (§4.2). Updated with one release store.
+/// Single-structure write-progress snapshot (§4.2).
+/// Always read/written as a whole — never field-by-field across tasks.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteProgress {
     pub generation: u64,
@@ -91,6 +92,71 @@ impl WriteProgress {
             last_write_ok_ms: 0,
             wire_eligible_bytes: 0,
             drained_bytes_epoch: 0,
+        }
+    }
+}
+
+/// Cross-task atomic snapshot of [`WriteProgress`] (§4.2).
+///
+/// Writer stores with a single mutex replace (release); supervisor/session
+/// loads a full copy under the same mutex (acquire). No torn field reads.
+#[derive(Debug)]
+pub struct AtomicWriteProgress {
+    inner: std::sync::Mutex<WriteProgress>,
+    base: Instant,
+}
+
+impl AtomicWriteProgress {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(WriteProgress::new()),
+            base: Instant::now(),
+        })
+    }
+
+    /// Acquire-load of the full snapshot.
+    pub fn load(&self) -> WriteProgress {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Release-store of the full snapshot (replaces all fields atomically).
+    pub fn store(&self, snap: WriteProgress) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = snap;
+    }
+
+    /// Writer helper: record `Ok(n>0)` socket progress.
+    /// Also decrements `wire_eligible_bytes` so cross-task HWM observers see
+    /// drain during a long `drain_writes` (not only at the next loop store).
+    pub fn note_write(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.generation = g.generation.wrapping_add(1);
+        g.last_write_ok_ms = self.base.elapsed().as_millis() as u64;
+        g.drained_bytes_epoch = g.drained_bytes_epoch.saturating_add(n as u64);
+        g.wire_eligible_bytes = g.wire_eligible_bytes.saturating_sub(n as u64);
+    }
+
+    /// Writer helper: publish current wire-eligible byte count.
+    pub fn store_eligible(&self, wire_eligible_bytes: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.wire_eligible_bytes = wire_eligible_bytes;
+        g.generation = g.generation.wrapping_add(1);
+    }
+}
+
+impl Default for AtomicWriteProgress {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(WriteProgress::new()),
+            base: Instant::now(),
         }
     }
 }
@@ -281,6 +347,17 @@ mod tests {
         let cause =
             wd.poll_timeout(Duration::from_millis(10), Some((1, Duration::from_millis(10))));
         assert_eq!(cause, None);
+    }
+
+    #[test]
+    fn atomic_write_progress_no_tear() {
+        let p = AtomicWriteProgress::new();
+        p.store_eligible(100);
+        p.note_write(50);
+        let snap = p.load();
+        assert_eq!(snap.wire_eligible_bytes, 50);
+        assert_eq!(snap.drained_bytes_epoch, 50);
+        assert!(snap.generation >= 2);
     }
 }
 

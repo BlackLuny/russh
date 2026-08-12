@@ -559,6 +559,8 @@ mod tests {
             rekey_gen: 0,
             rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
             handshake_deadline_at: None,
+            writer: None,
+            pending_supervisor_cause: None,
         }
     }
 

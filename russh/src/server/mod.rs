@@ -61,7 +61,11 @@ mod session;
 pub use self::session::*;
 mod encrypted;
 pub mod supervisor;
-pub use self::supervisor::{DisconnectCause, DisconnectCauseSlot, WriteProgress};
+pub mod writer;
+pub use self::supervisor::{
+    AtomicWriteProgress, DisconnectCause, DisconnectCauseSlot, WriteProgress,
+};
+pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
 /// Configuration of a server.
 pub struct Config {
@@ -1160,6 +1164,8 @@ where
         rekey_gen: 0,
         rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
         handshake_deadline_at: Some(handshake_deadline_at),
+        writer: None,
+        pending_supervisor_cause: None,
     };
 
     session.begin_rekey()?;
@@ -1251,6 +1257,7 @@ async fn reply<H: Handler + Send>(
 
                     if session.common.encrypted.is_some() {
                         // This is a rekey
+                        let outbound_gen = session.rekey_gen;
                         {
                             let common = &mut session.common;
                             common.newkeys(newkeys);
@@ -1261,13 +1268,63 @@ async fn reply<H: Handler + Send>(
                             }
                         }
 
-                        let mut pending = std::mem::take(&mut session.pending_reads);
-                        for p in pending.drain(..) {
-                            session.process_packet(handler, &p).await?;
+                        // S2a: outbound InstallAck — try_push + deadline-bounded wait (r2 P1).
+                        // On failure: stage first-cause and skip success tail; run() records
+                        // cause and walks unified Cancelling (no early-return past record_cause).
+                        let mut install_ok = true;
+                        if let Some(ref w) = session.writer {
+                            match w.try_install_outbound_epoch(outbound_gen) {
+                                Err(_) => {
+                                    debug!("try_install_outbound_epoch full/closed");
+                                    session.pending_supervisor_cause =
+                                        Some(crate::server::DisconnectCause::PeerError);
+                                    install_ok = false;
+                                }
+                                Ok(ack_rx) => match session.rekey_deadline.remaining() {
+                                    None => {
+                                        // Fail closed: never unbounded-wait ACK.
+                                        debug!("install_outbound: missing rekey deadline");
+                                        session.pending_supervisor_cause =
+                                            Some(crate::server::DisconnectCause::PeerError);
+                                        install_ok = false;
+                                    }
+                                    Some(rem) => {
+                                        let wait = async {
+                                            match ack_rx.await {
+                                                Ok(Ok(())) => Ok(()),
+                                                Ok(Err(_)) | Err(_) => Err(()),
+                                            }
+                                        };
+                                        match tokio::time::timeout(rem, wait).await {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(())) => {
+                                                session.pending_supervisor_cause = Some(
+                                                    crate::server::DisconnectCause::PeerError,
+                                                );
+                                                install_ok = false;
+                                            }
+                                            Err(_elapsed) => {
+                                                session.pending_supervisor_cause = Some(
+                                                    crate::server::DisconnectCause::RekeyTimeout,
+                                                );
+                                                install_ok = false;
+                                            }
+                                        }
+                                    }
+                                },
+                            }
                         }
-                        session.pending_reads = pending;
-                        session.pending_len = 0;
-                        session.flush()?;
+
+                        if install_ok {
+                            let mut pending = std::mem::take(&mut session.pending_reads);
+                            for p in pending.drain(..) {
+                                session.process_packet(handler, &p).await?;
+                            }
+                            session.pending_reads = pending;
+                            session.pending_len = 0;
+                            session.flush()?;
+                            session.ship_sealed_to_writer().await?;
+                        }
                     } else {
                         // This is the initial kex
 
@@ -1283,7 +1340,7 @@ async fn reply<H: Handler + Send>(
                     }
 
                     session.kex = SessionKexState::Idle;
-                    // S1: rekey completed — unregister deadline (gen-checked).
+                    // S1/S2a: rekey completed (outbound ACK done) — unregister deadline.
                     session.clear_rekey_deadline();
 
                     if session.common.strict_kex {

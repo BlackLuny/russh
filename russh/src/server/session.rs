@@ -7,7 +7,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use kex::ServerKex;
 use log::debug;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 
@@ -18,7 +18,10 @@ use crate::kex::{EXTENSION_SUPPORT_AS_CLIENT, KexCause, SessionKexState};
 use crate::pending_inbound::{
     self, BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
 };
-use crate::server::supervisor::{DisconnectCause, RekeyDeadline, WriteWatchdog};
+use crate::server::supervisor::{
+    AtomicWriteProgress, DisconnectCause, RekeyDeadline, WriteWatchdog,
+};
+use crate::server::writer::{spawn_writer, stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
 use crate::{ChannelOpenFailure, map_err, msg};
 
@@ -59,6 +62,11 @@ pub struct Session {
     /// Absolute handshake deadline (banner → initial kex → auth). Set in `run_stream`
     /// and never restarted mid-handshake.
     pub(crate) handshake_deadline_at: Option<tokio::time::Instant>,
+    /// S2a: handle to the independent WriterTask (None until stream is split).
+    pub(crate) writer: Option<WriterHandle>,
+    /// Supervisor first-cause staged from `reply()` (InstallAck fail etc.) so the
+    /// main loop can `record_cause` and take the unified Cancelling path (r2 P1).
+    pub(crate) pending_supervisor_cause: Option<DisconnectCause>,
 }
 
 #[derive(Debug)]
@@ -1020,7 +1028,7 @@ impl Session {
             }
         }
 
-        let (stream_read, mut stream_write) = stream.split();
+        let (stream_read, stream_write) = stream.split();
         let buffer = SSHBuffer::new();
 
         // Allow handing out references to the cipher
@@ -1044,14 +1052,45 @@ impl Session {
         // queued inbound item without the loop ever blocking on a single channel's slow consumer.
         let mut inbound_reserves: FuturesUnordered<BoxReserve> = FuturesUnordered::new();
 
-        // ── S1 ConnSupervisor state (in-loop; no separate task yet) ──────────
+        // ── S2a: spawn WriterTask (owns socket write half) ───────────────────
+        let write_progress = AtomicWriteProgress::new();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (writer_handle, writer_join_raw, mut writer_events) =
+            spawn_writer(stream_write, write_progress.clone(), cancel_rx);
+        let capacity_notify = writer_handle.capacity_notify();
+        self.writer = Some(writer_handle.clone());
+        let mut last_progress_snap = write_progress.load();
+        let writer_abort = writer_join_raw.abort_handle();
+        let mut writer_join = Some(writer_join_raw);
+
+        // Drop guard stays armed until production stop_writer_task finishes (r2).
+        // Early `?` / return Err still cancel+abort; normal path disarms only after join.
+        struct WriterTeardownGuard {
+            abort: tokio::task::AbortHandle,
+            cancel_tx: tokio::sync::watch::Sender<bool>,
+            armed: bool,
+        }
+        impl Drop for WriterTeardownGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = self.cancel_tx.send(true);
+                    self.abort.abort();
+                }
+            }
+        }
+        let mut writer_guard = WriterTeardownGuard {
+            abort: writer_abort.clone(),
+            cancel_tx: cancel_tx.clone(),
+            armed: true,
+        };
+
+        // ── S1 ConnSupervisor state (still in Session loop; inputs from Writer) ─
         let mut write_watchdog = WriteWatchdog::new();
         let mut handshake_done = false;
         let mut supervisor_cause: Option<DisconnectCause> = None;
         let write_progress_deadline = self.common.config.write_progress_deadline;
         let write_min_drain = self.common.config.write_min_drain;
         let teardown_grace = self.common.config.teardown_grace;
-        let mut drained_seen = self.common.packet_writer.drained_total();
         #[cfg(feature = "_test_hooks")]
         let cause_slot = self.common.config.disconnect_cause_slot.clone();
 
@@ -1089,9 +1128,28 @@ impl Session {
                 }
             }
 
-            // S1: map sealed ciphertext to wire_eligible; arm/disarm watchdog.
-            let eligible = self.common.packet_writer.pending_bytes() as u64;
-            write_watchdog.observe_eligible(eligible);
+            // Sealed-but-not-on-socket total: PacketWriter staging + Writer (bulk+out_q).
+            // Single byte-HWM for intake (S1 byte-bound restored; P0-2).
+            let writer_pending = self
+                .writer
+                .as_ref()
+                .map(|w| w.pending_bytes())
+                .unwrap_or(0);
+            let sealed_backlog = self
+                .common
+                .packet_writer
+                .pending_bytes()
+                .saturating_add(writer_pending);
+
+            // Watchdog arms on any sealed ciphertext waiting for the socket.
+            let snap = write_progress.load();
+            write_watchdog.observe_eligible(sealed_backlog as u64);
+            if snap.drained_bytes_epoch > last_progress_snap.drained_bytes_epoch {
+                let delta = (snap.drained_bytes_epoch - last_progress_snap.drained_bytes_epoch)
+                    as usize;
+                write_watchdog.note_write_ok(delta);
+            }
+            last_progress_snap = snap;
             if let Some(cause) = write_watchdog.poll_timeout(write_progress_deadline, write_min_drain)
             {
                 record_cause(cause, &mut supervisor_cause);
@@ -1124,13 +1182,9 @@ impl Session {
             // therefore stalled the whole session's outbound path. Per-channel isolation is
             // enforced by `enforce_outbound_cap` below instead.
             //
-            // The high-watermark gate pairs with the concurrent flush arm in `select!`: bytes
-            // now leave via that arm while the loop keeps reading, so intake of new outbound
-            // work must pause once too much is already buffered, or a slow-draining peer would
-            // grow the write buffer without bound.
+            // Intake HWM on total sealed backlog (PacketWriter + Writer queue).
             let can_receive_outbound = !self.kex.active()
-                && self.common.packet_writer.pending_bytes()
-                    < crate::sshbuffer::OUTBOUND_HIGH_WATERMARK;
+                && sealed_backlog < crate::sshbuffer::OUTBOUND_HIGH_WATERMARK;
             if can_receive_outbound {
                 let mut drained = 0;
                 while drained < MAX_MESSAGES_PER_BATCH {
@@ -1144,6 +1198,11 @@ impl Session {
                 }
                 if drained > 0 {
                     self.flush()?;
+                    if let Err(e) = self.ship_sealed_to_writer().await {
+                        debug!("ship_sealed_to_writer (batch): {e:?}");
+                        record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                        self.common.disconnected = true;
+                    }
                 }
                 // A drained Disconnect sets this; don't block in `select!` after.
                 if self.common.disconnected {
@@ -1178,7 +1237,10 @@ impl Session {
                 r = &mut reading => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
-                        Err(e) => return Err(e.into())
+                        Err(e) => {
+                            // writer_guard Drop will cancel+abort
+                            return Err(e.into());
+                        }
                     };
                     if buffer.buffer.len() < 5 {
                         is_reading = Some((stream_read, buffer, opening_cipher));
@@ -1225,9 +1287,15 @@ impl Session {
                             } else {
                                 reply(&mut self, &mut handler, &mut pkt).await
                             };
-                            match reply_result {
-                                Ok(_) => {}
-                                Err(e) => return Err(e),
+                            // Always consume staged first-cause before handling Err: a later
+                            // fallible flush in reply() must not drop InstallAck/RekeyTimeout.
+                            if let Some(c) = self.pending_supervisor_cause.take() {
+                                record_cause(c, &mut supervisor_cause);
+                                self.common.disconnected = true;
+                            }
+                            if let Err(e) = reply_result {
+                                // writer_guard Drop will cancel+abort on hard errors
+                                return Err(e);
                             }
                             // Register reserve futures for any channels that became backpressured
                             // while handling this packet (their app buffer filled up).
@@ -1259,6 +1327,7 @@ impl Session {
                     self.common.alive_timeouts = self.common.alive_timeouts.saturating_add(1);
                     if self.common.config.keepalive_max != 0 && self.common.alive_timeouts > self.common.config.keepalive_max {
                         debug!("Timeout, client not responding to keepalives");
+                        // writer_guard Drop will cancel+abort
                         return Err(crate::Error::KeepaliveTimeout.into());
                     }
                     sent_keepalive = true;
@@ -1266,13 +1335,35 @@ impl Session {
                 }
                 () = &mut inactivity_timer => {
                     debug!("timeout");
+                    // writer_guard Drop will cancel+abort
                     return Err(crate::Error::InactivityTimeout.into());
                 }
-                // Concurrent outbound flush: cancel-safe via flush_cursor.
-                // Write progress is observed via drained_total delta *after* select!
-                // so partial Ok(n) is never lost when this future is cancelled.
-                r = self.common.packet_writer.flush_into(&mut stream_write), if self.common.packet_writer.has_pending() => {
-                    let _ = map_err!(r)?;
+                // S2a: Writer events (InstallAck, write errors, kex queue full).
+                evt = writer_events.recv() => {
+                    match evt {
+                        Some(WriterEvent::InstallAckOutbound { generation }) => {
+                            debug!("session: got InstallAck Outbound gen={generation}");
+                        }
+                        Some(WriterEvent::KexQueueFull) => {
+                            record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        }
+                        Some(WriterEvent::WriteError(_)) => {
+                            record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        }
+                        None => {
+                            // Writer task ended unexpectedly.
+                            if supervisor_cause.is_none() {
+                                record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            }
+                            self.common.disconnected = true;
+                        }
+                    }
+                }
+                // P0-2: Writer drained → retry ship / reopen intake (do not sleep on stale HWM).
+                () = capacity_notify.notified() => {
+                    // Fall through to flush+ship below.
                 }
                 // See the batch-drain comment above: gating this arm on `has_any_pending_data()`
                 // would let one stalled channel block outbound progress for all of them.
@@ -1290,18 +1381,13 @@ impl Session {
                 }
             }
 
-            // S1 fix: feed watchdog from persistent drained_total so cancel of
-            // flush_into never drops partial write credit.
-            let drained_now = self.common.packet_writer.drained_total();
-            if drained_now > drained_seen {
-                let delta = (drained_now - drained_seen) as usize;
-                write_watchdog.note_write_ok(delta);
-                drained_seen = drained_now;
-            }
-
-            // Stage whatever this iteration produced; the concurrent flush arm above writes it
-            // out next time around without blocking the loop.
+            // Stage plaintext → seal into PacketWriter → ship sealed frames to Writer.
             self.flush()?;
+            if let Err(e) = self.ship_sealed_to_writer().await {
+                debug!("ship_sealed_to_writer: {e:?}");
+                record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                self.common.disconnected = true;
+            }
             self.release_outbound_acks();
 
             if self.common.received_data {
@@ -1339,18 +1425,22 @@ impl Session {
                 "en",
             );
             let _ = self.flush();
+            let _ = self.ship_sealed_to_writer().await;
         }
 
-        // Single non-stacked grace covering flush + shutdown + drain. On expiry,
-        // drop both stream halves immediately (no unbounded shutdown await).
+        // Single absolute grace (S1: no stacked deadlines). Writer stop + read drain
+        // share the same `grace_at`; read drain uses whatever budget remains.
         let grace_at = tokio::time::Instant::now() + teardown_grace;
-        let teardown = async {
-            let _ = self
-                .common
-                .packet_writer
-                .flush_into(&mut stream_write)
-                .await;
-            let _ = stream_write.shutdown().await;
+        stop_writer_task(
+            &cancel_tx,
+            self.writer.as_ref(),
+            &mut writer_join,
+            grace_at,
+        )
+        .await;
+        writer_guard.armed = false;
+
+        let read_drain = async {
             loop {
                 if let Some((stream_read, buffer, opening_cipher)) = is_reading.take() {
                     reading.set(start_reading(stream_read, buffer, opening_cipher));
@@ -1365,8 +1455,7 @@ impl Session {
                 }
             }
         };
-        let _ = tokio::time::timeout_at(grace_at, teardown).await;
-        // Drop stream halves by falling out of scope (cancels any hung IO).
+        let _ = tokio::time::timeout_at(grace_at, read_drain).await;
 
         // Convert supervisor first-cause into a typed Error so callers/tests see it.
         if let Some(cause) = supervisor_cause {
@@ -1382,6 +1471,40 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    /// Seal-side helper: move sealed wire frames from `PacketWriter` to WriterTask.
+    ///
+    /// All sealed ciphertext is submitted on the **ordered** wire path so seqn
+    /// order is preserved. Non-blocking: if the Writer queue is full, bytes are
+    /// restored to `PacketWriter` and retried on the next capacity wake / loop
+    /// iteration (P0-2 Notify). During kex, a full queue is fail-closed.
+    pub(crate) async fn ship_sealed_to_writer(&mut self) -> Result<(), Error> {
+        use crate::server::writer::TrySendWireError;
+        let Some(ref writer) = self.writer else {
+            return Ok(());
+        };
+        if !self.common.packet_writer.has_pending() {
+            return Ok(());
+        }
+        let bytes = self.common.packet_writer.take_pending_wire_bytes();
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        match writer.try_send_wire(bytes) {
+            Ok(()) => Ok(()),
+            Err(TrySendWireError::Full(b)) => {
+                self.common.packet_writer.restore_pending_wire_bytes(b);
+                if self.kex.active() {
+                    // Fail closed during kex: cannot stall forever mid-exchange.
+                    Err(Error::SendError)
+                } else {
+                    // Bulk backpressure — Writer Notify wakes us to retry.
+                    Ok(())
+                }
+            }
+            Err(TrySendWireError::Closed) => Err(Error::SendError),
+        }
     }
 
     /// Get a handle to this session.
@@ -2180,6 +2303,8 @@ mod tests {
             rekey_gen: 0,
             rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
             handshake_deadline_at: None,
+            writer: None,
+            pending_supervisor_cause: None,
         }
     }
 

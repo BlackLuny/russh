@@ -417,6 +417,52 @@ impl PacketWriter {
         self.drained_total
     }
 
+    /// Take all sealed-but-unflushed wire bytes out of the write buffer.
+    ///
+    /// Skips `[0..flush_cursor)` already written to the socket (P2 / S2b safety).
+    /// In S2a Session never mid-`flush_into` when shipping, so cursor is normally 0.
+    /// `debug_assert` only checks the cursor is in-bounds (not that it is zero).
+    pub fn take_pending_wire_bytes(&mut self) -> bytes::Bytes {
+        if self.write_buffer.buffer.is_empty() {
+            return bytes::Bytes::new();
+        }
+        debug_assert!(
+            self.flush_cursor <= self.write_buffer.buffer.len(),
+            "take_pending_wire_bytes: flush_cursor={} len={}",
+            self.flush_cursor,
+            self.write_buffer.buffer.len()
+        );
+        let mut buf = std::mem::take(&mut self.write_buffer.buffer);
+        if self.flush_cursor > 0 {
+            let skip = self.flush_cursor.min(buf.len());
+            buf.drain(..skip);
+        }
+        self.flush_cursor = 0;
+        bytes::Bytes::from(buf)
+    }
+
+    /// Restore sealed wire bytes previously taken by [`take_pending_wire_bytes`]
+    /// when the Writer queue rejected them (try_send full). Prepends so order is
+    /// preserved if anything was sealed after the take (should not happen).
+    pub fn restore_pending_wire_bytes(&mut self, bytes: bytes::Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Restored bytes are unwritten; cursor must stay 0 relative to them.
+        debug_assert_eq!(
+            self.flush_cursor, 0,
+            "restore_pending_wire_bytes with non-zero flush_cursor"
+        );
+        if self.write_buffer.buffer.is_empty() {
+            self.write_buffer.buffer = bytes.to_vec();
+        } else {
+            let mut restored = bytes.to_vec();
+            restored.append(&mut self.write_buffer.buffer);
+            self.write_buffer.buffer = restored;
+        }
+        self.flush_cursor = 0;
+    }
+
     /// Test helper: stage raw bytes into the write buffer (bypasses sealing).
     #[cfg(test)]
     pub(crate) fn test_stage_raw(&mut self, data: &[u8]) {
