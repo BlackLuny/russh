@@ -530,21 +530,12 @@ impl Encrypted {
                     wrote: pending_size,
                 });
             }
-            let (buf, a, from, seq) = channel
-                .pop_data_front()
-                .ok_or(crate::Error::Inconsistent)?;
-            let size = if write.is_empty() {
-                if let Some(ref mut w) = writer {
-                    Self::data_noqueue_direct(w, channel, &buf, a, from)?
-                } else {
-                    Self::data_noqueue(write, channel, &buf, a, from)?
-                }
-            } else {
-                Self::data_noqueue(write, channel, &buf, a, from)?
-            };
+            // S2d: gather consecutive same-stream entries into one packet.
+            // Cap = min(peer_maxpacket, remaining window, 32 KiB).
+            // Stop at a fence or a different EXTENDED_DATA ext.
+            let size = Self::gather_one_data_packet(write, writer.as_deref_mut(), channel)?;
             pending_size += size;
-            if from + size < buf.len() {
-                channel.push_data_front(buf, a, from + size, seq);
+            if size == 0 {
                 return Ok(ChannelFlushResult::Incomplete {
                     wrote: pending_size,
                 });
@@ -692,6 +683,70 @@ impl Encrypted {
     /// producer whose data was actually discarded.
     pub(crate) fn channel_exists(&self, channel: ChannelId) -> bool {
         self.channels.contains_key(&channel)
+    }
+
+    /// Assemble and emit **one** CHANNEL_DATA / EXTENDED_DATA from the
+    /// head of `pending_data`, concatenating consecutive same-`ext`
+    /// entries up to `min(peer_maxpacket, window, 32 KiB)`.
+    /// Does not cross a fence (ctrl seq ≤ next data seq) or a different ext.
+    fn gather_one_data_packet(
+        write: &mut Vec<u8>,
+        mut writer: Option<&mut PacketWriter>,
+        channel: &mut ChannelParams,
+    ) -> Result<usize, crate::Error> {
+        if channel.recipient_maximum_packet_size == 0 {
+            return Err(crate::Error::Inconsistent);
+        }
+        if channel.pending_data.is_empty() || channel.recipient_window_size == 0 {
+            return Ok(0);
+        }
+        if channel.ctrl_ahead_of_data() {
+            return Ok(0);
+        }
+        let ext0 = channel.pending_data.front().map(|(_, e, _)| *e).unwrap_or(None);
+        let cap = (channel.recipient_maximum_packet_size as usize)
+            .min(channel.recipient_window_size as usize)
+            .min(crate::LOCAL_TRANSPORT_PAYLOAD_CAP);
+        if cap == 0 {
+            return Ok(0);
+        }
+        let mut gathered = Vec::with_capacity(cap.min(4096));
+        while gathered.len() < cap {
+            if channel.ctrl_ahead_of_data() {
+                break;
+            }
+            let Some((buf, ext, from, seq)) = channel.pop_data_front() else {
+                break;
+            };
+            if ext != ext0 {
+                channel.push_data_front(buf, ext, from, seq);
+                break;
+            }
+            let avail = buf.len().saturating_sub(from);
+            if avail == 0 {
+                continue;
+            }
+            let take = avail.min(cap - gathered.len());
+            gathered.extend_from_slice(&buf[from..from + take]);
+            if from + take < buf.len() {
+                channel.push_data_front(buf, ext, from + take, seq);
+                break;
+            }
+        }
+        if gathered.is_empty() {
+            return Ok(0);
+        }
+        channel.boost_pending = false;
+        let size = if write.is_empty() {
+            if let Some(ref mut w) = writer {
+                Self::data_noqueue_direct(w, channel, &Bytes::from(gathered), ext0, 0)?
+            } else {
+                Self::data_noqueue(write, channel, &gathered, ext0, 0)?
+            }
+        } else {
+            Self::data_noqueue(write, channel, &gathered, ext0, 0)?
+        };
+        Ok(size)
     }
 
     /// Push the largest amount of `&buf0[from..]` that can fit into
@@ -1148,6 +1203,13 @@ mod tests {
         ch
     }
 
+    fn first_data_payload_len(buf: &[u8]) -> u32 {
+        // CHANNEL_DATA: 4B pktlen + msg + recip(4) + string_len(4)
+        assert!(buf.len() >= 13, "packet too short: {}", buf.len());
+        #[allow(clippy::indexing_slicing)]
+        BigEndian::read_u32(&buf[9..13])
+    }
+
     fn packet_types(buf: &[u8]) -> Vec<u8> {
         let mut packet_types = Vec::new();
         let mut cursor = 0;
@@ -1453,6 +1515,84 @@ mod tests {
         assert_eq!(channel.pending_data.len(), before);
         assert_eq!(channel.lane, crate::ChannelLaneState::Closing);
         assert!(encrypted.write.is_empty());
+    }
+
+    #[test]
+    fn gather_combines_consecutive_same_stream_entries() {
+        let channel_id = ChannelId(32);
+        let mut encrypted = test_encrypted();
+        let mut ch = test_ready_channel(channel_id, 52);
+        assert!(ch.enqueue_data(Bytes::from_static(b"aa"), None, 0));
+        assert!(ch.enqueue_data(Bytes::from_static(b"bb"), None, 0));
+        encrypted.channels.insert(channel_id, ch);
+
+        encrypted.flush_pending(channel_id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_DATA]);
+        assert_eq!(first_data_payload_len(&encrypted.write), 4);
+        assert!(encrypted.channels[&channel_id].pending_data.is_empty());
+    }
+
+    #[test]
+    fn gather_stops_before_eof_fence() {
+        let channel_id = ChannelId(33);
+        let mut encrypted = test_encrypted();
+        let mut ch = test_ready_channel(channel_id, 53);
+        assert!(ch.enqueue_data(Bytes::from_static(b"aa"), None, 0));
+        ch.enqueue_ctrl(crate::ChannelCtrlItem::Eof);
+        assert!(!ch.enqueue_data(Bytes::from_static(b"xx"), None, 0));
+        encrypted.channels.insert(channel_id, ch);
+
+        encrypted.flush_pending(channel_id).unwrap();
+        assert_eq!(
+            packet_types(&encrypted.write),
+            vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
+        );
+        assert_eq!(first_data_payload_len(&encrypted.write), 2);
+    }
+
+    #[test]
+    fn gather_respects_32kib_cap() {
+        let channel_id = ChannelId(34);
+        let mut encrypted = test_encrypted();
+        let mut ch = test_ready_channel(channel_id, 54);
+        ch.recipient_maximum_packet_size = 64 * 1024;
+        ch.recipient_window_size = 64 * 1024;
+        assert!(ch.enqueue_data(Bytes::from(vec![1u8; 20_000]), None, 0));
+        assert!(ch.enqueue_data(Bytes::from(vec![2u8; 20_000]), None, 0));
+        encrypted.channels.insert(channel_id, ch);
+
+        encrypted.flush_pending(channel_id).unwrap();
+        let types = packet_types(&encrypted.write);
+        assert_eq!(types, vec![msg::CHANNEL_DATA, msg::CHANNEL_DATA]);
+        assert_eq!(
+            first_data_payload_len(&encrypted.write),
+            crate::LOCAL_TRANSPORT_PAYLOAD_CAP as u32
+        );
+    }
+
+    #[test]
+    fn confirm_only_transitions_opening_to_confirmed() {
+        let mut ch = test_ready_channel(ChannelId(35), 55);
+        ch.lane = crate::ChannelLaneState::Closing;
+        ch.confirm(&crate::parsing::ChannelOpenConfirmation {
+            recipient_channel: 55,
+            sender_channel: 99,
+            initial_window_size: 1024,
+            maximum_packet_size: 1024,
+        });
+        assert_eq!(ch.lane, crate::ChannelLaneState::Closing);
+
+        let mut open = test_ready_channel(ChannelId(36), 56);
+        open.lane = crate::ChannelLaneState::Opening;
+        open.boost_pending = false;
+        open.confirm(&crate::parsing::ChannelOpenConfirmation {
+            recipient_channel: 56,
+            sender_channel: 100,
+            initial_window_size: 2048,
+            maximum_packet_size: 1024,
+        });
+        assert_eq!(open.lane, crate::ChannelLaneState::Confirmed);
+        assert!(open.boost_pending);
     }
 
     #[test]

@@ -706,6 +706,59 @@ impl ReplyQueueSlot {
     }
 }
 
+/// Test-only: S2d scheduler counters (regular quanta + boosts).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct SchedSlot {
+    regular_quanta: AtomicU64,
+    boosts: AtomicU64,
+    /// (recipient_channel, is_boost, ready_set_len at emit)
+    emits: std::sync::Mutex<Vec<(u32, bool, u32)>>,
+    /// `regular_quanta` snapshot at each boost (for adjacent-gap asserts).
+    boost_at: std::sync::Mutex<Vec<u64>>,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl SchedSlot {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    pub fn note_quantum(&self) {
+        self.regular_quanta.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn note_boost(&self) {
+        let q = self.regular_quanta.load(Ordering::SeqCst);
+        self.boosts.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut g) = self.boost_at.lock() {
+            g.push(q);
+        }
+    }
+
+    pub fn note_emit(&self, channel: u32, boost: bool, ready_len: u32) {
+        if let Ok(mut g) = self.emits.lock() {
+            g.push((channel, boost, ready_len));
+        }
+    }
+
+    pub fn regular_quanta(&self) -> u64 {
+        self.regular_quanta.load(Ordering::SeqCst)
+    }
+
+    pub fn boosts(&self) -> u64 {
+        self.boosts.load(Ordering::SeqCst)
+    }
+
+    pub fn emits(&self) -> Vec<(u32, bool, u32)> {
+        self.emits.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn boost_at_quanta(&self) -> Vec<u64> {
+        self.boost_at.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 /// Test-only: write-watchdog armed / eligible / rekey-generation edges.
 #[cfg(feature = "_test_hooks")]
 #[derive(Debug, Default)]

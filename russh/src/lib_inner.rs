@@ -517,6 +517,14 @@ pub(crate) enum ChannelLaneState {
     Closing,
 }
 
+/// S2d gather / 1-packet quantum: local transport payload cap.
+/// A CHANNEL_DATA / EXTENDED_DATA we assemble is at most
+/// `min(peer_maxpacket, remaining window, this)`.
+pub(crate) const LOCAL_TRANSPORT_PAYLOAD_CAP: usize = 32 * 1024;
+
+/// Regular quanta between boosts (plan §4.3 / gap #12).
+pub(crate) const BOOST_PERIOD: u32 = 8;
+
 /// Control / fence items sharing a submission sequence with `pending_data`.
 #[derive(Debug)]
 pub(crate) enum ChannelCtrlItem {
@@ -593,6 +601,8 @@ pub(crate) struct ChannelParams {
     /// open" / "we accepted theirs"). We stay `Opening` until *our*
     /// OPEN_CONFIRMATION is emitted.
     pub(crate) lane: ChannelLaneState,
+    /// First DATA packet after becoming `Confirmed` may take a boost slot.
+    pub(crate) boost_pending: bool,
     next_seq: u64,
     /// Submission sequence parallel to `pending_data`.
     data_seqs: std::collections::VecDeque<u64>,
@@ -623,6 +633,7 @@ impl ChannelParams {
             pending_eof: false,
             pending_close: false,
             lane: ChannelLaneState::Opening,
+            boost_pending: false,
             next_seq: 0,
             data_seqs: std::collections::VecDeque::new(),
             pending_ctrl: std::collections::VecDeque::new(),
@@ -636,13 +647,37 @@ impl ChannelParams {
         self.confirmed = true;
         // We opened this channel; the peer confirmed. No local
         // OPEN_CONFIRMATION is queued, so the lane can go Confirmed.
-        if !self
-            .pending_ctrl
-            .iter()
-            .any(|(_, i)| matches!(i, ChannelCtrlItem::OpenConfirmation { .. }))
+        // Only Opening → Confirmed (never from Closing).
+        if self.lane == ChannelLaneState::Opening
+            && !self
+                .pending_ctrl
+                .iter()
+                .any(|(_, i)| matches!(i, ChannelCtrlItem::OpenConfirmation { .. }))
         {
-            self.lane = ChannelLaneState::Confirmed;
+            self.enter_confirmed();
         }
+    }
+
+    fn enter_confirmed(&mut self) {
+        if self.lane == ChannelLaneState::Opening {
+            self.lane = ChannelLaneState::Confirmed;
+            self.boost_pending = true;
+        }
+    }
+
+    /// Ready-set membership for S2d DATA scheduling (plan §4.3).
+    /// Fences are emitted on a separate pass and do not enter the set.
+    pub(crate) fn in_ready_set(&self) -> bool {
+        self.lane == ChannelLaneState::Confirmed
+            && !self.pending_data.is_empty()
+            && self.recipient_window_size > 0
+            && !self.ctrl_ahead_of_data()
+    }
+
+    /// Head-of-lane DATA vs EXTENDED_DATA. Used so HWM one-packet
+    /// reservation matches the packet we are about to assemble.
+    pub(crate) fn pending_head_is_extended(&self) -> bool {
+        matches!(self.pending_data.front(), Some((_, Some(_), _)))
     }
 
     fn alloc_seq(&mut self) -> u64 {
@@ -725,7 +760,7 @@ impl ChannelParams {
             // remain rejected.
             ChannelCtrlItem::Close => self.pending_close = false,
             ChannelCtrlItem::OpenConfirmation { .. } => {
-                self.lane = ChannelLaneState::Confirmed;
+                self.enter_confirmed();
             }
             _ => {}
         }
@@ -761,6 +796,7 @@ impl ChannelParams {
         self.pending_ctrl.clear();
         self.pending_eof = false;
         self.pending_close = false;
+        self.boost_pending = false;
     }
 }
 

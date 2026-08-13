@@ -68,7 +68,7 @@ pub use self::supervisor::{
 pub use self::supervisor::{
     CapacityChainSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate, InstallAckHoldGate,
     KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, OutboundOrderSlot,
-    ReplyQueueSlot, WatchdogObserveSlot,
+    ReplyQueueSlot, SchedSlot, WatchdogObserveSlot,
 };
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
@@ -198,6 +198,12 @@ pub struct Config {
     /// Test-only: queued SUCCESS/FAILURE count (S2c fix1 generation admit).
     #[cfg(feature = "_test_hooks")]
     pub reply_queue: Option<std::sync::Arc<supervisor::ReplyQueueSlot>>,
+    /// Test-only: S2d ready-set / boost counters.
+    #[cfg(feature = "_test_hooks")]
+    pub sched: Option<std::sync::Arc<supervisor::SchedSlot>>,
+    /// Test-only: skip first-packet boost (on/off position contrast).
+    #[cfg(feature = "_test_hooks")]
+    pub disable_sched_boost: bool,
 }
 
 impl Default for Config {
@@ -270,6 +276,10 @@ impl Default for Config {
             outbound_order: None,
             #[cfg(feature = "_test_hooks")]
             reply_queue: None,
+            #[cfg(feature = "_test_hooks")]
+            sched: None,
+            #[cfg(feature = "_test_hooks")]
+            disable_sched_boost: false,
         }
     }
 }
@@ -1267,6 +1277,9 @@ where
         full_ledger: None,
         #[cfg(feature = "_test_hooks")]
         outbound_log_cursor: 0,
+        sched_next: None,
+        sched_since_boost: crate::BOOST_PERIOD,
+        sched_debt: None,
     };
 
     session.begin_rekey()?;

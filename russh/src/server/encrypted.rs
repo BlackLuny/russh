@@ -594,6 +594,9 @@ mod tests {
             full_ledger: None,
             #[cfg(feature = "_test_hooks")]
             outbound_log_cursor: 0,
+            sched_next: None,
+            sched_since_boost: crate::BOOST_PERIOD,
+            sched_debt: None,
         }
     }
 

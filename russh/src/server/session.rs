@@ -87,6 +87,12 @@ pub struct Session {
     /// Test-only: how far into `enc.write` we have already logged (S2c).
     #[cfg(feature = "_test_hooks")]
     pub(crate) outbound_log_cursor: usize,
+    /// S2d ready-set cursor: next ChannelId to start a regular quantum at.
+    pub(crate) sched_next: Option<ChannelId>,
+    /// Regular quanta since the last boost (saturates at [`crate::BOOST_PERIOD`]).
+    pub(crate) sched_since_boost: u32,
+    /// Fairness debt: skip this channel in the regular quantum after a boost.
+    pub(crate) sched_debt: Option<ChannelId>,
 }
 
 /// Completion actions when **both** outbound InstallAck and peer-Done are satisfied.
@@ -3515,63 +3521,21 @@ impl Session {
         // HWM clamps how much enters enc.write this call (remainder → pending_data);
         // `try_drain_pending_data_under_budget` unparks when Writer frees capacity.
         //
-        // Pack at most **one peer max-packet** of app data per budget snapshot, then
-        // flush and recompute — prevents multi-packet stale-budget overshoot.
+        // Enqueue then emit through the ready-set scheduler (1 gathered
+        // packet per ready channel per quantum). Parking (`is_rekeying=true`)
+        // keeps Encrypted::data from dumping the whole window itself.
         let kex_block = self.blocks_outbound_intake();
-        let max_pkt = self
-            .common
-            .encrypted
-            .as_ref()
-            .and_then(|e| e.channels.get(&channel))
-            .map(|c| c.recipient_maximum_packet_size)
-            .unwrap_or(self.common.config.maximum_packet_size);
         let data = data.into();
-        let budget = if kex_block {
-            0
-        } else {
-            self.outbound_budget_for_peer_packet(max_pkt, Self::CHANNEL_DATA_FRAMING)
-        };
-        let clamp = if let Some(enc) = self.common.encrypted.as_mut() {
-            if kex_block {
-                enc.data(channel, data, true)?;
-                None
-            } else {
-                let clamp = if let Some(ch) = enc.channels.get_mut(&channel) {
-                    let saved = ch.recipient_window_size;
-                    let payload_cap = Self::max_payload_for_budget(budget, max_pkt)
-                        .min(max_pkt as usize) as u32;
-                    let cap = payload_cap.min(saved);
-                    ch.recipient_window_size = cap;
-                    Some((saved, cap))
-                } else {
-                    None
-                };
-                enc.data(channel, data, false)?;
-                clamp
-            }
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            enc.data(channel, data, true)?;
         } else {
             unreachable!()
-        };
+        }
         if !kex_block {
-            // Emit under the clamped window (HWM one-packet), then restore.
-            let _ = self.flush_pending(channel)?;
-            if let (Some((saved, cap)), Some(ch)) = (
-                clamp,
-                self.common
-                    .encrypted
-                    .as_mut()
-                    .and_then(|e| e.channels.get_mut(&channel)),
-            ) {
-                ch.recipient_window_size =
-                    ch.recipient_window_size.saturating_add(saved.saturating_sub(cap));
-            }
+            let _ = self.try_drain_pending_data_under_budget()?;
         }
         self.record_outbound_from_write();
-        // Convert write→Writer so budget reflects sealed state for subsequent calls.
         let _ = self.flush();
-        // Unpark at most one more peer-packet under a fresh budget snapshot.
-        // (Full multi-packet unpark happens via WINDOW_ADJUST / capacity / loop-bottom drain.)
-        let _ = self.try_drain_channel_under_budget(channel);
         // Enforce here rather than at the run loop's dispatch sites: this is the single point
         // where a channel's outbound backlog grows, and `Handler` callbacks call it directly
         // while the loop is inside `reply()` — a path no dispatch-site check can see.
@@ -3581,6 +3545,10 @@ impl Session {
     /// Move channel `pending_data` into `enc.write` while HWM budget remains.
     /// Also emits head-of-lane fences (CONFIRMATION/EOF/CLOSE/SUCCESS/FAILURE)
     /// even when the peer window is 0 (I3 / appendix B.8).
+    ///
+    /// DATA uses the S2d ready-set: `Confirmed && !Closing`, 1 gathered
+    /// peer-packet per channel per quantum, with a quota-1/8 boost for a
+    /// newly Confirmed channel's first packet.
     pub(crate) fn try_drain_pending_data_under_budget(&mut self) -> Result<(), Error> {
         // Pass 1: fence items — no window predicate, no DATA dump.
         let fence_ids: Vec<_> = self
@@ -3599,21 +3567,142 @@ impl Session {
             let _ = self.flush_pending_fences(id)?;
         }
         loop {
-            let id = self.common.encrypted.as_ref().and_then(|enc| {
-                enc.channels
-                    .keys()
-                    .find(|id| enc.has_pending_data(**id))
-                    .copied()
-            });
-            let Some(id) = id else {
+            if self.blocks_outbound_intake() {
                 break;
+            }
+            let ready = self.ready_set();
+            if ready.is_empty() {
+                break;
+            }
+            // Boost: first packet of a newly Confirmed channel, at most
+            // once per BOOST_PERIOD *completed* regular quanta.
+            if self.sched_boost_allowed() {
+                if let Some(id) = self.boost_candidate(&ready) {
+                    let n = self.try_drain_channel_under_budget(id)?;
+                    if n > 0 {
+                        self.sched_since_boost = 0;
+                        self.sched_debt = Some(id);
+                        self.note_sched_boost();
+                        self.note_sched_emit(id, true);
+                    }
+                }
+            }
+            let ready = self.ready_set();
+            if ready.is_empty() {
+                break;
+            }
+            let start = match self.sched_next {
+                Some(n) => ready.iter().position(|id| *id >= n).unwrap_or(0),
+                None => 0,
             };
-            let n = self.try_drain_channel_under_budget(id)?;
-            if n == 0 {
+            let mut progressed = false;
+            let mut last_served = None;
+            let mut stopped_mid = false;
+            for i in 0..ready.len() {
+                let id = ready[(start + i) % ready.len()];
+                if self.sched_debt == Some(id) {
+                    continue;
+                }
+                let n = self.try_drain_channel_under_budget(id)?;
+                if n > 0 {
+                    progressed = true;
+                    last_served = Some(id);
+                    self.note_sched_emit(id, false);
+                    continue;
+                }
+                // Ready-set said this channel could emit; n==0 means the
+                // one-packet HWM snapshot refused it. Keep the failed id.
+                // `outbound_budget()` uses config max-packet and can still
+                // be >0 after a smaller recipient-max packet filled its
+                // own hard cap — do not walk on and let last_served
+                // overwrite (debt+wrap counterexample).
+                self.sched_next = Some(id);
+                stopped_mid = true;
+                break;
+            }
+            self.sched_debt = None;
+            if !stopped_mid {
+                if let Some(id) = last_served {
+                    self.sched_next = ready
+                        .iter()
+                        .copied()
+                        .find(|x| *x > id)
+                        .or(ready.first().copied());
+                }
+            }
+            // Only a regular pass that actually emitted a packet is a
+            // completed quantum (boost denominator). Empty budget-stop
+            // keeps the cursor but does not mint a quantum.
+            if progressed {
+                self.note_sched_quantum();
+            }
+            if !progressed {
                 break;
             }
         }
         Ok(())
+    }
+
+    fn ready_set(&self) -> Vec<ChannelId> {
+        let Some(enc) = self.common.encrypted.as_ref() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<ChannelId> = enc
+            .channels
+            .iter()
+            .filter(|(_, ch)| ch.in_ready_set())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn sched_boost_allowed(&self) -> bool {
+        #[cfg(feature = "_test_hooks")]
+        if self.common.config.disable_sched_boost {
+            return false;
+        }
+        self.sched_since_boost >= crate::BOOST_PERIOD
+    }
+
+    fn boost_candidate(&self, ready: &[ChannelId]) -> Option<ChannelId> {
+        let enc = self.common.encrypted.as_ref()?;
+        ready.iter().copied().find(|id| {
+            enc.channels
+                .get(id)
+                .is_some_and(|ch| ch.boost_pending && ch.in_ready_set())
+        })
+    }
+
+    fn note_sched_quantum(&mut self) {
+        self.sched_since_boost = self.sched_since_boost.saturating_add(1);
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.sched {
+            s.note_quantum();
+        }
+    }
+
+    fn note_sched_boost(&mut self) {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.sched {
+            s.note_boost();
+        }
+    }
+
+    fn note_sched_emit(&mut self, id: ChannelId, boost: bool) {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.sched {
+            let recip = self
+                .common
+                .encrypted
+                .as_ref()
+                .and_then(|enc| enc.channels.get(&id))
+                .map(|ch| ch.recipient_channel)
+                .unwrap_or(id.number());
+            s.note_emit(recip, boost, self.ready_set().len() as u32);
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        let _ = (id, boost);
     }
 
     /// HWM/framing-aware drain for **one** channel (WINDOW_ADJUST / targeted unpark).
@@ -3630,67 +3719,78 @@ impl Session {
         if self.blocks_outbound_intake() {
             return Ok(0);
         }
-        let max_pkt = self
+        let (max_pkt, framing) = self
             .common
             .encrypted
             .as_ref()
             .and_then(|enc| enc.channels.get(&id))
-            .map(|ch| ch.recipient_maximum_packet_size)
-            .unwrap_or(self.common.config.maximum_packet_size);
-        let mut total = 0usize;
-        loop {
-            let budget =
-                self.outbound_budget_for_peer_packet(max_pkt, Self::CHANNEL_DATA_FRAMING);
-            if budget == 0 {
-                break;
-            }
-            // At most one peer packet of app payload per iteration.
-            let payload_cap = Self::max_payload_for_budget(budget, max_pkt).min(max_pkt as usize);
-            if payload_cap == 0 {
-                break;
-            }
-            let has_pending = self
-                .common
-                .encrypted
-                .as_ref()
-                .map(|enc| enc.has_pending_data(id))
-                .unwrap_or(false);
-            if !has_pending {
-                break;
-            }
-            let clamp = if let Some(enc) = self.common.encrypted.as_mut() {
-                if let Some(ch) = enc.channels.get_mut(&id) {
-                    let saved = ch.recipient_window_size;
-                    if saved == 0 {
-                        None
-                    } else {
-                        let cap = (payload_cap as u32).min(saved);
-                        ch.recipient_window_size = cap;
-                        Some((saved, cap))
-                    }
+            .map(|ch| {
+                let framing = if ch.pending_head_is_extended() {
+                    Self::CHANNEL_EXT_DATA_FRAMING
                 } else {
+                    Self::CHANNEL_DATA_FRAMING
+                };
+                (ch.recipient_maximum_packet_size, framing)
+            })
+            .unwrap_or((
+                self.common.config.maximum_packet_size,
+                Self::CHANNEL_DATA_FRAMING,
+            ));
+        if max_pkt == 0 {
+            return Err(Error::Inconsistent);
+        }
+        // S2d: exactly one gathered peer packet. The ready-set loop
+        // (try_drain_pending_data_under_budget) rotates; this helper
+        // must not eat the rest of the HWM for `id`.
+        // Framing follows the lane head so EXTENDED_DATA reserves the
+        // extra 4B ext type and cannot step past archived HWM+one.
+        let budget = self.outbound_budget_for_peer_packet(max_pkt, framing);
+        if budget == 0 {
+            return Ok(0);
+        }
+        let payload_cap = Self::max_payload_for_budget_framed(budget, max_pkt, framing)
+            .min(max_pkt as usize)
+            .min(crate::LOCAL_TRANSPORT_PAYLOAD_CAP);
+        if payload_cap == 0 {
+            return Ok(0);
+        }
+        let has_pending = self
+            .common
+            .encrypted
+            .as_ref()
+            .map(|enc| enc.has_pending_data(id))
+            .unwrap_or(false);
+        if !has_pending {
+            return Ok(0);
+        }
+        let clamp = if let Some(enc) = self.common.encrypted.as_mut() {
+            if let Some(ch) = enc.channels.get_mut(&id) {
+                let saved = ch.recipient_window_size;
+                if saved == 0 {
                     None
+                } else {
+                    let cap = (payload_cap as u32).min(saved);
+                    ch.recipient_window_size = cap;
+                    Some((saved, cap))
                 }
             } else {
                 None
-            };
-            let Some((saved, cap)) = clamp else {
-                break;
-            };
-            let n = self.flush_pending(id)?;
-            if let Some(enc) = self.common.encrypted.as_mut() {
-                if let Some(ch) = enc.channels.get_mut(&id) {
-                    ch.recipient_window_size =
-                        ch.recipient_window_size.saturating_add(saved.saturating_sub(cap));
-                }
             }
-            self.flush()?;
-            total = total.saturating_add(n);
-            if n == 0 {
-                break;
+        } else {
+            None
+        };
+        let Some((saved, cap)) = clamp else {
+            return Ok(0);
+        };
+        let n = self.flush_pending(id)?;
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            if let Some(ch) = enc.channels.get_mut(&id) {
+                ch.recipient_window_size =
+                    ch.recipient_window_size.saturating_add(saved.saturating_sub(cap));
             }
         }
-        Ok(total)
+        self.flush()?;
+        Ok(n)
     }
 
     /// Send data to a channel. On session channels, `extended` can be
@@ -3705,40 +3805,17 @@ impl Session {
         extended: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), Error> {
-        let budget = self.outbound_budget();
         let kex_block = self.blocks_outbound_intake();
         let data = data.into();
         if let Some(enc) = self.common.encrypted.as_mut() {
-            if kex_block {
-                enc.extended_data(channel, extended, data, true)?;
-            } else {
-                let clamp = if let Some(ch) = enc.channels.get_mut(&channel) {
-                    let saved = ch.recipient_window_size;
-                    let max_pkt = ch.recipient_maximum_packet_size;
-                    let payload_cap = Self::max_payload_for_budget_framed(
-                        budget,
-                        max_pkt,
-                        Self::CHANNEL_EXT_DATA_FRAMING,
-                    ) as u32;
-                    let cap = payload_cap.min(saved);
-                    ch.recipient_window_size = cap;
-                    Some((saved, cap))
-                } else {
-                    None
-                };
-                enc.extended_data(channel, extended, data, false)?;
-                if let (Some((saved, cap)), Some(ch)) =
-                    (clamp, enc.channels.get_mut(&channel))
-                {
-                    ch.recipient_window_size =
-                        ch.recipient_window_size.saturating_add(saved.saturating_sub(cap));
-                }
-            }
+            enc.extended_data(channel, extended, data, true)?;
         } else {
             unreachable!()
         }
+        if !kex_block {
+            self.try_drain_pending_data_under_budget()?;
+        }
         let _ = self.flush();
-        let _ = self.try_drain_pending_data_under_budget();
         // See `Session::data`: enforced here so `Handler`-callback writes are covered too.
         self.enforce_outbound_cap(channel)
     }
@@ -4257,6 +4334,9 @@ mod tests {
             full_ledger: None,
             #[cfg(feature = "_test_hooks")]
             outbound_log_cursor: 0,
+            sched_next: None,
+            sched_since_boost: crate::BOOST_PERIOD,
+            sched_debt: None,
         }
     }
 
@@ -5398,6 +5478,168 @@ mod tests {
         }
         join.abort();
         let _ = join.await;
+    }
+
+    fn park_ready_channel(session: &mut Session, id: ChannelId, nbytes: usize) {
+        confirm_test_channel(session, id, 1 << 20);
+        let ch = session
+            .common
+            .encrypted
+            .as_mut()
+            .unwrap()
+            .channels
+            .get_mut(&id)
+            .unwrap();
+        ch.boost_pending = false;
+        ch.recipient_maximum_packet_size = 1024;
+        assert!(ch.enqueue_data(bytes::Bytes::from(vec![0xABu8; nbytes]), None, 0));
+    }
+
+    /// Debt + wrap + budget-stop must keep the failed id as `sched_next`.
+    /// ready [c1,c2,c3], debt=c3, start=c2 → emit c2, skip c3, stop on c1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sched_stopped_mid_not_overwritten_by_last_served() {
+        use crate::server::supervisor::AtomicWriteProgress;
+        use crate::server::writer::spawn_writer;
+        use crate::sshbuffer::PacketWriter;
+
+        let progress = AtomicWriteProgress::new();
+        let (_c, cancel_rx) = tokio::sync::watch::channel(false);
+        let (handle, join, _) =
+            spawn_writer(HangWrite, PacketWriter::clear(), progress, cancel_rx);
+        let mut session = authenticated_session();
+        session.writer = Some(handle.clone());
+
+        // Drain uses recipient max-packet 1024 (see park_ready_channel), so
+        // fill against that one-packet hard cap — not config 32KiB
+        // `outbound_budget()`, which sits ~32KiB past the 1024-packet bound
+        // and leaves room for every parked channel.
+        let framing = Session::CHANNEL_DATA_FRAMING;
+        let one_1k = 1024 + Session::packet_reservation(framing);
+        let hard = crate::sshbuffer::OUTBOUND_HIGH_WATERMARK.saturating_add(one_1k);
+        let adjust = 9usize.saturating_add(Session::WIRE_OVERHEAD_PER_PACKET);
+        // sealed ∈ [hard-adjust-one, hard-adjust): c2 can emit one 1024B
+        // DATA; after that `outbound_budget_for_peer_packet(1024)` is 0.
+        let lo = hard.saturating_sub(adjust).saturating_sub(one_1k);
+        let hi = hard.saturating_sub(adjust);
+        for _ in 0..512 {
+            let sealed = session.sealed_backlog_bytes();
+            if sealed >= lo && sealed < hi {
+                break;
+            }
+            assert!(
+                sealed < hi,
+                "fill overshot 1024-packet last zone sealed={sealed} hi={hi}"
+            );
+            let chunk = lo.saturating_sub(sealed).max(1).min(1024);
+            match handle.try_seal_payload(bytes::Bytes::from(vec![1u8; chunk])) {
+                Ok(()) => {}
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        let sealed = session.sealed_backlog_bytes();
+        assert!(
+            sealed >= lo && sealed < hi,
+            "need sealed in [{lo},{hi}) for one 1KiB DATA then budget-stop, got {sealed}"
+        );
+        let drain_budget = session.outbound_budget_for_peer_packet(1024, framing);
+        assert!(
+            drain_budget >= one_1k
+                || Session::max_payload_for_budget_framed(drain_budget, 1024, framing) > 0,
+            "need room for c2 DATA (budget={drain_budget} sealed={sealed})"
+        );
+
+        let c1 = insert_encrypted_channel(&mut session, 1 << 20);
+        let c2 = insert_encrypted_channel(&mut session, 1 << 20);
+        let c3 = insert_encrypted_channel(&mut session, 1 << 20);
+        park_ready_channel(&mut session, c1, 1024);
+        park_ready_channel(&mut session, c2, 1024);
+        park_ready_channel(&mut session, c3, 1024);
+        assert!(c1 < c2 && c2 < c3);
+
+        session.sched_debt = Some(c3);
+        session.sched_next = Some(c2);
+        session.sched_since_boost = 0;
+
+        session.try_drain_pending_data_under_budget().unwrap();
+
+        assert_eq!(
+            session.sched_next,
+            Some(c1),
+            "stopped_mid must keep the failed id (c1), not last_served's successor (c3); got {:?}",
+            session.sched_next
+        );
+        let left = |id: crate::ChannelId| {
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .channels
+                .get(&id)
+                .unwrap()
+                .pending_data
+                .iter()
+                .map(|(b, _, _)| b.len())
+                .sum::<usize>()
+        };
+        assert!(
+            left(c2) < 1024,
+            "c2 must emit the one packet that fits; leftover={}",
+            left(c2)
+        );
+        assert_eq!(
+            left(c1),
+            1024,
+            "c1 must budget-stop without emitting; leftover={}",
+            left(c1)
+        );
+        assert_eq!(
+            session.sched_since_boost, 1,
+            "one regular emit is one completed quantum, not an empty mid-stop"
+        );
+
+        join.abort();
+        let _ = join.await;
+    }
+
+    #[test]
+    fn session_extended_data_propagates_zero_max_packet() {
+        let mut session = authenticated_session();
+        let id = insert_encrypted_channel(&mut session, 1024);
+        confirm_test_channel(&mut session, id, 1024);
+        {
+            let ch = session
+                .common
+                .encrypted
+                .as_mut()
+                .unwrap()
+                .channels
+                .get_mut(&id)
+                .unwrap();
+            ch.recipient_maximum_packet_size = 0;
+        }
+        let err = session
+            .extended_data(id, 1, bytes::Bytes::from_static(b"x"))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Inconsistent),
+            "expected Inconsistent, got {err:?}"
+        );
+        let pending = session
+            .common
+            .encrypted
+            .as_ref()
+            .unwrap()
+            .channels
+            .get(&id)
+            .unwrap()
+            .pending_data
+            .len();
+        assert!(
+            pending > 0,
+            "failed drain must leave the EXTENDED_DATA queued"
+        );
     }
 
     /// R4-2: oversized channel-open field under GateWrite stays within HWM + one-packet.
