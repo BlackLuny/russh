@@ -441,7 +441,13 @@ async fn s2c_parked_data_reply_queue_is_bounded() -> Result<(), anyhow::Error> {
     for i in 0..FLOOD {
         let _ = channel.exec(true, format!("q-{i}")).await;
     }
-    sleep(Duration::from_millis(600)).await;
+    // S3a capacity-1 decoded pipe serializes inbound REQUEST. A fixed 600ms
+    // sleep under suite load can miss the generation-admit cliff (qmax=1201
+    // < max_legal=1423). Wait for the cap to fire instead.
+    wait_for("reply-queue cap → PeerError", Duration::from_secs(8), || {
+        matches!(cause.get(), Some(DisconnectCause::PeerError))
+    })
+    .await?;
 
     let qmax = replies.max();
     let qnow = replies.current();

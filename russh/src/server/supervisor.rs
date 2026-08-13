@@ -172,6 +172,8 @@ pub struct KexInstallObserveSlot {
     deadline_clears: AtomicU64,
     /// Peer KEXINITs parked via `park_pending_read`.
     parks: AtomicU64,
+    /// S3a: inbound InstallAck received for the open transaction.
+    inbound_acked: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "_test_hooks")]
@@ -261,6 +263,14 @@ impl KexInstallObserveSlot {
     pub fn parks(&self) -> u64 {
         self.parks.load(Ordering::SeqCst)
     }
+
+    pub fn set_inbound_acked(&self, v: bool) {
+        self.inbound_acked.store(v, Ordering::SeqCst);
+    }
+
+    pub fn inbound_acked(&self) -> bool {
+        self.inbound_acked.load(Ordering::SeqCst)
+    }
 }
 
 /// Test-only: R3 liveness chain counters — dequeue notify → real Session
@@ -327,6 +337,27 @@ pub struct FullLedger {
     pub enc_write: Arc<std::sync::atomic::AtomicUsize>,
     /// Linearized reservation sum. `fetch_max` / observe go through this.
     total: std::sync::atomic::AtomicUsize,
+    /// Linearized kex identity: parked NeedSubmit **or** Writer-accepted
+    /// SealBatch reservation not yet drained. Updated at the same call
+    /// sites as `total`, never reconstructed from racy component loads.
+    ///
+    /// Premise: at most one kex batch in flight (`pending_kex_install` is
+    /// unique). Transfer `set_kex_need(0)` then `credit_kex` is a debit+credit
+    /// of the same weight, so `kex_live` and non-kex stay conserved. Direct
+    /// accept (NeedSubmit never published) only hits `credit_kex`.
+    ///
+    /// Conservation direction (so `total - kex_live` never overestimates
+    /// non-kex except at instruction-width tear): credit kex → bump
+    /// `kex_live` first, then `total`; debit kex → drop `total` first,
+    /// then `kex_live`. Concurrent samples can only *under*-count non-kex.
+    /// Drain identity is **not** inferred from those atomics: the Writer
+    /// task owns a sealed-segment FIFO `(wire_len, is_kex)`, so a physical
+    /// `[A][K][B]` partial drain of `A+K` retires K and leaves B as
+    /// non-kex for the rest of B's lifetime.
+    kex_live: std::sync::atomic::AtomicUsize,
+    /// Remaining kex reservation/wire inside Writer. Position lives in the
+    /// Writer-task segment queue, not here.
+    kex_in_writer: std::sync::atomic::AtomicUsize,
     pub slot: Arc<LedgerMaxSlot>,
 }
 
@@ -343,6 +374,8 @@ impl FullLedger {
             kex_need: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             enc_write: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             total: std::sync::atomic::AtomicUsize::new(0),
+            kex_live: std::sync::atomic::AtomicUsize::new(0),
+            kex_in_writer: std::sync::atomic::AtomicUsize::new(0),
             slot,
         }
     }
@@ -351,32 +384,106 @@ impl FullLedger {
         self.total.load(Ordering::Acquire)
     }
 
-    /// Credit newly accepted reservation (intake / Writer accept / top-up).
+    /// Credit newly accepted **non-kex** reservation (DATA / control / enc.write).
     pub fn credit(&self, n: usize) {
         if n == 0 {
             return;
         }
         let now = self.total.fetch_add(n, Ordering::AcqRel).saturating_add(n);
-        self.observe_total(now);
+        let kex = self.kex_live.load(Ordering::Acquire);
+        self.observe_now(now, kex);
     }
 
-    /// Debit reservation that left the pipeline (socket drain / rollback /
-    /// seal reserved→actual shrink).
+    /// Debit **non-kex** reservation that left the pipeline.
     pub fn debit(&self, n: usize) {
         if n == 0 {
             return;
         }
-        let prev = self.total.fetch_update(
+        match self.sub_total(n) {
+            Some(now) => {
+                let kex = self.kex_live.load(Ordering::Acquire);
+                self.observe_now(now, kex);
+            }
+            None => self.observe_now(0, 0),
+        }
+    }
+
+    /// Credit a kex batch (parked NeedSubmit growth **or** Writer SealBatch
+    /// accept). Pushes `kex_peak`. Non-kex is unchanged.
+    pub fn credit_kex(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        // kex_live first so a torn concurrent sample cannot treat the new
+        // bytes as non-kex (`total` still old → non-kex underestimates).
+        let kex = self.kex_live.fetch_add(n, Ordering::AcqRel).saturating_add(n);
+        let now = self.total.fetch_add(n, Ordering::AcqRel).saturating_add(n);
+        self.slot.note_kex_need(kex);
+        self.observe_now(now, kex);
+    }
+
+    /// Debit a kex batch (NeedSubmit transfer-out, SealBatch rollback, kex
+    /// seal shrink, or FIFO drain of kex writer bytes).
+    pub fn debit_kex(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let now = self.sub_total(n);
+        let kex = match self.kex_live.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |cur| cur.checked_sub(n),
-        );
-        match prev {
-            Ok(old) => self.observe_total(old.saturating_sub(n)),
+        ) {
+            Ok(old) => old.saturating_sub(n),
+            Err(_) => {
+                self.slot.note_mismatch();
+                self.kex_live.store(0, Ordering::Release);
+                0
+            }
+        };
+        self.observe_now(now.unwrap_or(0), kex);
+    }
+
+    /// Writer accepted a SealBatch: kex identity enters `pending_bytes`.
+    pub fn credit_kex_to_writer(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.kex_in_writer.fetch_add(n, Ordering::AcqRel);
+        self.credit_kex(n);
+    }
+
+    /// Kex reservation left Writer (rollback / seal shrink / FIFO drain).
+    pub fn debit_kex_from_writer(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if self
+            .kex_in_writer
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| cur.checked_sub(n))
+            .is_err()
+        {
+            self.slot.note_mismatch();
+            self.kex_in_writer.store(0, Ordering::Release);
+        }
+        self.debit_kex(n);
+    }
+
+    pub fn kex_in_writer(&self) -> usize {
+        self.kex_in_writer.load(Ordering::Acquire)
+    }
+
+    fn sub_total(&self, n: usize) -> Option<usize> {
+        match self.total.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |cur| cur.checked_sub(n),
+        ) {
+            Ok(old) => Some(old.saturating_sub(n)),
             Err(_) => {
                 self.slot.note_mismatch();
                 self.total.store(0, Ordering::Release);
-                self.observe_total(0);
+                None
             }
         }
     }
@@ -392,18 +499,23 @@ impl FullLedger {
         }
     }
 
-    /// KEX NeedSubmit. Growth is intake; shrink + Writer accept is a transfer.
+    /// Parked NeedSubmit mirror. Growth is kex intake; shrink is a transfer
+    /// out of the NeedSubmit component (Writer `credit_kex_to_writer` follows
+    /// on the success path). Direct accept never publishes a non-zero value
+    /// here — that path only hits `credit_kex_to_writer`.
     pub fn set_kex_need(&self, new: usize) {
         let old = self.kex_need.swap(new, Ordering::AcqRel);
         if new > old {
-            self.slot.note_kex_need(new);
-            self.credit(new - old);
+            self.credit_kex(new - old);
         } else if old > new {
-            self.debit(old - new);
+            self.debit_kex(old - new);
         }
     }
 
-    fn observe_total(&self, total: usize) {
+    /// Sample `total` and linearized `kex_live` after both atomics have been
+    /// updated. Parts remain diagnostic (racy 4-way load). Peaks use the
+    /// values computed in this call, not `total - parts[2]`.
+    fn observe_now(&self, total: usize, kex_live: usize) {
         let parts = [
             self.writer_pending.load(Ordering::Acquire),
             self.session_pending.load(Ordering::Acquire),
@@ -411,12 +523,17 @@ impl FullLedger {
             self.enc_write.load(Ordering::Acquire),
         ];
         self.slot.observe_parts(total, parts);
+        self.slot.observe_linearized(total, kex_live);
+    }
+
+    pub fn kex_live(&self) -> usize {
+        self.kex_live.load(Ordering::Acquire)
     }
 
     /// Diagnostic only — do **not** use for max. Prefer [`Self::credit`]/
     /// [`Self::debit`] / [`Self::set_enc_write`] / [`Self::set_kex_need`].
     pub fn sample(&self) {
-        self.observe_total(self.total());
+        self.observe_now(self.total(), self.kex_live());
     }
 }
 
@@ -436,8 +553,13 @@ pub struct LedgerMaxSlot {
     mismatch: AtomicU64,
     full_hits: AtomicU64,
     intake_blocks: AtomicU64,
-    /// Peak KEX NeedSubmit component (R4: must be >0 on the kex scene).
+    /// Peak linearized `kex_live` (NeedSubmit **or** Writer-accepted batch).
     kex_peak: std::sync::atomic::AtomicUsize,
+    /// Peak of linearized `total - kex_live` (control/data only). Survives
+    /// NeedSubmit → Writer pending. Never derived from racy `parts[2]`.
+    max_excluding_kex: std::sync::atomic::AtomicUsize,
+    /// Last `kex_live` growth (bytes). Evidence for a kex-identity jump.
+    last_kex_jump: std::sync::atomic::AtomicUsize,
     /// Session-thread live `sealed_backlog` has been >= HWM (tiny packets may
     /// sit in `enc.write` and never enter the linearized Writer total).
     live_hwm: AtomicU64,
@@ -466,6 +588,8 @@ impl LedgerMaxSlot {
 
     /// Like [`Self::observe`], plus records the four ledger components that
     /// produced the new max (diagnostic only — racy on concurrent max updates).
+    ///
+    /// `parts` = `[writer_pending, session_pending, kex_need, enc_write]`.
     pub fn observe_parts(&self, n: usize, parts: [usize; 4]) {
         let mut cur = self.max.load(Ordering::Relaxed);
         while n > cur {
@@ -482,6 +606,26 @@ impl LedgerMaxSlot {
                     break;
                 }
                 Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Peaks from linearized `total` / `kex_live` (same call as the mutation).
+    /// `max_excluding_kex` is **not** `total - racy parts[2]`.
+    pub fn observe_linearized(&self, total: usize, kex_live: usize) {
+        self.observe(total);
+        self.note_kex_need(kex_live);
+        let non_kex = total.saturating_sub(kex_live);
+        let mut nk = self.max_excluding_kex.load(Ordering::Relaxed);
+        while non_kex > nk {
+            match self.max_excluding_kex.compare_exchange_weak(
+                nk,
+                non_kex,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => nk = c,
             }
         }
     }
@@ -532,7 +676,11 @@ impl LedgerMaxSlot {
     }
 
     pub fn note_kex_need(&self, n: usize) {
-        let mut cur = self.kex_peak.load(Ordering::Relaxed);
+        let prev_peak = self.kex_peak.load(Ordering::Relaxed);
+        if n > prev_peak {
+            self.last_kex_jump.store(n.saturating_sub(prev_peak), Ordering::SeqCst);
+        }
+        let mut cur = prev_peak;
         while n > cur {
             match self.kex_peak.compare_exchange_weak(
                 cur,
@@ -548,6 +696,16 @@ impl LedgerMaxSlot {
 
     pub fn kex_peak(&self) -> usize {
         self.kex_peak.load(Ordering::SeqCst)
+    }
+
+    /// Peak of linearized non-kex (`total - kex_live`) sampled at each
+    /// credit/debit. Survives NeedSubmit → Writer pending transfer.
+    pub fn max_excluding_kex_need(&self) -> usize {
+        self.max_excluding_kex.load(Ordering::SeqCst)
+    }
+
+    pub fn last_kex_jump(&self) -> usize {
+        self.last_kex_jump.load(Ordering::SeqCst)
     }
 
     pub fn note_live_hwm(&self, n: usize) {
@@ -566,6 +724,8 @@ impl LedgerMaxSlot {
         self.full_hits.store(0, Ordering::SeqCst);
         self.intake_blocks.store(0, Ordering::SeqCst);
         self.kex_peak.store(0, Ordering::SeqCst);
+        self.max_excluding_kex.store(0, Ordering::SeqCst);
+        self.last_kex_jump.store(0, Ordering::SeqCst);
         self.live_hwm.store(0, Ordering::SeqCst);
     }
 }

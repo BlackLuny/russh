@@ -61,6 +61,7 @@ pub use self::session::*;
 mod encrypted;
 pub mod supervisor;
 pub mod writer;
+pub mod reader;
 pub use self::supervisor::{
     AtomicWriteProgress, DisconnectCause, DisconnectCauseSlot, WriteProgress,
 };
@@ -70,6 +71,8 @@ pub use self::supervisor::{
     KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, OutboundOrderSlot,
     ReplyQueueSlot, SchedSlot, StopDiscardSlot, WatchdogObserveSlot,
 };
+#[cfg(feature = "_test_hooks")]
+pub use self::reader::{MidPacketHold, ReadHoldGate, ReaderObserveSlot};
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
 /// Configuration of a server.
@@ -195,6 +198,33 @@ pub struct Config {
     /// Test-only: per-channel outbound emit order (S2c fence / wire order).
     #[cfg(feature = "_test_hooks")]
     pub outbound_order: Option<std::sync::Arc<supervisor::OutboundOrderSlot>>,
+    /// Test-only: hold Session consumption of Reader inbound InstallAck (N8).
+    #[cfg(feature = "_test_hooks")]
+    pub inbound_ack_hold: Option<std::sync::Arc<supervisor::InstallAckHoldGate>>,
+    /// Test-only: observe Reader park/await/apply (N1–N8 / mid-read).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_observe: Option<std::sync::Arc<reader::ReaderObserveSlot>>,
+    /// Test-only: hold Reader at packet boundary before `cipher::read` (risk 2).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_read_hold: Option<std::sync::Arc<reader::ReadHoldGate>>,
+    /// Test-only: next inbound epoch try_push fails as Full (N7).
+    #[cfg(feature = "_test_hooks")]
+    pub force_inbound_install_full: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: skip NeedsReply inbound send so NEWKEYS-first is forced (N2).
+    #[cfg(feature = "_test_hooks")]
+    pub delay_inbound_epoch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: stall `cipher::read` mid-packet (risk-2 hard test).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_mid_packet_hold: Option<std::sync::Arc<reader::MidPacketHold>>,
+    /// Test-only: next Reader transport read becomes ReadError.
+    #[cfg(feature = "_test_hooks")]
+    pub reader_fail_next_read: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: hold Reader after inbound epoch recv, before apply (N5).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_apply_hold: Option<std::sync::Arc<reader::ReadHoldGate>>,
+    /// Test-only: Writer took the socket-hang path with sealed-but-undrained bytes.
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang_seen: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Test-only: queued SUCCESS/FAILURE count (S2c fix1 generation admit).
     #[cfg(feature = "_test_hooks")]
     pub reply_queue: Option<std::sync::Arc<supervisor::ReplyQueueSlot>>,
@@ -277,6 +307,24 @@ impl Default for Config {
             watchdog_observe: None,
             #[cfg(feature = "_test_hooks")]
             outbound_order: None,
+            #[cfg(feature = "_test_hooks")]
+            inbound_ack_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_read_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            force_inbound_install_full: None,
+            #[cfg(feature = "_test_hooks")]
+            delay_inbound_epoch: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_mid_packet_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_fail_next_read: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_apply_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            socket_hang_seen: None,
             #[cfg(feature = "_test_hooks")]
             reply_queue: None,
             #[cfg(feature = "_test_hooks")]
@@ -1274,6 +1322,7 @@ where
         rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
         handshake_deadline_at: Some(handshake_deadline_at),
         writer: None,
+        reader: None,
         pending_supervisor_cause: None,
         pending_outbound: crate::server::session::PendingOutbound::default(),
         pending_kex_install: None,
@@ -1409,6 +1458,14 @@ async fn reply<H: Handler + Send>(
                             // cause staged; do not put kex back / do not flush
                             return Ok(());
                         }
+                        let kex_gen = if kex.is_rekey() {
+                            session.rekey_gen
+                        } else {
+                            0
+                        };
+                        if session.push_inbound_from_kex(&mut kex, kex_gen).is_err() {
+                            return Ok(());
+                        }
                     } else {
                         if let Err(e) = session.seal_payloads(payloads) {
                             debug!("kex seal_payloads failed: {e:?}");
@@ -1418,6 +1475,15 @@ async fn reply<H: Handler + Send>(
                             return Ok(());
                         }
                         let _ = reset_seqn;
+                        // Keys may still exist (no outbound half) — try inbound anyway.
+                        let kex_gen = if kex.is_rekey() {
+                            session.rekey_gen
+                        } else {
+                            0
+                        };
+                        if session.push_inbound_from_kex(&mut kex, kex_gen).is_err() {
+                            return Ok(());
+                        }
                     }
                     session.kex = SessionKexState::InProgress(kex);
                 }
@@ -1465,11 +1531,29 @@ async fn reply<H: Handler + Send>(
                             {
                                 return Ok(()); // cause staged; no flush
                             }
-                            // Inbound cutover now (not deferred to InstallAck).
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    kex_gen,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
                             session.commit_rekey_inbound(newkeys);
-                            // Completion (Idle/deadline/replay) waits for InstallAck.
+                            // Completion waits for both InstallAcks + peer Done.
                         } else {
-                            // Normal rekey: inbound now; completion may wait for InstallAck.
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    session.rekey_gen,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
                             session.commit_rekey_inbound(newkeys);
                             let after =
                                 crate::server::session::KexAfterInstall::RekeyComplete;
@@ -1507,6 +1591,16 @@ async fn reply<H: Handler + Send>(
                             {
                                 return Ok(());
                             }
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    0,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
                             session.commit_initial_encrypted(
                                 EncryptedState::WaitingAuthServiceRequest {
                                     sent: false,
@@ -1515,6 +1609,16 @@ async fn reply<H: Handler + Send>(
                                 newkeys,
                             );
                         } else {
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    0,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
                             session.commit_initial_encrypted(
                                 EncryptedState::WaitingAuthServiceRequest {
                                     sent: false,

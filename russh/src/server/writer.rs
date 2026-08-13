@@ -81,6 +81,9 @@ pub struct WriterHooks {
     /// When held (true), socket write returns Pending (deterministic HangWrite).
     #[cfg(feature = "_test_hooks")]
     pub socket_hang: Option<Arc<AtomicBool>>,
+    /// Set true when the hang path runs with sealed bytes waiting (N5).
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang_seen: Option<Arc<AtomicBool>>,
     /// When true, SealBatchAndInstall returns Full (sticky) — deterministic
     /// Full/NeedSubmit. Tests clear the flag to allow install to advance.
     #[cfg(feature = "_test_hooks")]
@@ -335,6 +338,46 @@ impl WriterHandle {
         self.debit_ledger(weight);
     }
 
+    /// SealBatch accept failed: undo pending_bytes and linearized kex identity.
+    fn rollback_kex_reservation(&self, weight: usize) {
+        if weight == 0 {
+            return;
+        }
+        let ok = self.pending_bytes.fetch_update(
+            Ordering::Release,
+            Ordering::Acquire,
+            |cur| cur.checked_sub(weight),
+        );
+        if ok.is_err() {
+            log::error!("writer: pending_bytes kex rollback underflow weight={weight}");
+            #[cfg(feature = "_test_hooks")]
+            self.note_ledger_mismatch();
+        }
+        self.debit_kex_ledger(weight);
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    fn credit_kex_ledger(&self, n: usize) {
+        if let Some(ref fl) = self.full_ledger {
+            fl.credit_kex_to_writer(n);
+        }
+    }
+
+    #[cfg(not(feature = "_test_hooks"))]
+    #[inline]
+    fn credit_kex_ledger(&self, _n: usize) {}
+
+    #[cfg(feature = "_test_hooks")]
+    fn debit_kex_ledger(&self, n: usize) {
+        if let Some(ref fl) = self.full_ledger {
+            fl.debit_kex_from_writer(n);
+        }
+    }
+
+    #[cfg(not(feature = "_test_hooks"))]
+    #[inline]
+    fn debit_kex_ledger(&self, _n: usize) {}
+
     pub(crate) fn close_tombstone(&self) -> &Arc<CloseTombstone> {
         &self.tombstone
     }
@@ -420,7 +463,7 @@ impl WriterHandle {
         let weight: usize = payloads.iter().map(|p| seal_reservation(p.len())).sum();
         if weight > 0 {
             self.pending_bytes.fetch_add(weight, Ordering::Release);
-            self.credit_ledger(weight);
+            self.credit_kex_ledger(weight);
         }
         let (ack_tx, ack_rx) = oneshot::channel();
         match self.bulk_tx.try_send(WriterCmd::SealBatchAndInstallEpoch {
@@ -442,7 +485,7 @@ impl WriterHandle {
                 reset_seqn,
                 ..
             })) => {
-                self.rollback_reservation(weight);
+                self.rollback_kex_reservation(weight);
                 #[cfg(feature = "_test_hooks")]
                 self.note_full_hit();
                 Err(TrySendEpochError::Full {
@@ -455,11 +498,11 @@ impl WriterHandle {
                 })
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.rollback_reservation(weight);
+                self.rollback_kex_reservation(weight);
                 Err(TrySendEpochError::Closed)
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.rollback_reservation(weight);
+                self.rollback_kex_reservation(weight);
                 #[cfg(feature = "_test_hooks")]
                 self.note_full_hit();
                 Err(TrySendEpochError::Closed)
@@ -661,6 +704,8 @@ where
     let hooks_w = hooks.clone();
     let join = tokio::spawn(async move {
         let mut out_q: VecDeque<Bytes> = VecDeque::new();
+        #[cfg(feature = "_test_hooks")]
+        let mut drain_segs: VecDeque<(usize, bool)> = VecDeque::new();
         let mut flush_cursor: usize = 0;
         let mut current: Option<Bytes> = None;
         let mut shutting_down = false;
@@ -677,7 +722,11 @@ where
                 if let Some(ref fl) = hooks_w.full_ledger {
                     fl.credit(pre.len());
                 }
+                #[cfg(feature = "_test_hooks")]
+                let pre_len = pre.len();
                 out_q.push_back(pre);
+                #[cfg(feature = "_test_hooks")]
+                drain_segs.push_back((pre_len, false));
             }
             cipher_bytes_w.store(packet_writer.buffer().bytes, Ordering::Release);
         }
@@ -739,6 +788,8 @@ where
                             &mut shutdown_ack,
                             &mut bulk_closed,
                             &hooks_w,
+                            #[cfg(feature = "_test_hooks")]
+                            &mut drain_segs,
                         ) {
                             // seal error — continue; event already sent
                         }
@@ -769,6 +820,8 @@ where
                                 &mut shutdown_ack,
                                 &mut bulk_closed,
                                 &hooks_w,
+                                #[cfg(feature = "_test_hooks")]
+                                &mut drain_segs,
                             );
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -799,6 +852,8 @@ where
                             &mut shutdown_ack,
                             &mut bulk_closed,
                             &hooks_w,
+                            #[cfg(feature = "_test_hooks")]
+                            &mut drain_segs,
                         );
                     }
                 }
@@ -828,6 +883,10 @@ where
             if socket_hang_active && has_out {
                 // HangWrite: keep sealing/dequeue into out_q, never touch the
                 // socket (R2/R4 kex peak hold).
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref seen) = hooks_w.socket_hang_seen {
+                    seen.store(true, Ordering::SeqCst);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 continue;
             }
@@ -875,6 +934,8 @@ where
                     &pending_bytes_w,
                     &capacity_w,
                     &hooks_w,
+                    #[cfg(feature = "_test_hooks")]
+                    &mut drain_segs,
                 ), if has_out => {
                     if let Err(e) = result {
                         warn!("writer: socket write error: {e}");
@@ -903,6 +964,8 @@ where
                                 &mut shutdown_ack,
                                 &mut bulk_closed,
                                 &hooks_w,
+                                #[cfg(feature = "_test_hooks")]
+                                &mut drain_segs,
                             );
                         }
                         None => {
@@ -965,6 +1028,10 @@ fn seal_one_payload(
     cipher_bytes: &AtomicUsize,
     p: Bytes,
     hooks: &WriterHooks,
+    #[cfg_attr(not(feature = "_test_hooks"), allow(unused_variables))]
+    as_kex: bool,
+    #[cfg(feature = "_test_hooks")]
+    drain_segs: &mut VecDeque<(usize, bool)>,
 ) -> Result<(), Error> {
     let reserved = seal_reservation(p.len());
     if tombstone_should_drop(p.as_ref(), &hooks.tombstone) {
@@ -982,7 +1049,11 @@ fn seal_one_payload(
         } else {
             #[cfg(feature = "_test_hooks")]
             if let Some(ref fl) = hooks.full_ledger {
-                fl.debit(reserved);
+                if as_kex {
+                    fl.debit_kex_from_writer(reserved);
+                } else {
+                    fl.debit(reserved);
+                }
             }
         }
         #[cfg(feature = "_test_hooks")]
@@ -1015,7 +1086,11 @@ fn seal_one_payload(
         pending_bytes.fetch_add(delta, Ordering::Release);
         #[cfg(feature = "_test_hooks")]
         if let Some(ref fl) = hooks.full_ledger {
-            fl.credit(delta);
+            if as_kex {
+                fl.credit_kex_to_writer(delta);
+            } else {
+                fl.credit(delta);
+            }
         }
     } else if wire_len < reserved {
         let delta = reserved - wire_len;
@@ -1034,11 +1109,23 @@ fn seal_one_payload(
         }
         #[cfg(feature = "_test_hooks")]
         if let Some(ref fl) = hooks.full_ledger {
-            fl.debit(delta);
+            if as_kex {
+                fl.debit_kex_from_writer(delta);
+            } else {
+                fl.debit(delta);
+            }
         }
     }
     if !wire.is_empty() {
         out_q.push_back(wire);
+        // Segment records post-seal wire. Accept credited `reserved`;
+        // seal then credits/debits `wire - reserved` with the same
+        // identity, so this packet's remaining ledger weight equals
+        // `wire_len`. Drain consumes exactly those wire bytes.
+        // Tombstone / Full rollback / batch-error refund reservation
+        // before any wire exists and never push a segment.
+        #[cfg(feature = "_test_hooks")]
+        drain_segs.push_back((wire_len, as_kex));
     }
     cipher_bytes.store(packet_writer.buffer().bytes, Ordering::Release);
     Ok(())
@@ -1083,6 +1170,8 @@ fn handle_writer_cmd(
     shutdown_ack: &mut Option<oneshot::Sender<()>>,
     bulk_closed: &mut bool,
     hooks: &WriterHooks,
+    #[cfg(feature = "_test_hooks")]
+    drain_segs: &mut VecDeque<(usize, bool)>,
 ) -> Result<(), ()> {
     match cmd {
         WriterCmd::SealPayload(p) | WriterCmd::SealRaw(p) => {
@@ -1094,6 +1183,9 @@ fn handle_writer_cmd(
                 cipher_bytes,
                 p,
                 hooks,
+                false,
+                #[cfg(feature = "_test_hooks")]
+                drain_segs,
             ) {
                 warn!("writer: seal error: {e:?}");
                 let ok = pending_bytes.fetch_update(Ordering::Release, Ordering::Acquire, |cur| {
@@ -1126,7 +1218,8 @@ fn handle_writer_cmd(
             ack,
         } => {
             // 1) Seal all with OLD epoch — no await between seals or install.
-            for p in payloads {
+            let mut remaining = payloads.into_iter();
+            while let Some(p) = remaining.next() {
                 let reserved = seal_reservation(p.len());
                 if let Err(e) = seal_one_payload(
                     packet_writer,
@@ -1135,22 +1228,38 @@ fn handle_writer_cmd(
                     cipher_bytes,
                     p,
                     hooks,
+                    true,
+                    #[cfg(feature = "_test_hooks")]
+                    drain_segs,
                 ) {
-                    warn!("writer: batch seal error: {e:?}");
-                    let ok =
-                        pending_bytes.fetch_update(Ordering::Release, Ordering::Acquire, |cur| {
-                            cur.checked_sub(reserved)
-                        });
-                    if ok.is_err() {
-                        warn!("writer: batch seal-error cleanup underflow reserved={reserved}");
-                        #[cfg(feature = "_test_hooks")]
-                        if let Some(ref fl) = hooks.full_ledger {
-                            fl.slot.note_mismatch();
-                        }
-                    } else {
-                        #[cfg(feature = "_test_hooks")]
-                        if let Some(ref fl) = hooks.full_ledger {
-                            fl.debit(reserved);
+                    // Accept credited the whole batch. Failed payload never
+                    // became wire; refund it *and* every not-yet-sealed
+                    // remainder so pending_bytes / kex identity return to
+                    // only what actually entered out_q.
+                    let rest: usize = remaining.map(|q| seal_reservation(q.len())).sum();
+                    let refund = reserved.saturating_add(rest);
+                    warn!(
+                        "writer: batch seal error: {e:?} refund={refund} (failed={reserved} rest={rest})"
+                    );
+                    if refund > 0 {
+                        let ok = pending_bytes.fetch_update(
+                            Ordering::Release,
+                            Ordering::Acquire,
+                            |cur| cur.checked_sub(refund),
+                        );
+                        if ok.is_err() {
+                            warn!(
+                                "writer: batch seal-error cleanup underflow refund={refund}"
+                            );
+                            #[cfg(feature = "_test_hooks")]
+                            if let Some(ref fl) = hooks.full_ledger {
+                                fl.slot.note_mismatch();
+                            }
+                        } else {
+                            #[cfg(feature = "_test_hooks")]
+                            if let Some(ref fl) = hooks.full_ledger {
+                                fl.debit_kex_from_writer(refund);
+                            }
                         }
                     }
                     let _ = ack.send(Err(e));
@@ -1211,6 +1320,35 @@ fn handle_writer_cmd(
     }
 }
 
+/// Consume `n` sealed-but-not-drained wire bytes from the head of the
+/// Writer-local segment FIFO. Identity follows physical `[A][K][B]`
+/// order; a drain that crosses the A/K boundary retires K even if B
+/// is still queued. Seal and drain share the Writer task — no atomics.
+#[cfg(feature = "_test_hooks")]
+fn debit_drain_segments(
+    segs: &mut VecDeque<(usize, bool)>,
+    fl: &FullLedger,
+    mut n: usize,
+) {
+    while n > 0 {
+        let Some((rem, is_kex)) = segs.front_mut() else {
+            fl.slot.note_mismatch();
+            return;
+        };
+        let take = n.min(*rem);
+        *rem -= take;
+        n -= take;
+        if *is_kex {
+            fl.debit_kex_from_writer(take);
+        } else {
+            fl.debit(take);
+        }
+        if *rem == 0 {
+            segs.pop_front();
+        }
+    }
+}
+
 async fn drain_writes<W: AsyncWrite + Unpin>(
     w: &mut W,
     current: &mut Option<Bytes>,
@@ -1219,7 +1357,10 @@ async fn drain_writes<W: AsyncWrite + Unpin>(
     progress: &AtomicWriteProgress,
     pending_bytes: &AtomicUsize,
     capacity: &Notify,
+    #[cfg_attr(not(feature = "_test_hooks"), allow(unused_variables))]
     hooks: &WriterHooks,
+    #[cfg(feature = "_test_hooks")]
+    drain_segs: &mut VecDeque<(usize, bool)>,
 ) -> std::io::Result<()> {
     loop {
         // R5 test inject: fail the next socket write once.
@@ -1273,7 +1414,7 @@ async fn drain_writes<W: AsyncWrite + Unpin>(
         }
         #[cfg(feature = "_test_hooks")]
         if let Some(ref fl) = hooks.full_ledger {
-            fl.debit(n);
+            debit_drain_segments(drain_segs, fl, n);
         }
         capacity.notify_one();
 
@@ -1813,5 +1954,273 @@ mod tests {
             Err(TrySendEpochError::Closed) => {}
             other => panic!("expected Closed after writer exit, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    async fn wait_pred(mut pred: impl FnMut() -> bool, label: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pred() {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timeout waiting for {label}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// R4 / fix5: physical `[A][K][B]` drain across A/K must retire kex
+    /// while B is still queued. Aggregate `pending_before - kex_in_writer`
+    /// would debit A+B first and leave K live — this test is red on that
+    /// formula whenever `B >= K`.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_akb_fifo_retires_kex_before_trailing_nonkex() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+        use std::task::Waker;
+        use crate::server::supervisor::{FullLedger, LedgerMaxSlot};
+
+        struct QuotaWrite {
+            allow: Arc<AtomicUsize>,
+            written: Arc<AtomicUsize>,
+            waker: Arc<Mutex<Option<Waker>>>,
+        }
+        impl AsyncWrite for QuotaWrite {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                let allow = self.allow.load(Ordering::SeqCst);
+                let written = self.written.load(Ordering::SeqCst);
+                if written >= allow {
+                    *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                let n = buf.len().min(allow - written);
+                self.written.fetch_add(n, Ordering::SeqCst);
+                Poll::Ready(Ok(n))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let slot = LedgerMaxSlot::new();
+        let pending_arc = Arc::new(AtomicUsize::new(0));
+        let fl = Arc::new(FullLedger::new(
+            pending_arc.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            slot.clone(),
+        ));
+        let allow = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(Mutex::new(None));
+        let progress = AtomicWriteProgress::new();
+        let (_c, cancel_rx) = watch::channel(false);
+        let hooks = WriterHooks {
+            full_ledger: Some(fl.clone()),
+            pending_override: Some(pending_arc),
+            ..WriterHooks::default()
+        };
+        let (handle, join, _evt) = spawn_writer_with_hooks(
+            QuotaWrite {
+                allow: allow.clone(),
+                written: written.clone(),
+                waker: waker.clone(),
+            },
+            PacketWriter::clear(),
+            progress,
+            cancel_rx,
+            hooks,
+        );
+
+        // A: small non-kex. K: two-packet batch. B: larger than K so the
+        // old "all non-kex first" formula mis-attributes a drain of A+K.
+        handle
+            .try_seal_raw(Bytes::from(vec![crate::msg::IGNORE; 40]))
+            .expect("A");
+        wait_pred(|| handle.pending_bytes() > 0, "A sealed").await;
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+        let a_wire = handle.pending_bytes();
+        assert!(a_wire > 0);
+
+        handle
+            .try_seal_batch_and_install(
+                vec![
+                    Bytes::from(vec![0u8; 80]),
+                    Bytes::from_static(&[crate::msg::NEWKEYS]),
+                ],
+                7,
+                Box::new(crate::cipher::clear::Key {}),
+                Compression::None,
+                false,
+                false,
+            )
+            .expect("K accept");
+        wait_pred(|| fl.kex_in_writer() > 0, "K accepted").await;
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+        let after_k = handle.pending_bytes();
+        let k_wire = after_k.saturating_sub(a_wire);
+        assert!(k_wire > 0, "K must contribute wire after seal");
+        assert_eq!(
+            fl.kex_in_writer(),
+            k_wire,
+            "post-seal kex_in_writer must equal K wire"
+        );
+
+        handle
+            .try_seal_raw(Bytes::from(vec![crate::msg::IGNORE; 400]))
+            .expect("B");
+        wait_pred(|| handle.pending_bytes() > after_k, "B sealed").await;
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+        let after_b = handle.pending_bytes();
+        let b_wire = after_b.saturating_sub(after_k);
+        assert!(
+            b_wire >= k_wire,
+            "B >= K is the old-formula must-red shape (b={b_wire} k={k_wire})"
+        );
+
+        let max_ex_queued = slot.max_excluding_kex_need();
+        let live_non_kex = fl.total().saturating_sub(fl.kex_live());
+        eprintln!(
+            "f14-fix5 akb queued: a={a_wire} k={k_wire} b={b_wire} \
+             kex_in_writer={} kex_live={} non_kex={live_non_kex} max_ex={max_ex_queued}",
+            fl.kex_in_writer(),
+            fl.kex_live()
+        );
+        assert_eq!(live_non_kex, a_wire + b_wire, "B must stay non-kex");
+        assert!(
+            max_ex_queued >= a_wire + b_wire,
+            "non-kex peak lower bound must include A+B (max_ex={max_ex_queued})"
+        );
+
+        // Drain exactly A+K. Aggregate FIFO would debit A+B and leave K live.
+        allow.store(a_wire + k_wire, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        wait_pred(
+            || written.load(Ordering::SeqCst) >= a_wire + k_wire,
+            "drained A+K",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+
+        eprintln!(
+            "f14-fix5 akb after A+K drain: pending={} kex_in_writer={} kex_live={} \
+             written={} mismatch={}",
+            handle.pending_bytes(),
+            fl.kex_in_writer(),
+            fl.kex_live(),
+            written.load(Ordering::SeqCst),
+            slot.mismatch()
+        );
+        assert_eq!(
+            fl.kex_in_writer(),
+            0,
+            "HARD: kex identity must retire when A+K have left (old FIFO leaves K)"
+        );
+        assert_eq!(fl.kex_live(), 0, "HARD: kex_live must follow kex_in_writer");
+        assert_eq!(
+            handle.pending_bytes(),
+            b_wire,
+            "B must still be queued after A+K drain"
+        );
+        assert_eq!(
+            fl.total().saturating_sub(fl.kex_live()),
+            b_wire,
+            "HARD: remaining B is non-kex, not residual K"
+        );
+        assert_eq!(slot.mismatch(), 0);
+
+        allow.store(usize::MAX, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        wait_pred(|| handle.pending_bytes() == 0, "full drain").await;
+        assert_eq!(fl.kex_live(), 0);
+        assert_eq!(fl.kex_in_writer(), 0);
+        assert_eq!(slot.mismatch(), 0);
+
+        join.abort();
+        let _ = join.await;
+    }
+
+    /// R4 / fix5: two-packet SealBatch, first seal injected fail — refund
+    /// failed reserved *and* the unprocessed remainder.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_seal_first_fail_refunds_remainder() {
+        use std::sync::atomic::AtomicUsize;
+        use crate::server::supervisor::{FullLedger, LedgerMaxSlot};
+
+        let slot = LedgerMaxSlot::new();
+        let pending_arc = Arc::new(AtomicUsize::new(0));
+        let fl = Arc::new(FullLedger::new(
+            pending_arc.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            slot.clone(),
+        ));
+        let fail = Arc::new(AtomicBool::new(true));
+        let progress = AtomicWriteProgress::new();
+        let (_c, cancel_rx) = watch::channel(false);
+        let hooks = WriterHooks {
+            full_ledger: Some(fl.clone()),
+            pending_override: Some(pending_arc),
+            fail_next_seal: Some(fail),
+            ..WriterHooks::default()
+        };
+        let (handle, join, mut evt) = spawn_writer_with_hooks(
+            HangWrite,
+            PacketWriter::clear(),
+            progress,
+            cancel_rx,
+            hooks,
+        );
+        let baseline = handle.pending_bytes();
+        assert_eq!(baseline, 0);
+
+        let ack = handle
+            .try_seal_batch_and_install(
+                vec![Bytes::from(vec![0u8; 120]), Bytes::from(vec![0u8; 80])],
+                3,
+                Box::new(crate::cipher::clear::Key {}),
+                Compression::None,
+                false,
+                false,
+            )
+            .expect("batch accepted before seal");
+        let seal_res = ack.await.expect("ack channel");
+        assert!(seal_res.is_err(), "first payload fail_next_seal");
+
+        wait_pred(
+            || handle.pending_bytes() == baseline && fl.kex_live() == 0,
+            "remainder refunded",
+        )
+        .await;
+        let _ = evt.try_recv();
+        eprintln!(
+            "f14-fix5 batch fail refund: pending={} kex_live={} kex_in_writer={} mismatch={}",
+            handle.pending_bytes(),
+            fl.kex_live(),
+            fl.kex_in_writer(),
+            slot.mismatch()
+        );
+        assert_eq!(handle.pending_bytes(), baseline);
+        assert_eq!(fl.kex_live(), 0);
+        assert_eq!(fl.kex_in_writer(), 0);
+        assert_eq!(slot.mismatch(), 0);
+
+        join.abort();
+        let _ = join.await;
     }
 }

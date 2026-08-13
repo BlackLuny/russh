@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::ErrorKind;
 use std::sync::Arc;
 
 use channels::WindowSizeRef;
@@ -22,6 +21,9 @@ use crate::pending_inbound::{
 };
 use crate::server::supervisor::{
     AtomicWriteProgress, DisconnectCause, RekeyDeadline, WriteWatchdog,
+};
+use crate::server::reader::{
+    spawn_reader, stop_reader_task, InstallInboundEpoch, ReaderEvent, ReaderHandle, ReaderHooks,
 };
 use crate::server::writer::{spawn_writer, stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
@@ -66,6 +68,8 @@ pub struct Session {
     pub(crate) handshake_deadline_at: Option<tokio::time::Instant>,
     /// S2a: handle to the independent WriterTask (None until stream is split).
     pub(crate) writer: Option<WriterHandle>,
+    /// S3a: handle to the independent ReaderTask (None until stream is split).
+    pub(crate) reader: Option<ReaderHandle>,
     /// Supervisor first-cause staged from `reply()` (InstallAck fail etc.) so the
     /// main loop can `record_cause` and take the unified Cancelling path (r2 P1).
     pub(crate) pending_supervisor_cause: Option<DisconnectCause>,
@@ -111,19 +115,23 @@ pub(crate) enum KexAfterInstall {
     InitialComplete,
 }
 
-/// Dual-condition KEX install transaction (run-loop owned).
+/// Triple-condition KEX install transaction (run-loop owned).
 ///
 /// Conditions for **completion actions** (Idle / clear deadline / replay):
 /// 1. Outbound atomic install ACKed (`phase == InstallAcked`)
 /// 2. Peer Done merged (`after.is_some()`)
+/// 3. Inbound epoch ACKed (`inbound_acked`) when a ReaderTask exists
 ///
-/// **Inbound commit is separate** — always at Done, never delayed to InstallAck.
-/// Advanced by capacity notify, InstallAck events, loop-top — never blocked in `reply()`.
+/// `reply()` never awaits either ACK.
 pub(crate) struct PendingKexInstall {
     pub generation: u64,
     /// `None` until peer Done (or set at register for skip_exchange).
     pub after: Option<KexAfterInstall>,
     pub phase: PendingKexPhase,
+    /// Reader `InstallAckInbound` received (or no Reader — unit tests).
+    pub inbound_acked: bool,
+    /// `InstallInboundEpoch` successfully try_pushed to Reader (or applied locally).
+    pub inbound_sent: bool,
 }
 
 impl std::fmt::Debug for PendingKexInstall {
@@ -132,6 +140,8 @@ impl std::fmt::Debug for PendingKexInstall {
             .field("generation", &self.generation)
             .field("after", &self.after)
             .field("phase", &self.phase)
+            .field("inbound_acked", &self.inbound_acked)
+            .field("inbound_sent", &self.inbound_sent)
             .finish()
     }
 }
@@ -1398,7 +1408,7 @@ impl Session {
         let (stream_read, stream_write) = stream.split();
         let buffer = SSHBuffer::new();
 
-        // Allow handing out references to the cipher
+        // Hand inbound epoch to Reader; leave a clear stub on Session (S2b PacketWriter analog).
         let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
         std::mem::swap(&mut opening_cipher, &mut self.common.remote_to_local);
 
@@ -1410,10 +1420,6 @@ impl Session {
             future_or_pending(self.common.config.inactivity_timeout, tokio::time::sleep);
         pin!(inactivity_timer);
 
-        let reading = start_reading(stream_read, buffer, opening_cipher);
-        pin!(reading);
-        let mut is_reading = None;
-
         // Scheme C: in-flight `reserve_owned()` futures for backpressured channels. Kept local to
         // the run loop (not on `Session`, which must stay `Debug`). Each resolution delivers one
         // queued inbound item without the loop ever blocking on a single channel's slow consumer.
@@ -1422,6 +1428,7 @@ impl Session {
         // ── S2b: spawn WriterTask owning PacketWriter + write half ───────────
         let write_progress = AtomicWriteProgress::new();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let reader_cancel = cancel_rx.clone();
         // Move outbound epoch (PacketWriter) into Writer; leave clear placeholder on Session.
         let outbound_pw = std::mem::replace(
             &mut self.common.packet_writer,
@@ -1452,6 +1459,7 @@ impl Session {
                     fail_next_seal: self.common.config.fail_next_seal.clone(),
                     fail_next_socket_write: self.common.config.fail_next_socket_write.clone(),
                     socket_hang: self.common.config.socket_hang.clone(),
+                    socket_hang_seen: self.common.config.socket_hang_seen.clone(),
                     force_next_bulk_full: self.common.config.force_next_bulk_full.clone(),
                     capacity_chain: self.common.config.capacity_chain.clone(),
                     dequeue_hold: self.common.config.dequeue_hold.clone(),
@@ -1477,23 +1485,54 @@ impl Session {
         let writer_abort = writer_join_raw.abort_handle();
         let mut writer_join = Some(writer_join_raw);
 
-        // Drop guard stays armed until production stop_writer_task finishes (r2).
-        // Early `?` / return Err still cancel+abort; normal path disarms only after join.
-        struct WriterTeardownGuard {
-            abort: tokio::task::AbortHandle,
+        // ── S3a: spawn ReaderTask owning read half + inbound epoch ──────────
+        let reader_hooks = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                crate::server::reader::ReaderHooks {
+                    observe: self.common.config.reader_observe.clone(),
+                    read_hold: self.common.config.reader_read_hold.clone(),
+                    mid_packet_hold: self.common.config.reader_mid_packet_hold.clone(),
+                    fail_next_read: self.common.config.reader_fail_next_read.clone(),
+                    apply_hold: self.common.config.reader_apply_hold.clone(),
+                }
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                ReaderHooks::default()
+            }
+        };
+        let (reader_handle, reader_join_raw, mut decoded_rx, mut reader_events) = spawn_reader(
+            stream_read,
+            opening_cipher,
+            buffer,
+            reader_cancel,
+            reader_hooks,
+        );
+        self.reader = Some(reader_handle);
+        let reader_abort = reader_join_raw.abort_handle();
+        let mut reader_join = Some(reader_join_raw);
+
+        // Drop guard stays armed until production stop finishes.
+        // Early `?` / return Err still cancel+abort both IO tasks.
+        struct IoTeardownGuard {
+            writer_abort: tokio::task::AbortHandle,
+            reader_abort: tokio::task::AbortHandle,
             cancel_tx: tokio::sync::watch::Sender<bool>,
             armed: bool,
         }
-        impl Drop for WriterTeardownGuard {
+        impl Drop for IoTeardownGuard {
             fn drop(&mut self) {
                 if self.armed {
                     let _ = self.cancel_tx.send(true);
-                    self.abort.abort();
+                    self.writer_abort.abort();
+                    self.reader_abort.abort();
                 }
             }
         }
-        let mut writer_guard = WriterTeardownGuard {
-            abort: writer_abort.clone(),
+        let mut io_guard = IoTeardownGuard {
+            writer_abort: writer_abort.clone(),
+            reader_abort: reader_abort.clone(),
             cancel_tx: cancel_tx.clone(),
             armed: true,
         };
@@ -1510,6 +1549,8 @@ impl Session {
         // Deferred InstallAck while test hold is active (keeps read arm live).
         #[cfg(feature = "_test_hooks")]
         let mut deferred_install_ack: Option<u64> = None;
+        #[cfg(feature = "_test_hooks")]
+        let mut deferred_inbound_ack: Option<u64> = None;
 
         let record_cause = |cause: DisconnectCause, slot: &mut Option<DisconnectCause>| {
             if slot.is_none() {
@@ -1529,6 +1570,34 @@ impl Session {
 
             #[cfg(feature = "_test_hooks")]
             self.publish_kex_observe();
+
+            // Apply deferred inbound ACK once the inbound hold is released (N8).
+            #[cfg(feature = "_test_hooks")]
+            if let Some(generation) = deferred_inbound_ack {
+                let still_held = self
+                    .common
+                    .config
+                    .inbound_ack_hold
+                    .as_ref()
+                    .is_some_and(|h| h.is_held());
+                if !still_held {
+                    deferred_inbound_ack = None;
+                    if let Some(after) = self.on_install_ack_inbound(generation) {
+                        self.apply_kex_after_install(after);
+                        if let Err(e) = self.replay_pending_reads(&mut handler).await {
+                            debug!("pending_reads replay error: deferred inbound ACK");
+                            let _ = e;
+                            record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        }
+                        if let Some(c) = self.pending_supervisor_cause.take() {
+                            record_cause(c, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        }
+                        let _ = self.flush();
+                    }
+                }
+            }
 
             // Apply deferred InstallAck once the test hold is released (R1).
             // Prefer the select arm below for wake; this covers race after release.
@@ -1779,10 +1848,18 @@ impl Session {
             #[cfg(feature = "_test_hooks")]
             let install_ack_hold_fut = {
                 let hold = self.common.config.install_ack_hold.clone();
+                let inbound_hold = self.common.config.inbound_ack_hold.clone();
                 let waiting = deferred_install_ack.is_some();
+                let inbound_waiting = deferred_inbound_ack.is_some();
                 async move {
                     if waiting {
                         if let Some(h) = hold {
+                            h.wait_released().await;
+                            return;
+                        }
+                    }
+                    if inbound_waiting {
+                        if let Some(h) = inbound_hold {
                             h.wait_released().await;
                             return;
                         }
@@ -1812,26 +1889,92 @@ impl Session {
             tokio::pin!(inject_ignore_fut);
 
             tokio::select! {
-                r = &mut reading, if !self.outbound_blocks_inbound_read() => {
-                    let (stream_read, mut buffer, mut opening_cipher) = match r {
-                        Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
-                        Err(e) => {
-                            // writer_guard Drop will cancel+abort
-                            return Err(e.into());
+                // S3a: Reader delivers already-decrypted packets on a capacity-1
+                // pipe (temporary; S3b deletes the wait-if-full exception).
+                pkt = decoded_rx.recv(), if !self.outbound_blocks_inbound_read() => {
+                    let mut pkt = match pkt {
+                        Some(p) => p,
+                        None => {
+                            // decoded_tx drop races with the terminal event.
+                            // Harvest reader_events until Eof / ReadError /
+                            // channel close — never infer PeerError from None.
+                            debug!("decoded pipe closed; harvest reader terminal");
+                            loop {
+                                match reader_events.recv().await {
+                                    Some(ReaderEvent::InstallAckInbound { generation }) => {
+                                        debug!("session: harvest InstallAck Inbound gen={generation}");
+                                        let hold = {
+                                            #[cfg(feature = "_test_hooks")]
+                                            {
+                                                self.common
+                                                    .config
+                                                    .inbound_ack_hold
+                                                    .as_ref()
+                                                    .is_some_and(|h| h.is_held())
+                                            }
+                                            #[cfg(not(feature = "_test_hooks"))]
+                                            {
+                                                false
+                                            }
+                                        };
+                                        if hold {
+                                            #[cfg(feature = "_test_hooks")]
+                                            {
+                                                deferred_inbound_ack = Some(generation);
+                                            }
+                                        } else if let Some(after) =
+                                            self.on_install_ack_inbound(generation)
+                                        {
+                                            self.apply_kex_after_install(after);
+                                            if let Err(e) = self
+                                                .replay_pending_reads(&mut handler)
+                                                .await
+                                            {
+                                                debug!("pending_reads replay error: inbound ACK");
+                                                let _ = e;
+                                                record_cause(
+                                                    DisconnectCause::PeerError,
+                                                    &mut supervisor_cause,
+                                                );
+                                                self.common.disconnected = true;
+                                            }
+                                            if let Some(c) =
+                                                self.pending_supervisor_cause.take()
+                                            {
+                                                record_cause(c, &mut supervisor_cause);
+                                                self.common.disconnected = true;
+                                            }
+                                            let _ = self.flush();
+                                        }
+                                    }
+                                    Some(ReaderEvent::ReadError) => {
+                                        record_cause(
+                                            DisconnectCause::PeerError,
+                                            &mut supervisor_cause,
+                                        );
+                                        self.common.disconnected = true;
+                                        break;
+                                    }
+                                    Some(ReaderEvent::Eof) => {
+                                        debug!("reader eof (harvest after decoded close)");
+                                        self.common.disconnected = true;
+                                        break;
+                                    }
+                                    None => {
+                                        debug!("reader events closed without terminal (cancel)");
+                                        self.common.disconnected = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            break;
                         }
                     };
-                    if buffer.buffer.len() < 5 {
-                        is_reading = Some((stream_read, buffer, opening_cipher));
-                        break
-                    }
-
-                    let mut pkt = self.maybe_decompress(&buffer)?;
 
                     match pkt.buffer.first() {
                         None => (),
                         Some(&crate::msg::DISCONNECT) => {
                             debug!("break");
-                            is_reading = Some((stream_read, buffer, opening_cipher));
                             break;
                         }
                         Some(_) => {
@@ -1843,11 +1986,7 @@ impl Session {
                                     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 }
                             }
-                            // TODO it'd be cleaner to just pass cipher to reply()
-                            std::mem::swap(&mut opening_cipher, &mut self.common.remote_to_local);
 
-                            // S1 3.3: during handshake, bound arm-body awaits so a slow
-                            // handler/kex step cannot stretch the absolute deadline unboundedly.
                             let reply_result = if !handshake_done {
                                 match tokio::time::timeout_at(
                                     handshake_deadline_at,
@@ -1862,35 +2001,21 @@ impl Session {
                                             &mut supervisor_cause,
                                         );
                                         self.common.disconnected = true;
-                                        std::mem::swap(
-                                            &mut opening_cipher,
-                                            &mut self.common.remote_to_local,
-                                        );
                                         break;
                                     }
                                 }
                             } else {
                                 reply(&mut self, &mut handler, &mut pkt).await
                             };
-                            // Always consume staged first-cause before handling Err: a later
-                            // fallible flush in reply() must not drop InstallAck/RekeyTimeout.
                             if let Some(c) = self.pending_supervisor_cause.take() {
                                 record_cause(c, &mut supervisor_cause);
                                 self.common.disconnected = true;
                             }
                             if let Err(e) = reply_result {
-                                // writer_guard Drop will cancel+abort on hard errors
                                 return Err(e);
                             }
-                            // Register reserve futures for any channels that became backpressured
-                            // while handling this packet (their app buffer filled up).
                             self.drain_needs_reserve(&mut inbound_reserves);
-                            buffer.seqn = pkt.seqn; // TODO reply changes seqn internall, find cleaner way
 
-                            std::mem::swap(&mut opening_cipher, &mut self.common.remote_to_local);
-
-                            // R1: this packet was decrypted + handled while a KEX
-                            // install transaction was still open (pending hit).
                             #[cfg(feature = "_test_hooks")]
                             if self.pending_kex_install.is_some() {
                                 if let Some(ref slot) = self.common.config.kex_install_observe {
@@ -1899,7 +2024,6 @@ impl Session {
                             }
                         }
                     }
-                    reading.set(start_reading(stream_read, buffer, opening_cipher));
                 }
                 Some((cid, generation, res)) = inbound_reserves.next(), if !inbound_reserves.is_empty() && !self.blocks_outbound_intake() => {
                     // A backpressured channel's application buffer freed a slot: deliver its head
@@ -1921,7 +2045,7 @@ impl Session {
                     self.common.alive_timeouts = self.common.alive_timeouts.saturating_add(1);
                     if self.common.config.keepalive_max != 0 && self.common.alive_timeouts > self.common.config.keepalive_max {
                         debug!("Timeout, client not responding to keepalives");
-                        // writer_guard Drop will cancel+abort
+                        // io_guard Drop will cancel+abort
                         return Err(crate::Error::KeepaliveTimeout.into());
                     }
                     sent_keepalive = true;
@@ -1929,8 +2053,70 @@ impl Session {
                 }
                 () = &mut inactivity_timer => {
                     debug!("timeout");
-                    // writer_guard Drop will cancel+abort
+                    // io_guard Drop will cancel+abort
                     return Err(crate::Error::InactivityTimeout.into());
+                }
+                // Reader events (inbound InstallAck, read error, EOF).
+                revt = reader_events.recv() => {
+                    match revt {
+                        Some(ReaderEvent::InstallAckInbound { generation }) => {
+                            debug!("session: got InstallAck Inbound gen={generation}");
+                            let hold = {
+                                #[cfg(feature = "_test_hooks")]
+                                {
+                                    self.common
+                                        .config
+                                        .inbound_ack_hold
+                                        .as_ref()
+                                        .is_some_and(|h| h.is_held())
+                                }
+                                #[cfg(not(feature = "_test_hooks"))]
+                                {
+                                    false
+                                }
+                            };
+                            if hold {
+                                #[cfg(feature = "_test_hooks")]
+                                {
+                                    deferred_inbound_ack = Some(generation);
+                                }
+                            } else if let Some(after) =
+                                self.on_install_ack_inbound(generation)
+                            {
+                                self.apply_kex_after_install(after);
+                                if let Err(e) =
+                                    self.replay_pending_reads(&mut handler).await
+                                {
+                                    debug!("pending_reads replay error: inbound ACK");
+                                    let _ = e;
+                                    record_cause(
+                                        DisconnectCause::PeerError,
+                                        &mut supervisor_cause,
+                                    );
+                                    self.common.disconnected = true;
+                                }
+                                if let Some(c) = self.pending_supervisor_cause.take() {
+                                    record_cause(c, &mut supervisor_cause);
+                                    self.common.disconnected = true;
+                                }
+                                let _ = self.flush();
+                            }
+                        }
+                        Some(ReaderEvent::ReadError) => {
+                            record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        }
+                        Some(ReaderEvent::Eof) | None => {
+                            debug!("reader eof / dropped");
+                            if supervisor_cause.is_none()
+                                && self.pending_supervisor_cause.is_none()
+                            {
+                                // Clean EOF: leave first-cause unset so a
+                                // supervisor cause already recorded wins.
+                            }
+                            self.common.disconnected = true;
+                        }
+                    }
                 }
                 // Writer events (InstallAck, write/seal errors, kex queue full).
                 evt = writer_events.recv() => {
@@ -2174,8 +2360,8 @@ impl Session {
             let _ = self.flush();
         }
 
-        // Single absolute grace (S1: no stacked deadlines). Writer stop + read drain
-        // share the same `grace_at`; read drain uses whatever budget remains.
+        // Single absolute grace (S1: no stacked deadlines). Writer + Reader share
+        // the same `grace_at`. Read half lives in Reader — no Session drain.
         let grace_at = tokio::time::Instant::now() + teardown_grace;
         stop_writer_task(
             &cancel_tx,
@@ -2184,24 +2370,8 @@ impl Session {
             grace_at,
         )
         .await;
-        writer_guard.armed = false;
-
-        let read_drain = async {
-            loop {
-                if let Some((stream_read, buffer, opening_cipher)) = is_reading.take() {
-                    reading.set(start_reading(stream_read, buffer, opening_cipher));
-                }
-                match (&mut reading).await {
-                    Ok((0, _, _, _)) => break,
-                    Ok((_, r, b, opening_cipher)) => {
-                        is_reading = Some((r, b, opening_cipher));
-                    }
-                    Err(Error::IO(ref e)) if e.kind() == ErrorKind::UnexpectedEof => break,
-                    Err(_) => break,
-                }
-            }
-        };
-        let _ = tokio::time::timeout_at(grace_at, read_drain).await;
+        stop_reader_task(&mut reader_join, grace_at).await;
+        io_guard.armed = false;
 
         // Convert supervisor first-cause into a typed Error so callers/tests see it.
         if let Some(cause) = supervisor_cause {
@@ -2272,7 +2442,7 @@ impl Session {
             fl.set_kex_need(kex_need);
             fl.slot.note_live_hwm(n);
         } else if let Some(ref slot) = self.common.config.ledger_max {
-            slot.observe(n);
+            slot.observe_parts(n, [writer, pending, kex_need, unconsumed_write]);
         }
         n
     }
@@ -2305,6 +2475,12 @@ impl Session {
             self.pending_kex_install
                 .as_ref()
                 .is_some_and(|p| p.after.is_some()),
+        );
+        slot.set_inbound_acked(
+            self.pending_kex_install
+                .as_ref()
+                .is_some_and(|p| p.inbound_acked)
+                || self.reader.is_none(),
         );
         let non_idle = self.kex.active() || self.pending_kex_install.is_some();
         slot.set_non_idle(non_idle);
@@ -2533,6 +2709,9 @@ impl Session {
             if enc.client_compression.is_deferred() {
                 enc.client_compression
                     .init_decompress(&mut enc.decompress);
+                if let Some(ref reader) = self.reader {
+                    let _ = reader.try_enable_decompress(enc.client_compression.clone());
+                }
             }
         }
         // Seal USERAUTH_SUCCESS (and anything already staged) with pre-activate epoch.
@@ -2702,6 +2881,8 @@ impl Session {
                 activate_compress,
                 reset_seqn,
             },
+            inbound_acked: false,
+            inbound_sent: false,
         });
         self.try_advance_pending_kex_install();
         Ok(())
@@ -2740,6 +2921,8 @@ impl Session {
                 activate_compress,
                 reset_seqn,
             },
+            inbound_acked,
+            inbound_sent,
         }) = self.pending_kex_install.take()
         else {
             return;
@@ -2768,11 +2951,14 @@ impl Session {
             if reset_seqn {
                 self.common.packet_writer.reset_seqn();
             }
-            // Local path: install already applied → InstallAcked dual-condition.
+            // Local path: install already applied → InstallAcked. Inbound
+            // follows Reader if present; unit tests have no Reader.
             self.pending_kex_install = Some(PendingKexInstall {
                 generation,
                 after,
                 phase: PendingKexPhase::InstallAcked,
+                inbound_acked,
+                inbound_sent,
             });
             let _ = self.try_finalize_pending_kex_install();
             return;
@@ -2792,6 +2978,8 @@ impl Session {
                     generation,
                     after,
                     phase: PendingKexPhase::WaitingAck,
+                    inbound_acked,
+                    inbound_sent,
                 });
                 self.publish_kex_observe();
             }
@@ -2817,6 +3005,8 @@ impl Session {
                         activate_compress,
                         reset_seqn,
                     },
+                    inbound_acked,
+                    inbound_sent,
                 });
                 self.publish_kex_observe();
             }
@@ -2824,6 +3014,154 @@ impl Session {
                 debug!("pending kex install: Writer closed");
                 self.stage_cause(DisconnectCause::PeerError);
                 self.publish_kex_observe();
+            }
+        }
+    }
+
+    /// Reader inbound ACK. Marks inbound_acked; finalize only if the other
+    /// two conditions are already met. Never called from `reply()`.
+    pub(crate) fn on_install_ack_inbound(
+        &mut self,
+        generation: u64,
+    ) -> Option<KexAfterInstall> {
+        let Some(p) = self.pending_kex_install.as_mut() else {
+            return None;
+        };
+        if p.generation != generation {
+            return None;
+        }
+        p.inbound_acked = true;
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref slot) = self.common.config.kex_install_observe {
+            slot.set_inbound_acked(true);
+        }
+        self.publish_kex_observe();
+        let ready = self.try_finalize_pending_kex_install();
+        self.publish_kex_observe();
+        ready
+    }
+
+    /// NeedsReply (key-first): extract inbound half and try_push. `delay_inbound_epoch`
+    /// skips this so N2 can force NEWKEYS-first. Never awaits.
+    pub(crate) fn push_inbound_from_kex(
+        &mut self,
+        kex: &mut crate::server::kex::ServerKex,
+        generation: u64,
+    ) -> Result<(), ()> {
+        #[cfg(feature = "_test_hooks")]
+        if self
+            .common
+            .config
+            .delay_inbound_epoch
+            .as_ref()
+            .is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Ok(());
+        }
+        let Some(ih) = kex.take_inbound_epoch_install() else {
+            return Ok(());
+        };
+        let post_auth = matches!(
+            self.common.encrypted.as_ref().map(|e| &e.state),
+            Some(EncryptedState::InitCompression | EncryptedState::Authenticated)
+        );
+        let activate = !ih.compression.is_deferred() || post_auth;
+        self.try_push_inbound_epoch(generation, ih, activate)
+    }
+
+    /// Done path: push inbound if NeedsReply did not already.
+    pub(crate) fn push_inbound_from_newkeys_if_needed(
+        &mut self,
+        newkeys: &mut crate::session::NewKeys,
+        generation: u64,
+        strict_rekey: bool,
+    ) -> Result<(), ()> {
+        if self
+            .pending_kex_install
+            .as_ref()
+            .is_some_and(|p| p.inbound_sent)
+        {
+            return Ok(());
+        }
+        let ih = crate::server::kex::ServerKex::take_inbound_from_newkeys(
+            newkeys,
+            strict_rekey,
+        );
+        let post_auth = matches!(
+            self.common.encrypted.as_ref().map(|e| &e.state),
+            Some(EncryptedState::InitCompression | EncryptedState::Authenticated)
+        );
+        let activate = !ih.compression.is_deferred() || post_auth;
+        self.try_push_inbound_epoch(generation, ih, activate)
+    }
+
+    /// Try-push inbound epoch to Reader (capacity 1). Never awaits.
+    /// No Reader (unit tests): install locally into `remote_to_local` and
+    /// mark inbound_acked so the dual-condition tests stay valid.
+    pub(crate) fn try_push_inbound_epoch(
+        &mut self,
+        generation: u64,
+        half: crate::server::kex::InboundEpochInstall,
+        activate_decompress: bool,
+    ) -> Result<(), ()> {
+        #[cfg(feature = "_test_hooks")]
+        if self
+            .common
+            .config
+            .force_inbound_install_full
+            .as_ref()
+            .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::SeqCst))
+        {
+            self.stage_cause(DisconnectCause::PeerError);
+            return Err(());
+        }
+        if let Some(p) = self.pending_kex_install.as_ref() {
+            if p.inbound_sent {
+                return Ok(());
+            }
+        }
+
+        let epoch = InstallInboundEpoch {
+            generation,
+            cipher: half.cipher,
+            compression: half.compression,
+            activate_decompress,
+            // Connection already negotiated strict-kex: reset at every
+            // inbound install (rekey KEXINIT omits the strict marker).
+            reset_seqn: half.reset_seqn || self.common.strict_kex,
+        };
+
+        let Some(ref reader) = self.reader else {
+            self.common.remote_to_local = epoch.cipher;
+            if let Some(ref mut enc) = self.common.encrypted {
+                if epoch.activate_decompress {
+                    epoch.compression.init_decompress(&mut enc.decompress);
+                }
+            }
+            if let Some(p) = self.pending_kex_install.as_mut() {
+                p.inbound_sent = true;
+                p.inbound_acked = true;
+            }
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref slot) = self.common.config.kex_install_observe {
+                slot.mark_inbound_commit();
+                slot.set_inbound_acked(true);
+            }
+            return Ok(());
+        };
+
+        match reader.try_install_inbound(epoch) {
+            Ok(()) => {
+                if let Some(p) = self.pending_kex_install.as_mut() {
+                    p.inbound_sent = true;
+                    p.inbound_acked = false;
+                }
+                Ok(())
+            }
+            Err(crate::server::reader::TryInstallInboundError::Full(_))
+            | Err(crate::server::reader::TryInstallInboundError::Closed(_)) => {
+                self.stage_cause(DisconnectCause::PeerError);
+                Err(())
             }
         }
     }
@@ -2868,10 +3206,15 @@ impl Session {
         Some(after)
     }
 
-    /// If phase==InstallAcked && after.is_some(), take and return after for apply.
+    /// If phase==InstallAcked && after.is_some() && inbound ready, take and return after.
     fn try_finalize_pending_kex_install(&mut self) -> Option<KexAfterInstall> {
+        let inbound_ok = self.reader.is_none()
+            || self
+                .pending_kex_install
+                .as_ref()
+                .is_some_and(|p| p.inbound_acked);
         let ready = self.pending_kex_install.as_ref().is_some_and(|p| {
-            matches!(p.phase, PendingKexPhase::InstallAcked) && p.after.is_some()
+            matches!(p.phase, PendingKexPhase::InstallAcked) && p.after.is_some() && inbound_ok
         });
         if !ready {
             return None;
@@ -2947,10 +3290,11 @@ impl Session {
                         .init_decompress(&mut enc.decompress);
                 }
             }
-            // Per-direction cutover: inbound switches at peer NEWKEYS (this call).
-            common.remote_to_local = newkeys.cipher.remote_to_local;
+            // Cipher lives in Reader after S3a. Leave the Session stub alone.
+            // (try_push_inbound_epoch already handed the OpeningKey to Reader.)
             common.strict_kex = common.strict_kex || newkeys.names.strict_kex();
-            let _ = newkeys.cipher.local_to_remote; // stub or unused
+            let _ = newkeys.cipher.local_to_remote;
+            let _ = newkeys.cipher.remote_to_local;
         }
     }
 
@@ -4391,6 +4735,7 @@ mod tests {
             rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
             handshake_deadline_at: None,
             writer: None,
+            reader: None,
             pending_supervisor_cause: None,
             pending_outbound: PendingOutbound::default(),
             pending_kex_install: None,
@@ -4473,6 +4818,8 @@ mod tests {
             generation: 3,
             after: None,
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         assert!(session.on_install_ack_outbound(3).is_none());
         assert!(matches!(
@@ -4496,6 +4843,8 @@ mod tests {
             generation: 7,
             after: None,
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         assert!(session
             .merge_peer_done_into_pending(KexAfterInstall::RekeyComplete)
@@ -4548,6 +4897,8 @@ mod tests {
             generation: 1,
             after: None,
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         let err = session.register_seal_batch_and_install(
             vec![],
@@ -4576,6 +4927,8 @@ mod tests {
             generation: 1,
             after: None,
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         session.fail_pending_kex_install();
         assert_eq!(
@@ -4600,11 +4953,192 @@ mod tests {
                 activate_compress: false,
                 reset_seqn: false,
             },
+            inbound_acked: false,
+            inbound_sent: false,
         });
         assert!(
             session.sealed_backlog_bytes() >= 1000 + Session::WIRE_OVERHEAD_PER_PACKET,
             "NeedSubmit must count payload+wire overhead on the HWM ledger"
         );
+    }
+
+    /// Evidence for F14-kex: after control-plane fill to hard−ε, a NeedSubmit
+    /// batch (kex is allowed to flow) jumps `sealed_backlog` over hard. The
+    /// jump equals the NeedSubmit reservation — not a control-reply leak.
+    #[test]
+    fn kex_need_submit_jumps_hard_after_control_fill() {
+        use byteorder::{BigEndian, ByteOrder};
+        let mut session = authenticated_session();
+        let hard = session.outbound_hard_cap();
+        let edge = hard.saturating_sub(50);
+        let body = edge.saturating_sub(Session::WIRE_OVERHEAD_PER_PACKET);
+        assert!(body > 4, "hard cap must leave room for one framed packet");
+        if let Some(ref mut enc) = session.common.encrypted {
+            let mut pkt = vec![0u8; 4 + body];
+            BigEndian::write_u32(&mut pkt[..4], body as u32);
+            pkt[4] = crate::msg::IGNORE;
+            enc.write.extend_from_slice(&pkt);
+        }
+        let at_edge = session.sealed_backlog_bytes();
+        assert!(
+            at_edge < hard,
+            "control fill must sit under hard (at_edge={at_edge} hard={hard})"
+        );
+        assert!(
+            at_edge + Session::MAX_CONTROL_REPLY_RESERVATION >= hard
+                || at_edge + 50 >= hard,
+            "fill must be at the control-reply edge"
+        );
+
+        // ML-KEM-scale ECDH_REPLY (~1.2KiB) + NEWKEYS, worst-case OH each.
+        let reply = vec![0u8; 1200];
+        let newkeys = vec![crate::msg::NEWKEYS];
+        let kex_weight = reply.len()
+            + newkeys.len()
+            + 2 * Session::WIRE_OVERHEAD_PER_PACKET;
+        session.pending_kex_install = Some(PendingKexInstall {
+            generation: 1,
+            after: None,
+            phase: PendingKexPhase::NeedSubmit {
+                payloads: vec![
+                    bytes::Bytes::from(reply),
+                    bytes::Bytes::from(newkeys),
+                ],
+                cipher: Box::new(crate::cipher::clear::Key {}),
+                compression: Compression::None,
+                activate_compress: false,
+                reset_seqn: false,
+            },
+            inbound_acked: false,
+            inbound_sent: false,
+        });
+        let after = session.sealed_backlog_bytes();
+        let jumped = after.saturating_sub(at_edge);
+        eprintln!(
+            "f14-fix3 kex jump: at_edge={at_edge} after={after} hard={hard} \
+             jumped={jumped} kex_weight={kex_weight}"
+        );
+        assert_eq!(jumped, kex_weight, "jump must be exactly the NeedSubmit reservation");
+        assert!(
+            after > hard,
+            "NeedSubmit after control-fill must cross hard (after={after} hard={hard})"
+        );
+        assert!(
+            after.saturating_sub(kex_weight) <= hard,
+            "non-kex remainder must stay ≤ hard"
+        );
+    }
+
+    /// R3 / fix4: real `register_seal_batch_and_install` + Writer first-accept.
+    /// Before linearized kex identity, `kex_peak` stayed 0 on this path.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn kex_direct_accept_after_control_fill_tracks_identity() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        use byteorder::{BigEndian, ByteOrder};
+        use crate::server::supervisor::{AtomicWriteProgress, FullLedger, LedgerMaxSlot};
+        use crate::server::writer::{spawn_writer_with_hooks, WriterHooks};
+
+        let slot = LedgerMaxSlot::new();
+        let pending_arc = Arc::new(AtomicUsize::new(0));
+        let sess_pend = Arc::new(AtomicUsize::new(0));
+        let fl = Arc::new(FullLedger::new(
+            pending_arc.clone(),
+            sess_pend,
+            slot.clone(),
+        ));
+        let hang = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let progress = AtomicWriteProgress::new();
+        let (_c, cancel_rx) = tokio::sync::watch::channel(false);
+        let hooks = WriterHooks {
+            full_ledger: Some(fl.clone()),
+            pending_override: Some(pending_arc),
+            socket_hang: Some(hang.clone()),
+            ..WriterHooks::default()
+        };
+        let (handle, join, _evt) = spawn_writer_with_hooks(
+            HangWrite,
+            crate::sshbuffer::PacketWriter::clear(),
+            progress,
+            cancel_rx,
+            hooks,
+        );
+
+        let mut session = authenticated_session();
+        session.writer = Some(handle);
+        session.full_ledger = Some(fl.clone());
+        session.pending_outbound.set_full_ledger(fl);
+
+        let hard = session.outbound_hard_cap();
+        let edge = hard.saturating_sub(50);
+        let body = edge.saturating_sub(Session::WIRE_OVERHEAD_PER_PACKET);
+        if let Some(ref mut enc) = session.common.encrypted {
+            let mut pkt = vec![0u8; 4 + body];
+            BigEndian::write_u32(&mut pkt[..4], body as u32);
+            pkt[4] = crate::msg::IGNORE;
+            enc.write.extend_from_slice(&pkt);
+        }
+        let at_edge = session.sealed_backlog_bytes();
+        assert!(at_edge < hard, "fill under hard at_edge={at_edge} hard={hard}");
+        assert_eq!(
+            slot.kex_peak(),
+            0,
+            "no kex identity before register"
+        );
+
+        // R2 overshoot was 3043B. Two-packet reservation:
+        // 2867 + 1 + 2*88 = 3044.
+        let reply = vec![0u8; 2867];
+        let newkeys = vec![crate::msg::NEWKEYS];
+        let kex_weight = reply.len()
+            + newkeys.len()
+            + 2 * Session::WIRE_OVERHEAD_PER_PACKET;
+        assert_eq!(kex_weight, 3044);
+
+        session
+            .register_seal_batch_and_install(
+                vec![bytes::Bytes::from(reply), bytes::Bytes::from(newkeys)],
+                11,
+                Box::new(crate::cipher::clear::Key {}),
+                Compression::None,
+                true,
+                false,
+                None,
+            )
+            .expect("direct accept");
+
+        let max = slot.max();
+        let kex_peak = slot.kex_peak();
+        let max_ex = slot.max_excluding_kex_need();
+        eprintln!(
+            "f14-fix4 direct accept: at_edge={at_edge} max={max} hard={hard} \
+             kex_weight={kex_weight} kex_peak={kex_peak} max_ex_kex={max_ex} \
+             parts={:?}",
+            slot.parts()
+        );
+
+        assert_eq!(
+            kex_peak, kex_weight,
+            "HARD: direct Writer accept must publish kex_peak (was 0 before fix4)"
+        );
+        assert!(
+            max > hard,
+            "HARD: must observe the overshoot scene (max={max} hard={hard})"
+        );
+        assert!(
+            max <= hard.saturating_add(kex_peak),
+            "HARD: total ≤ hard+kex_peak (max={max} hard={hard} kex_peak={kex_peak})"
+        );
+        assert!(
+            max_ex <= hard,
+            "HARD: linearized non-kex ≤ hard (max_ex={max_ex} hard={hard})"
+        );
+
+        hang.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(session.writer.take());
+        join.abort();
+        let _ = join.await;
     }
 
     /// Framing-aware budget: tiny max-packet cannot claim full budget as payload.
@@ -4642,6 +5176,8 @@ mod tests {
                 activate_compress: false,
                 reset_seqn: false,
             },
+            inbound_acked: false,
+            inbound_sent: false,
         });
         assert!(session.blocks_outbound_intake());
         assert_eq!(session.active_rekey_gen(), Some(5));
@@ -4668,6 +5204,8 @@ mod tests {
                 activate_compress: false,
                 reset_seqn: false,
             },
+            inbound_acked: false,
+            inbound_sent: false,
         });
         let eligible = session.sealed_backlog_bytes() as u64;
         assert!(eligible >= 4096);
@@ -4704,6 +5242,8 @@ mod tests {
                 activate_compress: false,
                 reset_seqn: false,
             },
+            inbound_acked: false,
+            inbound_sent: false,
         });
         let backlog = session.sealed_backlog_bytes();
         // Must count both write residual and NeedSubmit.
@@ -4735,6 +5275,8 @@ mod tests {
             generation: 9,
             after: Some(KexAfterInstall::RekeyComplete),
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Pre-stage a different first cause.
         session.stage_cause(DisconnectCause::WriteStalled);
@@ -5140,6 +5682,8 @@ mod tests {
             generation: 3,
             after: Some(KexAfterInstall::RekeyComplete),
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Writer die → fail path.
         join.abort();
@@ -5158,8 +5702,9 @@ mod tests {
         assert!(session.pending_supervisor_cause.is_some());
     }
 
-    /// R1: Done-before-ACK arming of next read future uses new inbound cipher (swap path).
-    /// Under pre-勘误 logic (inbound wait for ACK) this assertion fails.
+    /// Retired swap-path probe. Production no longer `mem::swap`s the inbound
+    /// cipher in `Session::run` (S3a: Reader owns the epoch). Equivalent
+    /// red-test: `test_s3a_reader::n1_*` + `reader::mid_read_install_does_not_apply`.
     #[test]
     fn r1_done_before_ack_swaps_new_inbound_into_read_future() {
         let mut session = authenticated_session();
@@ -5171,6 +5716,8 @@ mod tests {
             generation: 7,
             after: None,
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Peer Done this turn: commit inbound (new tag 0x22) but do NOT InstallAck-complete.
         // Mirrors commit_rekey_inbound's cipher assignment without full NewKeys construct.
@@ -5231,6 +5778,8 @@ mod tests {
             generation: 0,
             after: Some(KexAfterInstall::InitialComplete),
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Done turn: commit inbound only (ACK not yet).
         set_inbound(&mut session, Box::new(TagOpen(0x33)));
@@ -5316,6 +5865,8 @@ mod tests {
                     activate_compress,
                     reset_seqn,
                 },
+                inbound_acked: false,
+                inbound_sent: false,
             });
         } else {
             session.pending_kex_install = Some(PendingKexInstall {
@@ -5328,6 +5879,8 @@ mod tests {
                     activate_compress: true,
                     reset_seqn: true,
                 },
+                inbound_acked: false,
+                inbound_sent: false,
             });
         }
 
@@ -5423,6 +5976,8 @@ mod tests {
                     activate_compress,
                     reset_seqn,
                 },
+                inbound_acked: false,
+                inbound_sent: false,
             });
         } else {
             session.pending_kex_install = Some(PendingKexInstall {
@@ -5435,6 +5990,8 @@ mod tests {
                     activate_compress: true,
                     reset_seqn: true,
                 },
+                inbound_acked: false,
+                inbound_sent: false,
             });
         }
 
@@ -5947,6 +6504,8 @@ mod tests {
             generation: 8,
             after: Some(KexAfterInstall::RekeyComplete),
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Writer fail injection: abort join → Closed.
         join.abort();
@@ -6062,6 +6621,8 @@ mod tests {
             generation: 0,
             after: Some(KexAfterInstall::InitialComplete),
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         join.abort();
         let _ = join.await;
@@ -6078,6 +6639,8 @@ mod tests {
             generation: 1,
             after: None,
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         assert!(
             !session.should_park_kexinit(),
@@ -6100,6 +6663,8 @@ mod tests {
             generation: 2,
             after: Some(KexAfterInstall::RekeyComplete),
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Park a KEXINIT as should_park would.
         assert!(session.should_park_kexinit());
@@ -6132,6 +6697,8 @@ mod tests {
             generation: 4,
             after: None, // ACK first
             phase: PendingKexPhase::WaitingAck,
+                    inbound_acked: false,
+            inbound_sent: false,
         });
         // Before peer Done: must NOT park.
         assert!(!session.should_park_kexinit());

@@ -793,6 +793,32 @@ pub struct FloodServerConfig {
     /// Queued SUCCESS/FAILURE count (S2c fix1).
     #[cfg(feature = "_test_hooks")]
     pub reply_queue: Option<Arc<russh::server::ReplyQueueSlot>>,
+    /// Hold inbound InstallAck (S3a N8).
+    #[cfg(feature = "_test_hooks")]
+    pub inbound_ack_hold: Option<Arc<russh::server::InstallAckHoldGate>>,
+    /// Reader park/await/apply observation (S3a).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_observe: Option<Arc<russh::server::ReaderObserveSlot>>,
+    /// Hold Reader before cipher::read (S3a mid-read).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_read_hold: Option<Arc<russh::server::ReadHoldGate>>,
+    /// Next inbound install try_push Full (S3a N7).
+    #[cfg(feature = "_test_hooks")]
+    pub force_inbound_install_full: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Hold Reader after inbound epoch recv, before apply (S3a N5).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_apply_hold: Option<Arc<russh::server::ReadHoldGate>>,
+    /// Skip NeedsReply inbound send (S3a N2).
+    #[cfg(feature = "_test_hooks")]
+    pub delay_inbound_epoch: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Writer took the hang path with undrained bytes (S3a N5).
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang_seen: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Next Reader transport read becomes ReadError.
+    #[cfg(feature = "_test_hooks")]
+    pub reader_fail_next_read: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Optional Preferred override (N6 disable strict-kex).
+    pub preferred: Option<russh::Preferred>,
 }
 
 impl Default for FloodServerConfig {
@@ -852,6 +878,23 @@ impl Default for FloodServerConfig {
             outbound_order: None,
             #[cfg(feature = "_test_hooks")]
             reply_queue: None,
+            #[cfg(feature = "_test_hooks")]
+            inbound_ack_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_read_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            force_inbound_install_full: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_apply_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            delay_inbound_epoch: None,
+            #[cfg(feature = "_test_hooks")]
+            socket_hang_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_fail_next_read: None,
+            preferred: None,
         }
     }
 }
@@ -931,6 +974,27 @@ impl FloodServer {
                 outbound_order: self.cfg.outbound_order.clone(),
                 #[cfg(feature = "_test_hooks")]
                 reply_queue: self.cfg.reply_queue.clone(),
+                #[cfg(feature = "_test_hooks")]
+                inbound_ack_hold: self.cfg.inbound_ack_hold.clone(),
+                #[cfg(feature = "_test_hooks")]
+                reader_observe: self.cfg.reader_observe.clone(),
+                #[cfg(feature = "_test_hooks")]
+                reader_read_hold: self.cfg.reader_read_hold.clone(),
+                #[cfg(feature = "_test_hooks")]
+                force_inbound_install_full: self.cfg.force_inbound_install_full.clone(),
+                #[cfg(feature = "_test_hooks")]
+                reader_apply_hold: self.cfg.reader_apply_hold.clone(),
+                #[cfg(feature = "_test_hooks")]
+                delay_inbound_epoch: self.cfg.delay_inbound_epoch.clone(),
+                #[cfg(feature = "_test_hooks")]
+                socket_hang_seen: self.cfg.socket_hang_seen.clone(),
+                #[cfg(feature = "_test_hooks")]
+                reader_fail_next_read: self.cfg.reader_fail_next_read.clone(),
+                preferred: self
+                    .cfg
+                    .preferred
+                    .clone()
+                    .unwrap_or_else(russh::Preferred::default),
                 ..Default::default()
             });
             if let Err(e) = self.run_on_address(config, addr).await {

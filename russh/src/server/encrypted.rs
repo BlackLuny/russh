@@ -586,6 +586,7 @@ mod tests {
             rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
             handshake_deadline_at: None,
             writer: None,
+            reader: None,
             pending_supervisor_cause: None,
             pending_outbound: crate::server::session::PendingOutbound::default(),
             pending_kex_install: None,

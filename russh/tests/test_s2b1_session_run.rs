@@ -1832,10 +1832,27 @@ async fn f14_control_reply_during_slow_kex_stays_at_hard() -> Result<(), anyhow:
         .await;
     }
     let max = ledger.max();
-    eprintln!("f14 kex-control max={max} hard={hard}");
+    let parts = ledger.parts();
+    let kex_peak = ledger.kex_peak();
+    let max_ex_kex = ledger.max_excluding_kex_need();
+    let kex_jump = ledger.last_kex_jump();
+    eprintln!(
+        "f14 kex-control max={max} hard={hard} parts=[w={} pend={} kex={} enc={}] \
+         kex_peak={kex_peak} kex_jump={kex_jump} max_ex_kex={max_ex_kex}",
+        parts[0], parts[1], parts[2], parts[3]
+    );
+    // KEX NeedSubmit is allowed to flow (S2b) and is not an admit_control_reply
+    // subject. Control/data stay at hard; the NeedSubmit batch is the only
+    // legal overshoot, bounded by the observed kex_peak (0 when no kex landed).
     assert!(
-        max <= hard,
-        "F14 HARD: control flood during slow kex must stay ≤ hard (max={max})"
+        max <= hard.saturating_add(kex_peak),
+        "F14 HARD: total may exceed hard only by the NeedSubmit batch \
+         (max={max} hard={hard} kex_peak={kex_peak} max_ex_kex={max_ex_kex} parts={parts:?})"
+    );
+    assert!(
+        max_ex_kex <= hard,
+        "F14 HARD: control/data (excluding NeedSubmit) must stay ≤ hard \
+         (max_ex_kex={max_ex_kex} hard={hard} parts={parts:?})"
     );
     Ok(())
 }

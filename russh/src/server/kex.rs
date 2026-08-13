@@ -45,6 +45,8 @@ pub(crate) struct ServerKex {
     config: Arc<Config>,
     /// Outbound half already extracted at local-NEWKEYS NeedsReply (S2b).
     outbound_half_taken: bool,
+    /// Inbound half extracted at NeedsReply (S3a key-first) or Done.
+    inbound_half_taken: bool,
 }
 
 impl Debug for ServerKex {
@@ -76,6 +78,28 @@ pub(crate) struct OutboundEpochInstall {
     pub reset_seqn: bool,
 }
 
+/// Inbound half material extracted at local-NEWKEYS / Done (S3a).
+pub(crate) struct InboundEpochInstall {
+    pub cipher: Box<dyn crate::cipher::OpeningKey + Send>,
+    pub compression: crate::compression::Compression,
+    pub reset_seqn: bool,
+}
+
+fn inbound_from_newkeys(newkeys: &mut NewKeys, strict_rekey: bool) -> InboundEpochInstall {
+    let cipher = std::mem::replace(
+        &mut newkeys.cipher.remote_to_local,
+        Box::new(crate::cipher::clear::Key {}),
+    );
+    // Server inbound is client→server = names.client_compression.
+    let compression = newkeys.names.client_compression.clone();
+    let reset_seqn = newkeys.names.strict_kex() || strict_rekey;
+    InboundEpochInstall {
+        cipher,
+        compression,
+        reset_seqn,
+    }
+}
+
 impl ServerKex {
     pub fn new(
         config: Arc<Config>,
@@ -90,6 +114,7 @@ impl ServerKex {
             cause,
             state: ServerKexState::Created,
             outbound_half_taken: false,
+            inbound_half_taken: false,
         }
     }
 
@@ -120,6 +145,28 @@ impl ServerKex {
             compression,
             reset_seqn,
         })
+    }
+
+    /// Take inbound cipher half exactly once after local NEWKEYS was produced
+    /// (S3a key-first). Leaves a clear-key stub so Done can still consume metadata.
+    pub fn take_inbound_epoch_install(&mut self) -> Option<InboundEpochInstall> {
+        if self.inbound_half_taken {
+            return None;
+        }
+        let ServerKexState::WaitingForNewKeys { ref mut newkeys } = self.state else {
+            return None;
+        };
+        self.inbound_half_taken = true;
+        Some(inbound_from_newkeys(newkeys, self.cause.is_strict_rekey()))
+    }
+
+    /// Extract inbound half from a `Done` `NewKeys` when it was never taken at
+    /// NeedsReply (`none`/skip_exchange / NEWKEYS-first).
+    pub fn take_inbound_from_newkeys(
+        newkeys: &mut NewKeys,
+        strict_rekey: bool,
+    ) -> InboundEpochInstall {
+        inbound_from_newkeys(newkeys, strict_rekey)
     }
 
     /// Extract outbound half from a `Done` `NewKeys` when it was never taken at
