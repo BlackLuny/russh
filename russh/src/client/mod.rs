@@ -1706,17 +1706,18 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
-                    push_packet!(enc.write, {
-                        msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut enc.write)?;
-                        pending.recipient_channel.encode(&mut enc.write)?;
-                        pending.sender_channel.encode(&mut enc.write)?;
-                        pending.window_size.encode(&mut enc.write)?;
-                        pending.packet_size.encode(&mut enc.write)?;
+                    let id = pending.sender_channel;
+                    let mut params = pending.channel_params;
+                    params.enqueue_ctrl(crate::ChannelCtrlItem::OpenConfirmation {
+                        recipient_channel: pending.recipient_channel,
+                        sender_channel: pending.sender_channel.0,
+                        window_size: pending.window_size,
+                        packet_size: pending.packet_size,
                     });
-                    enc.channels
-                        .insert(pending.sender_channel, pending.channel_params);
+                    enc.channels.insert(id, params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
+                    enc.flush_pending(id)?;
                 }
                 Err(reason) => {
                     push_packet!(enc.write, {

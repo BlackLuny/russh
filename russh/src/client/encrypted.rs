@@ -737,19 +737,15 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
-                let channel_params = ChannelParams {
-                    recipient_channel: msg.recipient_channel,
-                    sender_channel: id,
-                    recipient_window_size: msg.recipient_window_size,
-                    sender_window_size: self.common.config.window_size,
-                    recipient_maximum_packet_size: msg.recipient_maximum_packet_size,
-                    sender_maximum_packet_size: self.common.config.maximum_packet_size,
-                    confirmed: true,
-                    wants_reply: false,
-                    pending_data: std::collections::VecDeque::new(),
-                    pending_eof: false,
-                    pending_close: false,
-                };
+                let channel_params = ChannelParams::new(
+                    msg.recipient_channel,
+                    id,
+                    msg.recipient_window_size,
+                    self.common.config.window_size,
+                    msg.recipient_maximum_packet_size,
+                    self.common.config.maximum_packet_size,
+                    true,
+                );
 
                 let (channel, channel_ref) = Channel::new(
                     id,

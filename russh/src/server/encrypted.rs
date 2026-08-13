@@ -592,6 +592,8 @@ mod tests {
             deferred_window_grants: std::collections::HashSet::new(),
             #[cfg(feature = "_test_hooks")]
             full_ledger: None,
+            #[cfg(feature = "_test_hooks")]
+            outbound_log_cursor: 0,
         }
     }
 
@@ -1791,22 +1793,15 @@ impl Session {
         } else {
             unreachable!()
         };
-        let channel_params = ChannelParams {
-            recipient_channel: msg.recipient_channel,
-
-            // "sender" is the local end, i.e. we're the sender, the remote is the recipient.
+        let channel_params = ChannelParams::new(
+            msg.recipient_channel,
             sender_channel,
-
-            recipient_window_size: msg.recipient_window_size,
-            sender_window_size: self.common.config.window_size,
-            recipient_maximum_packet_size: msg.recipient_maximum_packet_size,
-            sender_maximum_packet_size: self.common.config.maximum_packet_size,
-            confirmed: true,
-            wants_reply: false,
-            pending_data: std::collections::VecDeque::new(),
-            pending_eof: false,
-            pending_close: false,
-        };
+            msg.recipient_window_size,
+            self.common.config.window_size,
+            msg.recipient_maximum_packet_size,
+            self.common.config.maximum_packet_size,
+            true,
+        );
 
         let (channel, channel_ref) = Channel::new(
             sender_channel,

@@ -84,6 +84,9 @@ pub struct Session {
     /// ledger mutation samples the complete sum (R4).
     #[cfg(feature = "_test_hooks")]
     pub(crate) full_ledger: Option<std::sync::Arc<crate::server::supervisor::FullLedger>>,
+    /// Test-only: how far into `enc.write` we have already logged (S2c).
+    #[cfg(feature = "_test_hooks")]
+    pub(crate) outbound_log_cursor: usize,
 }
 
 /// Completion actions when **both** outbound InstallAck and peer-Done are satisfied.
@@ -3046,6 +3049,10 @@ impl Session {
                 if enc.write_cursor >= enc.write.len() {
                     enc.write_cursor = 0;
                     enc.write.clear();
+                    #[cfg(feature = "_test_hooks")]
+                    {
+                        self.outbound_log_cursor = 0;
+                    }
                     break;
                 }
                 // During kex / pending-install, do not dump application
@@ -3155,11 +3162,81 @@ impl Session {
     }
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, Error> {
-        if let Some(ref mut enc) = self.common.encrypted {
-            enc.flush_pending(channel)
+        self.flush_pending_ex(channel, !self.blocks_outbound_intake())
+    }
+
+    /// Emit head-of-lane fences only (no DATA). Used so EOF/CLOSE/SUCCESS
+    /// are not locked by a zero window, without dumping DATA past HWM.
+    pub fn flush_pending_fences(&mut self, channel: ChannelId) -> Result<usize, Error> {
+        self.flush_pending_ex(channel, false)
+    }
+
+    fn flush_pending_ex(&mut self, channel: ChannelId, allow_data: bool) -> Result<usize, Error> {
+        // SUCCESS/FAILURE were admitted at generation (enqueue). Emitting
+        // them must not re-check HWM — that left parked replies in
+        // `pending_ctrl` forever while new ones kept arriving.
+        let n = if let Some(ref mut enc) = self.common.encrypted {
+            enc.flush_pending_admitted(channel, |_| true, allow_data)?
         } else {
-            Ok(0)
+            0
+        };
+        self.publish_reply_queue();
+        self.record_outbound_from_write();
+        Ok(n)
+    }
+
+    /// Parse newly staged `enc.write` packets into the S2c order log.
+    fn record_outbound_from_write(&mut self) {
+        #[cfg(feature = "_test_hooks")]
+        if let (Some(log), Some(enc)) = (
+            self.common.config.outbound_order.as_ref(),
+            self.common.encrypted.as_ref(),
+        ) {
+            use byteorder::{BigEndian, ByteOrder};
+            let mut cursor = self.outbound_log_cursor.max(enc.write_cursor);
+            while cursor + 4 <= enc.write.len() {
+                let len = BigEndian::read_u32(&enc.write[cursor..cursor + 4]) as usize;
+                if cursor + 4 + len > enc.write.len() || len == 0 {
+                    break;
+                }
+                let msg = enc.write[cursor + 4];
+                let chan = if len >= 5 && cursor + 9 <= enc.write.len() {
+                    BigEndian::read_u32(&enc.write[cursor + 5..cursor + 9])
+                } else {
+                    0
+                };
+                // CHANNEL_DATA: msg(1)+recip(4)+string_len(4)+payload
+                // CHANNEL_EXTENDED_DATA: msg(1)+recip(4)+ext(4)+string_len(4)+payload
+                let payload_len = match msg {
+                    crate::msg::CHANNEL_DATA
+                        if len >= 9 && cursor + 13 <= enc.write.len() =>
+                    {
+                        BigEndian::read_u32(&enc.write[cursor + 9..cursor + 13])
+                    }
+                    crate::msg::CHANNEL_EXTENDED_DATA
+                        if len >= 13 && cursor + 17 <= enc.write.len() =>
+                    {
+                        BigEndian::read_u32(&enc.write[cursor + 13..cursor + 17])
+                    }
+                    _ => 0,
+                };
+                match msg {
+                    crate::msg::CHANNEL_OPEN_CONFIRMATION
+                    | crate::msg::CHANNEL_DATA
+                    | crate::msg::CHANNEL_EXTENDED_DATA
+                    | crate::msg::CHANNEL_EOF
+                    | crate::msg::CHANNEL_CLOSE
+                    | crate::msg::CHANNEL_SUCCESS
+                    | crate::msg::CHANNEL_FAILURE
+                    | crate::msg::CHANNEL_REQUEST => log.push(chan, msg, payload_len),
+                    _ => {}
+                }
+                cursor += 4 + len;
+            }
+            self.outbound_log_cursor = cursor;
         }
+        #[cfg(not(feature = "_test_hooks"))]
+        let _ = self;
     }
 
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
@@ -3256,41 +3333,74 @@ impl Session {
         channel: ChannelId,
         success: bool,
     ) -> Result<(), crate::Error> {
-        let recipient = {
-            let Some(enc) = self.common.encrypted.as_ref() else {
-                return Ok(());
-            };
-            let Some(ch) = enc.channels.get(&channel) else {
-                return Ok(());
-            };
-            assert!(ch.confirmed);
-            if !ch.wants_reply {
-                return Ok(());
-            }
-            ch.recipient_channel
-        };
-        let weight = 5usize.saturating_add(Self::WIRE_OVERHEAD_PER_PACKET);
-        debug_assert!(weight <= Self::MAX_CONTROL_REPLY_RESERVATION);
-        if !self.admit_control_reply(weight, true) {
+        let wants = self
+            .common
+            .encrypted
+            .as_ref()
+            .and_then(|enc| enc.channels.get(&channel))
+            .map(|ch| {
+                assert!(ch.confirmed);
+                ch.wants_reply
+            })
+            .unwrap_or(false);
+        if !wants {
             return Ok(());
         }
-        if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(ch) = enc.channels.get_mut(&channel) {
+        // Generation-point admit (invariant #3): reservation covers
+        // already-queued SUCCESS/FAILURE plus this one, even if a parked
+        // DATA head means we cannot emit yet.
+        let queued = self
+            .common
+            .encrypted
+            .as_ref()
+            .map(|enc| enc.queued_reply_reservation())
+            .unwrap_or(0);
+        let weight = crate::ChannelCtrlItem::reply_reservation();
+        if !self.admit_control_reply(weight.saturating_add(queued), true) {
+            if let Some(ch) = self
+                .common
+                .encrypted
+                .as_mut()
+                .and_then(|enc| enc.channels.get_mut(&channel))
+            {
                 ch.wants_reply = false;
-                if success {
-                    debug!("channel_success {channel:?}");
-                }
-                push_packet!(enc.write, {
-                    enc.write.push(if success {
-                        msg::CHANNEL_SUCCESS
-                    } else {
-                        msg::CHANNEL_FAILURE
-                    });
-                    recipient.encode(&mut enc.write)?;
-                })
             }
+            self.publish_reply_queue();
+            return Ok(());
         }
+        if let Some(ch) = self
+            .common
+            .encrypted
+            .as_mut()
+            .and_then(|enc| enc.channels.get_mut(&channel))
+        {
+            ch.wants_reply = false;
+            if success {
+                debug!("channel_success {channel:?}");
+            }
+            ch.enqueue_ctrl(if success {
+                crate::ChannelCtrlItem::Success
+            } else {
+                crate::ChannelCtrlItem::Failure
+            });
+        }
+        self.publish_reply_queue();
+        let _ = self.try_drain_channel_under_budget(channel)?;
+        let _ = self.flush_pending_fences(channel)?;
         Ok(())
+    }
+
+    fn publish_reply_queue(&self) {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref slot) = self.common.config.reply_queue {
+            let n = self
+                .common
+                .encrypted
+                .as_ref()
+                .map(|enc| enc.queued_reply_count())
+                .unwrap_or(0);
+            slot.observe(n);
+        }
     }
 
     fn finalize_channel_open_reply(
@@ -3301,17 +3411,20 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
-                    push_packet!(enc.write, {
-                        msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut enc.write)?;
-                        pending.recipient_channel.encode(&mut enc.write)?;
-                        pending.sender_channel.0.encode(&mut enc.write)?;
-                        pending.window_size.encode(&mut enc.write)?;
-                        pending.packet_size.encode(&mut enc.write)?;
+                    let id = pending.sender_channel;
+                    let mut params = pending.channel_params;
+                    params.enqueue_ctrl(crate::ChannelCtrlItem::OpenConfirmation {
+                        recipient_channel: pending.recipient_channel,
+                        sender_channel: pending.sender_channel.0,
+                        window_size: pending.window_size,
+                        packet_size: pending.packet_size,
                     });
-                    enc.channels
-                        .insert(pending.sender_channel, pending.channel_params);
+                    enc.channels.insert(id, params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
+                    // Head fence: emit now (unbounded, no window, no HWM).
+                    enc.flush_pending(id)?;
+                    self.record_outbound_from_write();
                 }
                 Err(reason) => {
                     push_packet!(enc.write, {
@@ -3349,14 +3462,18 @@ impl Session {
 
     /// Close a channel.
     pub fn close(&mut self, channel: ChannelId) -> Result<(), Error> {
-        let emitted = if let Some(ref mut enc) = self.common.encrypted {
-            enc.close(channel)?;
-            // `Encrypted::close` drops the protocol entry only when it actually wrote
-            // CHANNEL_CLOSE; otherwise it parked as `pending_close` behind queued data.
-            !enc.channel_exists(channel)
+        if let Some(ref mut enc) = self.common.encrypted {
+            enc.park_close(channel);
         } else {
             unreachable!()
-        };
+        }
+        let _ = self.try_drain_channel_under_budget(channel)?;
+        let _ = self.flush_pending_fences(channel)?;
+        let emitted = !self
+            .common
+            .encrypted
+            .as_ref()
+            .is_some_and(|e| e.channel_exists(channel));
         if emitted {
             // The close is on the wire and the peer owes only its mandatory reply. If nothing is
             // reading this channel any more — the dominant path, since dropping a `Channel` is
@@ -3378,10 +3495,13 @@ impl Session {
     /// Send EOF to a channel
     pub fn eof(&mut self, channel: ChannelId) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            enc.eof(channel)
+            enc.park_eof(channel);
         } else {
             unreachable!()
         }
+        let _ = self.try_drain_channel_under_budget(channel)?;
+        let _ = self.flush_pending_fences(channel)?;
+        Ok(())
     }
 
     /// Send data to a channel. On session channels, `extended` can be
@@ -3411,13 +3531,13 @@ impl Session {
         } else {
             self.outbound_budget_for_peer_packet(max_pkt, Self::CHANNEL_DATA_FRAMING)
         };
-        if let Some(enc) = self.common.encrypted.as_mut() {
+        let clamp = if let Some(enc) = self.common.encrypted.as_mut() {
             if kex_block {
                 enc.data(channel, data, true)?;
+                None
             } else {
                 let clamp = if let Some(ch) = enc.channels.get_mut(&channel) {
                     let saved = ch.recipient_window_size;
-                    // One peer packet max per call under current budget.
                     let payload_cap = Self::max_payload_for_budget(budget, max_pkt)
                         .min(max_pkt as usize) as u32;
                     let cap = payload_cap.min(saved);
@@ -3427,16 +3547,26 @@ impl Session {
                     None
                 };
                 enc.data(channel, data, false)?;
-                if let (Some((saved, cap)), Some(ch)) =
-                    (clamp, enc.channels.get_mut(&channel))
-                {
-                    ch.recipient_window_size =
-                        ch.recipient_window_size.saturating_add(saved.saturating_sub(cap));
-                }
+                clamp
             }
         } else {
             unreachable!()
+        };
+        if !kex_block {
+            // Emit under the clamped window (HWM one-packet), then restore.
+            let _ = self.flush_pending(channel)?;
+            if let (Some((saved, cap)), Some(ch)) = (
+                clamp,
+                self.common
+                    .encrypted
+                    .as_mut()
+                    .and_then(|e| e.channels.get_mut(&channel)),
+            ) {
+                ch.recipient_window_size =
+                    ch.recipient_window_size.saturating_add(saved.saturating_sub(cap));
+            }
         }
+        self.record_outbound_from_write();
         // Convert write→Writer so budget reflects sealed state for subsequent calls.
         let _ = self.flush();
         // Unpark at most one more peer-packet under a fresh budget snapshot.
@@ -3449,7 +3579,25 @@ impl Session {
     }
 
     /// Move channel `pending_data` into `enc.write` while HWM budget remains.
+    /// Also emits head-of-lane fences (CONFIRMATION/EOF/CLOSE/SUCCESS/FAILURE)
+    /// even when the peer window is 0 (I3 / appendix B.8).
     pub(crate) fn try_drain_pending_data_under_budget(&mut self) -> Result<(), Error> {
+        // Pass 1: fence items — no window predicate, no DATA dump.
+        let fence_ids: Vec<_> = self
+            .common
+            .encrypted
+            .as_ref()
+            .map(|enc| {
+                enc.channels
+                    .keys()
+                    .copied()
+                    .filter(|id| enc.has_pending_lane(*id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in fence_ids {
+            let _ = self.flush_pending_fences(id)?;
+        }
         loop {
             let id = self.common.encrypted.as_ref().and_then(|enc| {
                 enc.channels
@@ -3477,6 +3625,8 @@ impl Session {
         &mut self,
         id: crate::ChannelId,
     ) -> Result<usize, Error> {
+        // Fences first (no DATA). DATA still uses the HWM clamp below.
+        let _ = self.flush_pending_fences(id)?;
         if self.blocks_outbound_intake() {
             return Ok(0);
         }
@@ -3602,18 +3752,18 @@ impl Session {
         client_can_do: bool,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                assert!(channel.confirmed);
-                push_packet!(enc.write, {
-                    msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
-
-                    channel.recipient_channel.encode(&mut enc.write)?;
-                    "xon-xoff".encode(&mut enc.write)?;
-                    0u8.encode(&mut enc.write)?;
-                    (client_can_do as u8).encode(&mut enc.write)?;
-                })
+            if let Some(ch) = enc.channels.get_mut(&channel) {
+                assert!(ch.confirmed);
+                let mut body = Vec::new();
+                ch.recipient_channel.encode(&mut body)?;
+                "xon-xoff".encode(&mut body)?;
+                0u8.encode(&mut body)?;
+                (client_can_do as u8).encode(&mut body)?;
+                ch.enqueue_ctrl(crate::ChannelCtrlItem::Request { body: body.into() });
             }
         }
+        let _ = self.try_drain_channel_under_budget(channel)?;
+        let _ = self.flush_pending_fences(channel)?;
         Ok(())
     }
 
@@ -3654,18 +3804,18 @@ impl Session {
         exit_status: u32,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                assert!(channel.confirmed);
-                push_packet!(enc.write, {
-                    msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
-
-                    channel.recipient_channel.encode(&mut enc.write)?;
-                    "exit-status".encode(&mut enc.write)?;
-                    0u8.encode(&mut enc.write)?;
-                    exit_status.encode(&mut enc.write)?;
-                })
+            if let Some(ch) = enc.channels.get_mut(&channel) {
+                assert!(ch.confirmed);
+                let mut body = Vec::new();
+                ch.recipient_channel.encode(&mut body)?;
+                "exit-status".encode(&mut body)?;
+                0u8.encode(&mut body)?;
+                exit_status.encode(&mut body)?;
+                ch.enqueue_ctrl(crate::ChannelCtrlItem::Request { body: body.into() });
             }
         }
+        let _ = self.try_drain_channel_under_budget(channel)?;
+        let _ = self.flush_pending_fences(channel)?;
         Ok(())
     }
 
@@ -3679,21 +3829,21 @@ impl Session {
         language_tag: &str,
     ) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = enc.channels.get_mut(&channel) {
                 assert!(channel.confirmed);
-                push_packet!(enc.write, {
-                    msg::CHANNEL_REQUEST.encode(&mut enc.write)?;
-
-                    channel.recipient_channel.encode(&mut enc.write)?;
-                    "exit-signal".encode(&mut enc.write)?;
-                    0u8.encode(&mut enc.write)?;
-                    signal.name().encode(&mut enc.write)?;
-                    (core_dumped as u8).encode(&mut enc.write)?;
-                    error_message.encode(&mut enc.write)?;
-                    language_tag.encode(&mut enc.write)?;
-                })
+                let mut body = Vec::new();
+                channel.recipient_channel.encode(&mut body)?;
+                "exit-signal".encode(&mut body)?;
+                0u8.encode(&mut body)?;
+                signal.name().encode(&mut body)?;
+                (core_dumped as u8).encode(&mut body)?;
+                error_message.encode(&mut body)?;
+                language_tag.encode(&mut body)?;
+                channel.enqueue_ctrl(crate::ChannelCtrlItem::Request { body: body.into() });
             }
         }
+        let _ = self.try_drain_channel_under_budget(channel)?;
+        let _ = self.flush_pending_fences(channel)?;
         Ok(())
     }
 
@@ -4105,6 +4255,8 @@ mod tests {
             deferred_window_grants: HashSet::new(),
             #[cfg(feature = "_test_hooks")]
             full_ledger: None,
+            #[cfg(feature = "_test_hooks")]
+            outbound_log_cursor: 0,
         }
     }
 

@@ -505,38 +505,262 @@ impl Display for ChannelId {
     }
 }
 
+/// Per-channel outbound lane (I3 / S2c).
+///
+/// `Opening → Confirmed → Closing`. OPEN_CONFIRMATION is the head fence;
+/// EOF/CLOSE are tail fences. Only DATA/EXTENDED_DATA consume the peer
+/// window (RFC 4254 §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelLaneState {
+    Opening,
+    Confirmed,
+    Closing,
+}
+
+/// Control / fence items sharing a submission sequence with `pending_data`.
+#[derive(Debug)]
+pub(crate) enum ChannelCtrlItem {
+    OpenConfirmation {
+        recipient_channel: u32,
+        sender_channel: u32,
+        window_size: u32,
+        packet_size: u32,
+    },
+    Eof,
+    Close,
+    Success,
+    Failure,
+    /// CHANNEL_REQUEST body after the message byte (recipient already encoded).
+    Request { body: bytes::Bytes },
+}
+
+impl ChannelCtrlItem {
+    #[allow(dead_code)]
+    pub(crate) fn is_fence(&self) -> bool {
+        matches!(
+            self,
+            Self::OpenConfirmation { .. }
+                | Self::Eof
+                | Self::Close
+                | Self::Success
+                | Self::Failure
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ssh_msg(&self) -> u8 {
+        match self {
+            Self::OpenConfirmation { .. } => crate::msg::CHANNEL_OPEN_CONFIRMATION,
+            Self::Eof => crate::msg::CHANNEL_EOF,
+            Self::Close => crate::msg::CHANNEL_CLOSE,
+            Self::Success => crate::msg::CHANNEL_SUCCESS,
+            Self::Failure => crate::msg::CHANNEL_FAILURE,
+            Self::Request { .. } => crate::msg::CHANNEL_REQUEST,
+        }
+    }
+
+    /// Wire reservation for a peer-driven CHANNEL_SUCCESS/FAILURE (5+88).
+    pub(crate) fn reply_reservation() -> usize {
+        5 + 4 + 1 + 19 + 64
+    }
+
+    pub(crate) fn is_peer_reply(&self) -> bool {
+        matches!(self, Self::Success | Self::Failure)
+    }
+}
+
 /// The parameters of a channel.
 #[derive(Debug)]
 pub(crate) struct ChannelParams {
-    recipient_channel: u32,
-    sender_channel: ChannelId,
-    recipient_window_size: u32,
-    sender_window_size: u32,
-    recipient_maximum_packet_size: u32,
-    sender_maximum_packet_size: u32,
+    pub(crate) recipient_channel: u32,
+    pub(crate) sender_channel: ChannelId,
+    pub(crate) recipient_window_size: u32,
+    pub(crate) sender_window_size: u32,
+    pub(crate) recipient_maximum_packet_size: u32,
+    pub(crate) sender_maximum_packet_size: u32,
     /// Has the other side confirmed the channel?
     pub confirmed: bool,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    wants_reply: bool,
+    pub(crate) wants_reply: bool,
     /// (buffer, extended stream #, data offset in buffer)
-    pending_data: std::collections::VecDeque<(bytes::Bytes, Option<u32>, usize)>,
-    pending_eof: bool,
-    pending_close: bool,
+    pub(crate) pending_data: std::collections::VecDeque<(bytes::Bytes, Option<u32>, usize)>,
+    /// EOF has been submitted. Sticky after the fence is emitted so
+    /// later DATA cannot follow CHANNEL_EOF on the wire (RFC 4254
+    /// §5.3 / I3). Also dedups a second `eof()`.
+    pub(crate) pending_eof: bool,
+    pub(crate) pending_close: bool,
+    /// I3 lane. Independent of `confirmed` (that flag is "peer accepted our
+    /// open" / "we accepted theirs"). We stay `Opening` until *our*
+    /// OPEN_CONFIRMATION is emitted.
+    pub(crate) lane: ChannelLaneState,
+    next_seq: u64,
+    /// Submission sequence parallel to `pending_data`.
+    data_seqs: std::collections::VecDeque<u64>,
+    pending_ctrl: std::collections::VecDeque<(u64, ChannelCtrlItem)>,
 }
 
 impl ChannelParams {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        recipient_channel: u32,
+        sender_channel: ChannelId,
+        recipient_window_size: u32,
+        sender_window_size: u32,
+        recipient_maximum_packet_size: u32,
+        sender_maximum_packet_size: u32,
+        confirmed: bool,
+    ) -> Self {
+        Self {
+            recipient_channel,
+            sender_channel,
+            recipient_window_size,
+            sender_window_size,
+            recipient_maximum_packet_size,
+            sender_maximum_packet_size,
+            confirmed,
+            wants_reply: false,
+            pending_data: std::collections::VecDeque::new(),
+            pending_eof: false,
+            pending_close: false,
+            lane: ChannelLaneState::Opening,
+            next_seq: 0,
+            data_seqs: std::collections::VecDeque::new(),
+            pending_ctrl: std::collections::VecDeque::new(),
+        }
+    }
+
     pub fn confirm(&mut self, c: &ChannelOpenConfirmation) {
         self.recipient_channel = c.sender_channel; // "sender" is the sender of the confirmation
         self.recipient_window_size = c.initial_window_size;
         self.recipient_maximum_packet_size = c.maximum_packet_size;
         self.confirmed = true;
+        // We opened this channel; the peer confirmed. No local
+        // OPEN_CONFIRMATION is queued, so the lane can go Confirmed.
+        if !self
+            .pending_ctrl
+            .iter()
+            .any(|(_, i)| matches!(i, ChannelCtrlItem::OpenConfirmation { .. }))
+        {
+            self.lane = ChannelLaneState::Confirmed;
+        }
     }
 
-    pub(crate) fn take_pending_controls(&mut self) -> (bool, bool) {
-        (
-            std::mem::take(&mut self.pending_eof),
-            std::mem::take(&mut self.pending_close),
-        )
+    fn alloc_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        s
+    }
+
+    /// Enqueue a **new** DATA / EXTENDED_DATA item.
+    ///
+    /// After EOF or CLOSE has been submitted (`pending_eof` or
+    /// `lane == Closing`), new application data is dropped and this
+    /// returns `false` (RFC 4254 §5.3 / I3 tail fence). Callers treat
+    /// that as success: a concurrent handler `data()` racing `eof()`
+    /// must not panic. Remainder of an already-accepted packet is
+    /// reinserted via [`Self::push_data_front`], which is **not** gated.
+    pub(crate) fn enqueue_data(
+        &mut self,
+        buf: bytes::Bytes,
+        ext: Option<u32>,
+        from: usize,
+    ) -> bool {
+        if self.pending_eof || self.lane == ChannelLaneState::Closing {
+            return false;
+        }
+        let seq = self.alloc_seq();
+        self.pending_data.push_back((buf, ext, from));
+        self.data_seqs.push_back(seq);
+        true
+    }
+
+    pub(crate) fn enqueue_ctrl(&mut self, item: ChannelCtrlItem) {
+        match &item {
+            ChannelCtrlItem::Eof => self.pending_eof = true,
+            ChannelCtrlItem::Close => {
+                self.pending_close = true;
+                self.lane = ChannelLaneState::Closing;
+            }
+            ChannelCtrlItem::OpenConfirmation { .. } => {
+                self.lane = ChannelLaneState::Opening;
+            }
+            _ => {}
+        }
+        let seq = self.alloc_seq();
+        self.pending_ctrl.push_back((seq, item));
+    }
+
+    pub(crate) fn has_pending_ctrl(&self) -> bool {
+        !self.pending_ctrl.is_empty()
+    }
+
+    /// Peer-driven SUCCESS/FAILURE still sitting in the lane (not yet on
+    /// `enc.write`). Used for generation-point admit so a parked DATA head
+    /// cannot hide an unbounded reply queue.
+    pub(crate) fn queued_reply_count(&self) -> usize {
+        self.pending_ctrl
+            .iter()
+            .filter(|(_, i)| i.is_peer_reply())
+            .count()
+    }
+
+    pub(crate) fn queued_reply_reservation(&self) -> usize {
+        self.queued_reply_count()
+            .saturating_mul(ChannelCtrlItem::reply_reservation())
+    }
+
+    pub(crate) fn ctrl_ahead_of_data(&self) -> bool {
+        match (self.data_seqs.front(), self.pending_ctrl.front()) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(d), Some((c, _))) => *c <= *d,
+        }
+    }
+
+    pub(crate) fn pop_ctrl_front(&mut self) -> Option<ChannelCtrlItem> {
+        let item = self.pending_ctrl.pop_front().map(|(_, i)| i)?;
+        match &item {
+            // `pending_eof` stays set: the tail fence has been
+            // submitted (and is now on the wire). New DATA must
+            // remain rejected.
+            ChannelCtrlItem::Close => self.pending_close = false,
+            ChannelCtrlItem::OpenConfirmation { .. } => {
+                self.lane = ChannelLaneState::Confirmed;
+            }
+            _ => {}
+        }
+        Some(item)
+    }
+
+    pub(crate) fn peek_ctrl_front(&self) -> Option<&ChannelCtrlItem> {
+        self.pending_ctrl.front().map(|(_, i)| i)
+    }
+
+    pub(crate) fn pop_data_front(
+        &mut self,
+    ) -> Option<(bytes::Bytes, Option<u32>, usize, u64)> {
+        let seq = self.data_seqs.pop_front()?;
+        let (buf, ext, from) = self.pending_data.pop_front()?;
+        Some((buf, ext, from, seq))
+    }
+
+    pub(crate) fn push_data_front(
+        &mut self,
+        buf: bytes::Bytes,
+        ext: Option<u32>,
+        from: usize,
+        seq: u64,
+    ) {
+        self.pending_data.push_front((buf, ext, from));
+        self.data_seqs.push_front(seq);
+    }
+
+    pub(crate) fn clear_outbound(&mut self) {
+        self.pending_data.clear();
+        self.data_seqs.clear();
+        self.pending_ctrl.clear();
+        self.pending_eof = false;
+        self.pending_close = false;
     }
 }
 

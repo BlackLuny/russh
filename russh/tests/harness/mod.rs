@@ -787,6 +787,12 @@ pub struct FloodServerConfig {
     /// Write-watchdog armed/eligible edges (`_test_hooks`, fix14).
     #[cfg(feature = "_test_hooks")]
     pub watchdog_observe: Option<Arc<russh::server::WatchdogObserveSlot>>,
+    /// Per-channel outbound emit order (S2c).
+    #[cfg(feature = "_test_hooks")]
+    pub outbound_order: Option<Arc<russh::server::OutboundOrderSlot>>,
+    /// Queued SUCCESS/FAILURE count (S2c fix1).
+    #[cfg(feature = "_test_hooks")]
+    pub reply_queue: Option<Arc<russh::server::ReplyQueueSlot>>,
 }
 
 impl Default for FloodServerConfig {
@@ -842,6 +848,10 @@ impl Default for FloodServerConfig {
             deferred_grant: None,
             #[cfg(feature = "_test_hooks")]
             watchdog_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            outbound_order: None,
+            #[cfg(feature = "_test_hooks")]
+            reply_queue: None,
         }
     }
 }
@@ -917,6 +927,10 @@ impl FloodServer {
                 deferred_grant: self.cfg.deferred_grant.clone(),
                 #[cfg(feature = "_test_hooks")]
                 watchdog_observe: self.cfg.watchdog_observe.clone(),
+                #[cfg(feature = "_test_hooks")]
+                outbound_order: self.cfg.outbound_order.clone(),
+                #[cfg(feature = "_test_hooks")]
+                reply_queue: self.cfg.reply_queue.clone(),
                 ..Default::default()
             });
             if let Err(e) = self.run_on_address(config, addr).await {

@@ -5,7 +5,7 @@
 //! this module only supplies the supervision state machine and timers that the
 //! current `select!` loop polls.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -640,6 +640,69 @@ impl DeferredGrantSlot {
 
     pub fn emitted(&self) -> u64 {
         self.emitted.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only: outbound channel-message order as packets enter `enc.write`
+/// (the Writer seal FIFO). Used by S2c wire-order assertions.
+/// Third field is the CHANNEL_DATA / EXTENDED_DATA payload length (0 otherwise).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct OutboundOrderSlot {
+    msgs: std::sync::Mutex<Vec<(u32, u8, u32)>>,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl OutboundOrderSlot {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    pub fn push(&self, channel: u32, msg: u8, payload_len: u32) {
+        if let Ok(mut g) = self.msgs.lock() {
+            g.push((channel, msg, payload_len));
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<(u32, u8, u32)> {
+        self.msgs.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Message types for `channel` in emit order.
+    pub fn types_for(&self, channel: u32) -> Vec<u8> {
+        self.snapshot()
+            .into_iter()
+            .filter(|(c, _, _)| *c == channel)
+            .map(|(_, m, _)| m)
+            .collect()
+    }
+}
+
+/// Test-only: peer-driven SUCCESS/FAILURE still queued in lanes.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct ReplyQueueSlot {
+    current: AtomicUsize,
+    max: AtomicUsize,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl ReplyQueueSlot {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    pub fn observe(&self, n: usize) {
+        self.current.store(n, Ordering::SeqCst);
+        let _ = self.max.fetch_max(n, Ordering::SeqCst);
+    }
+
+    pub fn current(&self) -> usize {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    pub fn max(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
     }
 }
 

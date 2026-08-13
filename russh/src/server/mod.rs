@@ -67,7 +67,8 @@ pub use self::supervisor::{
 #[cfg(feature = "_test_hooks")]
 pub use self::supervisor::{
     CapacityChainSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate, InstallAckHoldGate,
-    KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, WatchdogObserveSlot,
+    KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, OutboundOrderSlot,
+    ReplyQueueSlot, WatchdogObserveSlot,
 };
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
@@ -191,6 +192,12 @@ pub struct Config {
     /// Test-only: write-watchdog armed / eligible / rekey-gen edges.
     #[cfg(feature = "_test_hooks")]
     pub watchdog_observe: Option<std::sync::Arc<supervisor::WatchdogObserveSlot>>,
+    /// Test-only: per-channel outbound emit order (S2c fence / wire order).
+    #[cfg(feature = "_test_hooks")]
+    pub outbound_order: Option<std::sync::Arc<supervisor::OutboundOrderSlot>>,
+    /// Test-only: queued SUCCESS/FAILURE count (S2c fix1 generation admit).
+    #[cfg(feature = "_test_hooks")]
+    pub reply_queue: Option<std::sync::Arc<supervisor::ReplyQueueSlot>>,
 }
 
 impl Default for Config {
@@ -259,6 +266,10 @@ impl Default for Config {
             deferred_grant: None,
             #[cfg(feature = "_test_hooks")]
             watchdog_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            outbound_order: None,
+            #[cfg(feature = "_test_hooks")]
+            reply_queue: None,
         }
     }
 }
@@ -1254,6 +1265,8 @@ where
         deferred_window_grants: std::collections::HashSet::new(),
         #[cfg(feature = "_test_hooks")]
         full_ledger: None,
+        #[cfg(feature = "_test_hooks")]
+        outbound_log_cursor: 0,
     };
 
     session.begin_rekey()?;

@@ -117,12 +117,14 @@ impl ChannelFlushResult {
             ChannelFlushResult::Complete { wrote, .. } => *wrote,
         }
     }
-    pub(crate) fn complete(wrote: usize, channel: &mut ChannelParams) -> Self {
-        let (pending_eof, pending_close) = channel.take_pending_controls();
+    pub(crate) fn complete(wrote: usize, _channel: &mut ChannelParams) -> Self {
+        // Flags live only on the lane (`pending_ctrl` + enqueue/pop). Do not
+        // take-and-clear them here: that dual-track used to drop EOF/CLOSE
+        // bookkeeping while the items were still queued (or vice versa).
         ChannelFlushResult::Complete {
             wrote,
-            pending_eof,
-            pending_close,
+            pending_eof: false,
+            pending_close: false,
         }
     }
 }
@@ -288,21 +290,36 @@ impl Encrypted {
         Ok(())
     }
 
+    pub fn park_eof(&mut self, channel: ChannelId) {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            if !ch.pending_eof && !ch.pending_close {
+                ch.enqueue_ctrl(crate::ChannelCtrlItem::Eof);
+            }
+        }
+    }
+
     pub fn eof(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        if let Some(channel) = self.has_pending_data_mut(channel) {
-            channel.pending_eof = true;
-        } else {
-            self.byte(channel, msg::CHANNEL_EOF)?;
+        self.park_eof(channel);
+        if !self.has_pending_data(channel) {
+            let _ = self.flush_pending(channel)?;
         }
         Ok(())
     }
 
+    pub fn park_close(&mut self, channel: ChannelId) {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            if !ch.pending_close {
+                ch.enqueue_ctrl(crate::ChannelCtrlItem::Close);
+            }
+        }
+    }
+
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        if let Some(channel) = self.has_pending_data_mut(channel) {
-            channel.pending_close = true;
-        } else {
-            self.byte(channel, msg::CHANNEL_CLOSE)?;
-            self.channels.remove(&channel);
+        self.park_close(channel);
+        // Do not auto-flush DATA: a full-window flush here would skip HWM.
+        // Callers that want emit (unit tests) invoke flush_pending themselves.
+        if !self.has_pending_data(channel) {
+            let _ = self.flush_pending(channel)?;
         }
         Ok(())
     }
@@ -319,9 +336,7 @@ impl Encrypted {
     /// entry for the life of the session.
     pub fn close_discarding_pending(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         if let Some(c) = self.channels.get_mut(&channel) {
-            c.pending_data.clear();
-            c.pending_eof = false;
-            c.pending_close = false;
+            c.clear_outbound();
         }
         self.byte(channel, msg::CHANNEL_CLOSE)?;
         self.channels.remove(&channel);
@@ -395,39 +410,141 @@ impl Encrypted {
         Ok(false)
     }
 
+    fn encode_ctrl_payload(
+        channel: &ChannelParams,
+        item: &crate::ChannelCtrlItem,
+    ) -> Result<Vec<u8>, crate::Error> {
+        let mut body = Vec::new();
+        match item {
+            crate::ChannelCtrlItem::OpenConfirmation {
+                recipient_channel,
+                sender_channel,
+                window_size,
+                packet_size,
+            } => {
+                msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut body)?;
+                recipient_channel.encode(&mut body)?;
+                sender_channel.encode(&mut body)?;
+                window_size.encode(&mut body)?;
+                packet_size.encode(&mut body)?;
+            }
+            crate::ChannelCtrlItem::Eof => {
+                body.push(msg::CHANNEL_EOF);
+                channel.recipient_channel.encode(&mut body)?;
+            }
+            crate::ChannelCtrlItem::Close => {
+                body.push(msg::CHANNEL_CLOSE);
+                channel.recipient_channel.encode(&mut body)?;
+            }
+            crate::ChannelCtrlItem::Success => {
+                body.push(msg::CHANNEL_SUCCESS);
+                channel.recipient_channel.encode(&mut body)?;
+            }
+            crate::ChannelCtrlItem::Failure => {
+                body.push(msg::CHANNEL_FAILURE);
+                channel.recipient_channel.encode(&mut body)?;
+            }
+            crate::ChannelCtrlItem::Request { body: rest } => {
+                body.push(msg::CHANNEL_REQUEST);
+                body.extend_from_slice(rest);
+            }
+        }
+        Ok(body)
+    }
+
+    fn push_ctrl_to_write(write: &mut Vec<u8>, payload: &[u8]) -> Result<(), crate::Error> {
+        push_packet!(write, {
+            write.extend_from_slice(payload);
+        });
+        Ok(())
+    }
+
+    /// Drain one channel's outbound lane. Control/fence items are never
+    /// gated on the peer window (I3 / appendix B.8). DATA still consumes
+    /// window via `data_noqueue`.
     fn flush_channel(
         write: &mut Vec<u8>,
         channel: &mut ChannelParams,
+        admit: &mut impl FnMut(&crate::ChannelCtrlItem) -> bool,
+        allow_data: bool,
     ) -> Result<ChannelFlushResult, crate::Error> {
-        let mut pending_size = 0;
-        while let Some((buf, a, from)) = channel.pending_data.pop_front() {
-            let size = Self::data_noqueue(write, channel, &buf, a, from)?;
-            pending_size += size;
-            if from + size < buf.len() {
-                channel.pending_data.push_front((buf, a, from + size));
-                return Ok(ChannelFlushResult::Incomplete {
-                    wrote: pending_size,
-                });
-            }
-        }
-        Ok(ChannelFlushResult::complete(pending_size, channel))
+        Self::flush_channel_inner(write, None, channel, admit, allow_data)
     }
 
     fn flush_channel_with_writer(
         write: &mut Vec<u8>,
         writer: &mut PacketWriter,
         channel: &mut ChannelParams,
+        admit: &mut impl FnMut(&crate::ChannelCtrlItem) -> bool,
+    ) -> Result<ChannelFlushResult, crate::Error> {
+        Self::flush_channel_inner(write, Some(writer), channel, admit, true)
+    }
+
+    fn flush_channel_inner(
+        write: &mut Vec<u8>,
+        mut writer: Option<&mut PacketWriter>,
+        channel: &mut ChannelParams,
+        admit: &mut impl FnMut(&crate::ChannelCtrlItem) -> bool,
+        allow_data: bool,
     ) -> Result<ChannelFlushResult, crate::Error> {
         let mut pending_size = 0;
-        while let Some((buf, a, from)) = channel.pending_data.pop_front() {
+        loop {
+            if channel.ctrl_ahead_of_data() {
+                let Some(item) = channel.peek_ctrl_front() else {
+                    break;
+                };
+                if !admit(item) {
+                    return Ok(ChannelFlushResult::Incomplete {
+                        wrote: pending_size,
+                    });
+                }
+                let item = channel
+                    .pop_ctrl_front()
+                    .ok_or(crate::Error::Inconsistent)?;
+                let payload = Self::encode_ctrl_payload(channel, &item)?;
+                if write.is_empty() {
+                    if let Some(ref mut w) = writer {
+                        w.write_packet(|packet| {
+                            packet.extend_from_slice(&payload);
+                            Ok(())
+                        })?;
+                    } else {
+                        Self::push_ctrl_to_write(write, &payload)?;
+                    }
+                } else {
+                    Self::push_ctrl_to_write(write, &payload)?;
+                }
+                continue;
+            }
+            if channel.pending_data.is_empty() {
+                break;
+            }
+            if !allow_data {
+                return Ok(ChannelFlushResult::Incomplete {
+                    wrote: pending_size,
+                });
+            }
+            // DATA: window predicate applies (RFC 4254 §5.2).
+            if channel.recipient_window_size == 0 {
+                return Ok(ChannelFlushResult::Incomplete {
+                    wrote: pending_size,
+                });
+            }
+            let (buf, a, from, seq) = channel
+                .pop_data_front()
+                .ok_or(crate::Error::Inconsistent)?;
             let size = if write.is_empty() {
-                Self::data_noqueue_direct(writer, channel, &buf, a, from)?
+                if let Some(ref mut w) = writer {
+                    Self::data_noqueue_direct(w, channel, &buf, a, from)?
+                } else {
+                    Self::data_noqueue(write, channel, &buf, a, from)?
+                }
             } else {
                 Self::data_noqueue(write, channel, &buf, a, from)?
             };
             pending_size += size;
             if from + size < buf.len() {
-                channel.pending_data.push_front((buf, a, from + size));
+                channel.push_data_front(buf, a, from + size, seq);
                 return Ok(ChannelFlushResult::Incomplete {
                     wrote: pending_size,
                 });
@@ -439,27 +556,40 @@ impl Encrypted {
     fn handle_flushed_channel(
         &mut self,
         channel: ChannelId,
-        flush_result: ChannelFlushResult,
+        _flush_result: ChannelFlushResult,
     ) -> Result<(), crate::Error> {
-        if let ChannelFlushResult::Complete {
-            wrote: _,
-            pending_eof,
-            pending_close,
-        } = flush_result
-        {
-            if pending_eof {
-                self.eof(channel)?;
-            }
-            if pending_close {
-                self.close(channel)?;
-            }
+        // CLOSE already written by the lane drain. Drop the protocol
+        // entry once the tail fence is gone and no DATA remains.
+        // CLOSE is never admit-gated, so a queued Close cannot sit behind
+        // a hard-cap refuse. Window=0 with DATA in front is G2 (channel
+        // stays until the peer adjusts or the session dies). Teardown
+        // drops Encrypted, so there is no cross-connection leak.
+        let gone = self.channels.get(&channel).is_some_and(|ch| {
+            ch.lane == crate::ChannelLaneState::Closing
+                && ch.pending_data.is_empty()
+                && !ch.has_pending_ctrl()
+        });
+        if gone {
+            self.channels.remove(&channel);
         }
         Ok(())
     }
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, crate::Error> {
+        self.flush_pending_admitted(channel, |_| true, true)
+    }
+
+    /// Like [`flush_pending`], with a per-ctrl admit hook (server HWM hard
+    /// cap for CHANNEL_SUCCESS/FAILURE). `false` leaves the item queued.
+    /// `allow_data`: when false (kex / pending-install), only fences emit.
+    pub fn flush_pending_admitted(
+        &mut self,
+        channel: ChannelId,
+        mut admit: impl FnMut(&crate::ChannelCtrlItem) -> bool,
+        allow_data: bool,
+    ) -> Result<usize, crate::Error> {
         let flush_result = match self.channels.get_mut(&channel) {
-            Some(ch) => Self::flush_channel(&mut self.write, ch)?,
+            Some(ch) => Self::flush_channel(&mut self.write, ch, &mut admit, allow_data)?,
             None => return Ok(0),
         };
         let wrote = flush_result.wrote();
@@ -473,7 +603,9 @@ impl Encrypted {
         channel: ChannelId,
     ) -> Result<usize, crate::Error> {
         let flush_result = match self.channels.get_mut(&channel) {
-            Some(ch) => Self::flush_channel_with_writer(&mut self.write, writer, ch)?,
+            Some(ch) => {
+                Self::flush_channel_with_writer(&mut self.write, writer, ch, &mut |_| true)?
+            }
             None => return Ok(0),
         };
         let wrote = flush_result.wrote();
@@ -509,6 +641,27 @@ impl Encrypted {
     pub fn has_pending_data(&self, channel: ChannelId) -> bool {
         if let Some(channel) = self.channels.get(&channel) {
             !channel.pending_data.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Sum of wire reservations for SUCCESS/FAILURE still in per-channel lanes.
+    pub(crate) fn queued_reply_reservation(&self) -> usize {
+        self.channels
+            .values()
+            .map(|c| c.queued_reply_reservation())
+            .sum()
+    }
+
+    pub(crate) fn queued_reply_count(&self) -> usize {
+        self.channels.values().map(|c| c.queued_reply_count()).sum()
+    }
+
+    /// DATA or fence/control still queued on the per-channel lane.
+    pub fn has_pending_lane(&self, channel: ChannelId) -> bool {
+        if let Some(ch) = self.channels.get(&channel) {
+            !ch.pending_data.is_empty() || ch.has_pending_ctrl()
         } else {
             false
         }
@@ -679,16 +832,21 @@ impl Encrypted {
             if !channel.confirmed {
                 return Err(crate::Error::WrongChannel);
             }
-            if !channel.pending_data.is_empty() || is_rekeying {
-                channel.pending_data.push_back((buf0, None, 0));
+            let blocked = !channel.pending_data.is_empty()
+                || channel.has_pending_ctrl()
+                || is_rekeying;
+            if !channel.enqueue_data(buf0, None, 0) {
+                // Post-EOF/CLOSE: silent drop (see ChannelParams::enqueue_data).
                 return Ok(());
             }
-            let buf_len = Self::data_noqueue(&mut self.write, channel, &buf0, None, 0)?;
-            if buf_len < buf0.len() {
-                channel.pending_data.push_back((buf0, None, buf_len))
+            if blocked {
+                return Ok(());
             }
         } else {
             debug!("{channel:?} not saved for this session");
+        }
+        if !is_rekeying {
+            self.flush_pending(channel)?;
         }
         Ok(())
     }
@@ -708,20 +866,21 @@ impl Encrypted {
             if !channel.confirmed {
                 return Err(crate::Error::WrongChannel);
             }
-            if !channel.pending_data.is_empty() || is_rekeying {
-                channel.pending_data.push_back((buf0, None, 0));
+            let blocked = !channel.pending_data.is_empty()
+                || channel.has_pending_ctrl()
+                || is_rekeying;
+            if !channel.enqueue_data(buf0, None, 0) {
+                // Post-EOF/CLOSE: silent drop (see ChannelParams::enqueue_data).
                 return Ok(());
             }
-            let buf_len = if self.write.is_empty() {
-                Self::data_noqueue_direct(writer, channel, &buf0, None, 0)?
-            } else {
-                Self::data_noqueue(&mut self.write, channel, &buf0, None, 0)?
-            };
-            if buf_len < buf0.len() {
-                channel.pending_data.push_back((buf0, None, buf_len))
+            if blocked {
+                return Ok(());
             }
         } else {
             debug!("{channel:?} not saved for this session");
+        }
+        if !is_rekeying {
+            self.flush_pending_with_writer(writer, channel)?;
         }
         Ok(())
     }
@@ -741,14 +900,19 @@ impl Encrypted {
             if !channel.confirmed {
                 return Err(crate::Error::WrongChannel);
             }
-            if !channel.pending_data.is_empty() || is_rekeying {
-                channel.pending_data.push_back((buf0, Some(ext), 0));
+            let blocked = !channel.pending_data.is_empty()
+                || channel.has_pending_ctrl()
+                || is_rekeying;
+            if !channel.enqueue_data(buf0, Some(ext), 0) {
+                // Post-EOF/CLOSE: silent drop (see ChannelParams::enqueue_data).
                 return Ok(());
             }
-            let buf_len = Self::data_noqueue(&mut self.write, channel, &buf0, Some(ext), 0)?;
-            if buf_len < buf0.len() {
-                channel.pending_data.push_back((buf0, Some(ext), buf_len))
+            if blocked {
+                return Ok(());
             }
+        }
+        if !is_rekeying {
+            self.flush_pending(channel)?;
         }
         Ok(())
     }
@@ -769,18 +933,19 @@ impl Encrypted {
             if !channel.confirmed {
                 return Err(crate::Error::WrongChannel);
             }
-            if !channel.pending_data.is_empty() || is_rekeying {
-                channel.pending_data.push_back((buf0, Some(ext), 0));
+            let blocked = !channel.pending_data.is_empty()
+                || channel.has_pending_ctrl()
+                || is_rekeying;
+            if !channel.enqueue_data(buf0, Some(ext), 0) {
+                // Post-EOF/CLOSE: silent drop (see ChannelParams::enqueue_data).
                 return Ok(());
             }
-            let buf_len = if self.write.is_empty() {
-                Self::data_noqueue_direct(writer, channel, &buf0, Some(ext), 0)?
-            } else {
-                Self::data_noqueue(&mut self.write, channel, &buf0, Some(ext), 0)?
-            };
-            if buf_len < buf0.len() {
-                channel.pending_data.push_back((buf0, Some(ext), buf_len))
+            if blocked {
+                return Ok(());
             }
+        }
+        if !is_rekeying {
+            self.flush_pending_with_writer(writer, channel)?;
         }
         Ok(())
     }
@@ -846,19 +1011,15 @@ impl Encrypted {
             if let std::collections::hash_map::Entry::Vacant(vacant_entry) =
                 self.channels.entry(ChannelId(self.last_channel_id.0))
             {
-                vacant_entry.insert(ChannelParams {
-                    recipient_channel: 0,
-                    sender_channel: ChannelId(self.last_channel_id.0),
-                    sender_window_size: window_size,
-                    recipient_window_size: 0,
-                    sender_maximum_packet_size: maxpacket,
-                    recipient_maximum_packet_size: 0,
-                    confirmed: false,
-                    wants_reply: false,
-                    pending_data: std::collections::VecDeque::new(),
-                    pending_eof: false,
-                    pending_close: false,
-                });
+                vacant_entry.insert(ChannelParams::new(
+                    0,
+                    ChannelId(self.last_channel_id.0),
+                    0,
+                    window_size,
+                    0,
+                    maxpacket,
+                    false,
+                ));
                 return ChannelId(self.last_channel_id.0);
             }
         }
@@ -967,19 +1128,24 @@ mod tests {
         pending_eof: bool,
         pending_close: bool,
     ) -> ChannelParams {
-        ChannelParams {
+        let mut ch = ChannelParams::new(
             recipient_channel,
             sender_channel,
-            recipient_window_size: 1024,
-            sender_window_size: 1024,
-            recipient_maximum_packet_size: 1024,
-            sender_maximum_packet_size: 1024,
-            confirmed: true,
-            wants_reply: false,
-            pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
-            pending_eof,
-            pending_close,
+            1024,
+            1024,
+            1024,
+            1024,
+            true,
+        );
+        ch.lane = crate::ChannelLaneState::Confirmed;
+        ch.enqueue_data(Bytes::from_static(b"hello"), None, 0);
+        if pending_eof {
+            ch.enqueue_ctrl(crate::ChannelCtrlItem::Eof);
         }
+        if pending_close {
+            ch.enqueue_ctrl(crate::ChannelCtrlItem::Close);
+        }
+        ch
     }
 
     fn packet_types(buf: &[u8]) -> Vec<u8> {
@@ -1010,7 +1176,7 @@ mod tests {
 
     fn test_ready_channel(sender_channel: ChannelId, recipient_channel: u32) -> ChannelParams {
         let mut channel = test_channel(sender_channel, recipient_channel, false, false);
-        channel.pending_data.clear();
+        channel.clear_outbound();
         channel
     }
 
@@ -1021,19 +1187,9 @@ mod tests {
         pending_eof: bool,
         pending_close: bool,
     ) -> ChannelParams {
-        ChannelParams {
-            recipient_channel,
-            sender_channel,
-            recipient_window_size: window_size,
-            sender_window_size: 1024,
-            recipient_maximum_packet_size: 1024,
-            sender_maximum_packet_size: 1024,
-            confirmed: true,
-            wants_reply: false,
-            pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
-            pending_eof,
-            pending_close,
-        }
+        let mut ch = test_channel(sender_channel, recipient_channel, pending_eof, pending_close);
+        ch.recipient_window_size = window_size;
+        ch
     }
 
     // flush_pending (single-channel path)
@@ -1051,7 +1207,11 @@ mod tests {
             packet_types(&encrypted.write),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
-        assert!(!encrypted.channels[&channel_id].pending_eof);
+        assert!(
+            encrypted.channels[&channel_id].pending_eof,
+            "pending_eof stays latched after emit so later DATA cannot follow EOF"
+        );
+        assert!(!encrypted.channels[&channel_id].has_pending_ctrl());
 
         // Second flush must not re-emit EOF.
         encrypted.flush_pending(channel_id).unwrap();
@@ -1148,7 +1308,11 @@ mod tests {
             packet_types(&encrypted.write),
             vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF]
         );
-        assert!(!encrypted.channels[&channel_id].pending_eof);
+        assert!(
+            encrypted.channels[&channel_id].pending_eof,
+            "pending_eof stays latched after emit so later DATA cannot follow EOF"
+        );
+        assert!(!encrypted.channels[&channel_id].has_pending_ctrl());
 
         encrypted.flush_all_pending().unwrap();
         assert_eq!(
@@ -1241,6 +1405,53 @@ mod tests {
         assert_eq!(channel.pending_data.front().unwrap().1, initial_front_ext);
         assert_eq!(channel.pending_data.back().unwrap().0.as_ref(), b"new");
         assert_eq!(channel.pending_data.back().unwrap().1, None);
+        assert!(encrypted.write.is_empty());
+    }
+
+    #[test]
+    fn data_after_eof_is_silently_dropped() {
+        let channel_id = ChannelId(30);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(channel_id, test_ready_channel(channel_id, 50));
+
+        encrypted.eof(channel_id).unwrap();
+        let before = encrypted.channels[&channel_id].pending_data.len();
+        encrypted
+            .data(channel_id, Bytes::from_static(b"after-eof"), false)
+            .unwrap();
+        encrypted
+            .extended_data(channel_id, 1, Bytes::from_static(b"ext-after"), false)
+            .unwrap();
+
+        let channel = &encrypted.channels[&channel_id];
+        assert_eq!(channel.pending_data.len(), before);
+        assert!(channel.pending_eof);
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_EOF]);
+    }
+
+    #[test]
+    fn data_after_close_is_silently_dropped() {
+        let channel_id = ChannelId(31);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(channel_id, test_channel(channel_id, 51, false, false));
+
+        encrypted.close(channel_id).unwrap();
+        let before = encrypted.channels[&channel_id].pending_data.len();
+        assert_eq!(
+            encrypted.channels[&channel_id].lane,
+            crate::ChannelLaneState::Closing
+        );
+        encrypted
+            .data(channel_id, Bytes::from_static(b"after-close"), false)
+            .unwrap();
+
+        let channel = &encrypted.channels[&channel_id];
+        assert_eq!(channel.pending_data.len(), before);
+        assert_eq!(channel.lane, crate::ChannelLaneState::Closing);
         assert!(encrypted.write.is_empty());
     }
 
