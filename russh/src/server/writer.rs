@@ -6,8 +6,8 @@
 //! S2a invariants preserved: continuous `drain_writes`, `notify_one`, single
 //! absolute grace stop, FIFO seal order (no kex wire priority).
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
@@ -24,9 +24,44 @@ use crate::server::supervisor::{CapacityChainSlot, FullLedger};
 use crate::sshbuffer::PacketWriter;
 use crate::Error;
 
+/// Shared StopDiscard tombstone: recipient channel ids whose unsealed
+/// plaintext must not be sealed (plan §4.3 / line 135). Keyed by the
+/// peer's recipient id parsed from the payload itself.
+#[derive(Debug, Default)]
+pub struct CloseTombstone {
+    ids: Mutex<HashSet<u32>>,
+}
+
+impl CloseTombstone {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn insert(&self, recipient: u32) {
+        if let Ok(mut g) = self.ids.lock() {
+            g.insert(recipient);
+        }
+    }
+
+    pub fn contains(&self, recipient: u32) -> bool {
+        self.ids
+            .lock()
+            .map(|g| g.contains(&recipient))
+            .unwrap_or(false)
+    }
+
+    pub fn remove(&self, recipient: u32) {
+        if let Ok(mut g) = self.ids.lock() {
+            g.remove(&recipient);
+        }
+    }
+}
+
 /// Optional test/production hooks for WriterTask (fail inject, ledger max).
 #[derive(Clone, Default)]
 pub struct WriterHooks {
+    /// StopDiscard tombstone shared with Session (always present).
+    pub tombstone: Arc<CloseTombstone>,
     /// Full-pipeline ledger components — sampled at **every** Writer ledger
     /// mutation (accept / rollback / seal-adjust / drain) so the observed max
     /// is the complete sum, not the Writer-local `pending_bytes` (R4).
@@ -56,6 +91,9 @@ pub struct WriterHooks {
     /// When true, do not pull from the bulk mpsc (R3 one-cmd dequeue gate).
     #[cfg(feature = "_test_hooks")]
     pub dequeue_hold: Option<Arc<AtomicBool>>,
+    /// Test-only: observe unsealed queue inserts and seal-time drops.
+    #[cfg(feature = "_test_hooks")]
+    pub stop_discard: Option<Arc<crate::server::supervisor::StopDiscardSlot>>,
 }
 
 pub const KEX_QUEUE_CAP: usize = 16;
@@ -219,6 +257,9 @@ pub struct WriterHandle {
     fail_next_seal: Option<Arc<AtomicBool>>,
     #[cfg(feature = "_test_hooks")]
     force_next_bulk_full: Option<Arc<AtomicBool>>,
+    tombstone: Arc<CloseTombstone>,
+    #[cfg(feature = "_test_hooks")]
+    stop_discard: Option<Arc<crate::server::supervisor::StopDiscardSlot>>,
 }
 
 impl WriterHandle {
@@ -294,6 +335,10 @@ impl WriterHandle {
         self.debit_ledger(weight);
     }
 
+    pub(crate) fn close_tombstone(&self) -> &Arc<CloseTombstone> {
+        &self.tombstone
+    }
+
     fn try_send_cmd(&self, cmd: WriterCmd, weight: usize) -> Result<(), TrySendWireError> {
         // force_next_bulk_full is intentionally **batch-install only** (see
         // try_seal_batch_and_install) so flood SealPayload traffic cannot consume it.
@@ -301,8 +346,19 @@ impl WriterHandle {
             self.pending_bytes.fetch_add(weight, Ordering::Release);
             self.credit_ledger(weight);
         }
+        #[cfg(feature = "_test_hooks")]
+        let queued_obs = match &cmd {
+            WriterCmd::SealPayload(b) | WriterCmd::SealRaw(b) => parse_channel_payload(b),
+            _ => None,
+        };
         match self.bulk_tx.try_send(cmd) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                #[cfg(feature = "_test_hooks")]
+                if let (Some(slot), Some((msg, recip))) = (self.stop_discard.as_ref(), queued_obs) {
+                    slot.note_queued_unsealed(recip, msg);
+                }
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 self.rollback_reservation(weight);
                 #[cfg(feature = "_test_hooks")]
@@ -597,6 +653,9 @@ where
         fail_next_seal: hooks.fail_next_seal.clone(),
         #[cfg(feature = "_test_hooks")]
         force_next_bulk_full: hooks.force_next_bulk_full.clone(),
+        tombstone: hooks.tombstone.clone(),
+        #[cfg(feature = "_test_hooks")]
+        stop_discard: hooks.stop_discard.clone(),
     };
 
     let hooks_w = hooks.clone();
@@ -864,6 +923,41 @@ where
     (handle, join, evt_rx)
 }
 
+/// SSH channel payload: `byte msg` + `uint32 recipient` (RFC 4253/4254).
+fn parse_channel_payload(payload: &[u8]) -> Option<(u8, u32)> {
+    if payload.len() < 5 {
+        return None;
+    }
+    let msg = *payload.first()?;
+    let recip = u32::from_be_bytes([
+        *payload.get(1)?,
+        *payload.get(2)?,
+        *payload.get(3)?,
+        *payload.get(4)?,
+    ]);
+    Some((msg, recip))
+}
+
+fn tombstone_should_drop(payload: &[u8], tombstone: &CloseTombstone) -> bool {
+    let Some((msg, recip)) = parse_channel_payload(payload) else {
+        return false;
+    };
+    if msg == crate::msg::CHANNEL_CLOSE {
+        return false;
+    }
+    let droppable = matches!(
+        msg,
+        crate::msg::CHANNEL_DATA
+            | crate::msg::CHANNEL_EXTENDED_DATA
+            | crate::msg::CHANNEL_EOF
+            | crate::msg::CHANNEL_WINDOW_ADJUST
+            | crate::msg::CHANNEL_REQUEST
+            | crate::msg::CHANNEL_SUCCESS
+            | crate::msg::CHANNEL_FAILURE
+    );
+    droppable && tombstone.contains(recip)
+}
+
 fn seal_one_payload(
     packet_writer: &mut PacketWriter,
     out_q: &mut VecDeque<Bytes>,
@@ -873,6 +967,33 @@ fn seal_one_payload(
     hooks: &WriterHooks,
 ) -> Result<(), Error> {
     let reserved = seal_reservation(p.len());
+    if tombstone_should_drop(p.as_ref(), &hooks.tombstone) {
+        // Unstarted seal: drop plaintext, refund reservation, do not
+        // consume outbound seqn. CLOSE is never dropped (exemption).
+        let ok = pending_bytes.fetch_update(Ordering::Release, Ordering::Acquire, |cur| {
+            cur.checked_sub(reserved)
+        });
+        if ok.is_err() {
+            warn!("writer: tombstone-drop reservation underflow reserved={reserved}");
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref fl) = hooks.full_ledger {
+                fl.slot.note_mismatch();
+            }
+        } else {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref fl) = hooks.full_ledger {
+                fl.debit(reserved);
+            }
+        }
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = hooks.stop_discard {
+            s.note_seal_drop();
+        }
+        return Ok(());
+    }
+    let clear_recip = parse_channel_payload(p.as_ref()).and_then(|(msg, recip)| {
+        (msg == crate::msg::CHANNEL_CLOSE).then_some(recip)
+    });
     #[cfg(feature = "_test_hooks")]
     if hooks
         .fail_next_seal
@@ -883,6 +1004,10 @@ fn seal_one_payload(
         return Err(Error::Inconsistent);
     }
     packet_writer.packet_raw(p.as_ref())?;
+    if let Some(recip) = clear_recip {
+        // FIFO: every earlier cmd for this recipient has been seen.
+        hooks.tombstone.remove(recip);
+    }
     let wire = packet_writer.take_pending_wire_bytes();
     let wire_len = wire.len();
     if wire_len > reserved {

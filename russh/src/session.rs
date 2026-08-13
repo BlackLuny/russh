@@ -308,7 +308,7 @@ impl Encrypted {
 
     pub fn park_close(&mut self, channel: ChannelId) {
         if let Some(ch) = self.channels.get_mut(&channel) {
-            if !ch.pending_close {
+            if !ch.pending_close && !ch.outbound_closed {
                 ch.enqueue_ctrl(crate::ChannelCtrlItem::Close);
             }
         }
@@ -324,23 +324,38 @@ impl Encrypted {
         Ok(())
     }
 
-    /// Tear a channel down immediately, discarding anything still queued for it, and emit
-    /// `CHANNEL_CLOSE` now.
+    /// StopDiscard (plan §4.3 / 行 135): drop unframed lane items, emit
+    /// exactly one outbound `CHANNEL_CLOSE`. Already-sealed Writer `out_q`
+    /// packets are left intact. Unsealed plaintext in enc.write / bulk FIFO
+    /// / pending_outbound is dropped at Writer seal via the tombstone.
     ///
-    /// Unlike [`Self::close`], this never parks the close behind queued outbound data. Use it
-    /// when the channel is already dead from the peer's point of view — it sent us
-    /// `CHANNEL_CLOSE`, or it violated its advertised window and we are dropping it. In those
-    /// cases the queued bytes can no longer be delivered to anyone, and `close`'s `pending_close`
-    /// path would hold the mandatory reply until a `CHANNEL_WINDOW_ADJUST` that a closing or
-    /// misbehaving peer has no reason to ever send — stranding the reply and leaking the channel
-    /// entry for the life of the session.
-    pub fn close_discarding_pending(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        if let Some(c) = self.channels.get_mut(&channel) {
-            c.clear_outbound();
+    /// This is the single discard implementation. Local `close()` still
+    /// parks behind DATA; peer CLOSE, inbound overflow, and outbound
+    /// cap all enter here. A second call on a gone channel is a no-op
+    /// (CLOSE arbitration: never a second CLOSE).
+    pub fn close_discarding_pending(
+        &mut self,
+        channel: ChannelId,
+    ) -> Result<crate::StopDiscardStats, crate::Error> {
+        let Some(c) = self.channels.get_mut(&channel) else {
+            return Ok(crate::StopDiscardStats {
+                already_gone: true,
+                ..crate::StopDiscardStats::default()
+            });
+        };
+        if c.outbound_closed {
+            // CLOSE already framed this turn (pop_ctrl_front). Do not
+            // write a second one; drop any leftover unframed items.
+            let stats = c.stop_discard_unframed();
+            self.channels.remove(&channel);
+            return Ok(stats);
         }
+        let stats = c.stop_discard_unframed();
+        // Channel still present so `byte` can encode the reply. Lane is
+        // empty; this is the unique CLOSE for the channel.
         self.byte(channel, msg::CHANNEL_CLOSE)?;
         self.channels.remove(&channel);
-        Ok(())
+        Ok(stats)
     }
 
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
@@ -393,6 +408,9 @@ impl Encrypted {
     ) -> Result<bool, crate::Error> {
         let ceiling = target.saturating_sub(undelivered);
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.outbound_closed {
+                return Ok(false);
+            }
             if channel.sender_window_size < ceiling / 2 {
                 debug!(
                     "sender_window_size {:?}, target {:?}, undelivered {:?}, ceiling {:?}",
@@ -1303,6 +1321,99 @@ mod tests {
         assert!(
             !encrypted.channels.contains_key(&channel_id),
             "channel must be dropped, not left waiting on a window adjustment"
+        );
+    }
+
+    /// Already-framed packets in `enc.write` survive StopDiscard; only
+    /// the unframed lane is dropped. A second discard must not emit
+    /// another CLOSE.
+    #[test]
+    fn stop_discard_keeps_framed_and_drops_lane() {
+        let channel_id = ChannelId(21);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(channel_id, test_channel(channel_id, 50, false, false));
+        encrypted.flush_pending(channel_id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_DATA]);
+        // Park more unframed DATA + a local CLOSE behind it.
+        encrypted
+            .data(channel_id, bytes::Bytes::from_static(b"more"), true)
+            .unwrap();
+        encrypted.park_close(channel_id);
+        assert!(encrypted.has_pending_data(channel_id));
+        assert!(encrypted.channels[&channel_id].pending_close);
+
+        let stats = encrypted.close_discarding_pending(channel_id).unwrap();
+        assert!(
+            stats.discarded_items >= 1,
+            "unframed lane must be discarded, stats={stats:?}"
+        );
+        assert_eq!(
+            packet_types(&encrypted.write),
+            vec![msg::CHANNEL_DATA, msg::CHANNEL_CLOSE],
+            "framed DATA must stay; exactly one CLOSE appended"
+        );
+        assert!(!encrypted.channels.contains_key(&channel_id));
+
+        let again = encrypted.close_discarding_pending(channel_id).unwrap();
+        assert!(again.already_gone);
+        assert_eq!(
+            packet_types(&encrypted.write)
+                .into_iter()
+                .filter(|&t| t == msg::CHANNEL_CLOSE)
+                .count(),
+            1,
+            "second StopDiscard must not emit another CLOSE"
+        );
+    }
+
+    #[test]
+    fn enqueue_after_outbound_closed_is_dropped() {
+        let channel_id = ChannelId(22);
+        let mut encrypted = test_encrypted();
+        let mut ch = test_channel(channel_id, 51, false, false);
+        ch.outbound_closed = true;
+        encrypted.channels.insert(channel_id, ch);
+        encrypted.park_close(channel_id);
+        encrypted
+            .channels
+            .get_mut(&channel_id)
+            .unwrap()
+            .enqueue_ctrl(crate::ChannelCtrlItem::Success);
+        assert!(
+            !encrypted.channels[&channel_id].has_pending_ctrl(),
+            "SUCCESS after outbound_closed must not enqueue"
+        );
+        assert!(!encrypted.channels[&channel_id].pending_close);
+    }
+
+    #[test]
+    fn enqueue_after_pending_close_is_dropped() {
+        let channel_id = ChannelId(23);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(channel_id, test_channel(channel_id, 52, false, true));
+        assert!(encrypted.channels[&channel_id].pending_close);
+        encrypted
+            .channels
+            .get_mut(&channel_id)
+            .unwrap()
+            .enqueue_ctrl(crate::ChannelCtrlItem::Success);
+        encrypted
+            .channels
+            .get_mut(&channel_id)
+            .unwrap()
+            .enqueue_ctrl(crate::ChannelCtrlItem::Request {
+                body: bytes::Bytes::from_static(b"x"),
+            });
+        let ch = &encrypted.channels[&channel_id];
+        assert!(ch.has_pending_ctrl(), "parked CLOSE must remain");
+        assert_eq!(
+            ch.queued_reply_count(),
+            0,
+            "SUCCESS/REQUEST after parked CLOSE must not enqueue"
         );
     }
 

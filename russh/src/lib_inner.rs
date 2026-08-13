@@ -597,6 +597,10 @@ pub(crate) struct ChannelParams {
     /// §5.3 / I3). Also dedups a second `eof()`.
     pub(crate) pending_eof: bool,
     pub(crate) pending_close: bool,
+    /// CLOSE has been framed into `enc.write` (or discarded as a
+    /// duplicate). After this the channel must not emit ADJUST /
+    /// SUCCESS / FAILURE / REQUEST (S2e lifecycle latch).
+    pub(crate) outbound_closed: bool,
     /// I3 lane. Independent of `confirmed` (that flag is "peer accepted our
     /// open" / "we accepted theirs"). We stay `Opening` until *our*
     /// OPEN_CONFIRMATION is emitted.
@@ -632,6 +636,7 @@ impl ChannelParams {
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
             pending_close: false,
+            outbound_closed: false,
             lane: ChannelLaneState::Opening,
             boost_pending: false,
             next_seq: 0,
@@ -700,7 +705,7 @@ impl ChannelParams {
         ext: Option<u32>,
         from: usize,
     ) -> bool {
-        if self.pending_eof || self.lane == ChannelLaneState::Closing {
+        if self.pending_eof || self.outbound_closed || self.lane == ChannelLaneState::Closing {
             return false;
         }
         let seq = self.alloc_seq();
@@ -710,6 +715,19 @@ impl ChannelParams {
     }
 
     pub(crate) fn enqueue_ctrl(&mut self, item: ChannelCtrlItem) {
+        if self.outbound_closed {
+            // CLOSE already framed: drop further control (ADJUST is not
+            // a lane item; SUCCESS/FAILURE/REQUEST/EOF/CLOSE are).
+            return;
+        }
+        // CLOSE submitted but not yet framed: same tail-fence as S2c
+        // DATA. Late SUCCESS/REQUEST must not sit behind the parked
+        // CLOSE and appear on the wire after it. WINDOW_ADJUST is a
+        // Session bypass (not a lane item) and may still emit while
+        // CLOSE is only parked — it will precede the parked CLOSE.
+        if self.pending_close || self.lane == ChannelLaneState::Closing {
+            return;
+        }
         match &item {
             ChannelCtrlItem::Eof => self.pending_eof = true,
             ChannelCtrlItem::Close => {
@@ -758,7 +776,10 @@ impl ChannelParams {
             // `pending_eof` stays set: the tail fence has been
             // submitted (and is now on the wire). New DATA must
             // remain rejected.
-            ChannelCtrlItem::Close => self.pending_close = false,
+            ChannelCtrlItem::Close => {
+                self.pending_close = false;
+                self.outbound_closed = true;
+            }
             ChannelCtrlItem::OpenConfirmation { .. } => {
                 self.enter_confirmed();
             }
@@ -790,6 +811,7 @@ impl ChannelParams {
         self.data_seqs.push_front(seq);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear_outbound(&mut self) {
         self.pending_data.clear();
         self.data_seqs.clear();
@@ -798,6 +820,44 @@ impl ChannelParams {
         self.pending_close = false;
         self.boost_pending = false;
     }
+
+    /// Drop every unframed lane item (DATA + non-CLOSE ctrl). CLOSE is
+    /// not counted as discarded: StopDiscard still owes the peer exactly
+    /// one outbound CLOSE. Does not touch `enc.write` / Writer FIFO.
+    pub(crate) fn stop_discard_unframed(&mut self) -> crate::StopDiscardStats {
+        let data_items = self.pending_data.len();
+        let data_bytes = self
+            .pending_data
+            .iter()
+            .map(|(buf, _, from)| buf.len().saturating_sub(*from))
+            .sum::<usize>();
+        let ctrl_dropped = self
+            .pending_ctrl
+            .iter()
+            .filter(|(_, i)| !matches!(i, ChannelCtrlItem::Close))
+            .count();
+        self.pending_data.clear();
+        self.data_seqs.clear();
+        self.pending_ctrl.clear();
+        self.pending_eof = true;
+        self.pending_close = false;
+        self.boost_pending = false;
+        self.lane = ChannelLaneState::Closing;
+        self.outbound_closed = true;
+        crate::StopDiscardStats {
+            discarded_items: data_items.saturating_add(ctrl_dropped),
+            discarded_bytes: data_bytes,
+            already_gone: false,
+        }
+    }
+}
+
+/// Result of [`Encrypted::close_discarding_pending`] / StopDiscard.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StopDiscardStats {
+    pub discarded_items: usize,
+    pub discarded_bytes: usize,
+    pub already_gone: bool,
 }
 
 /// Returns `f(val)` if `val` it is [Some], or a forever pending [Future] if it is [None].

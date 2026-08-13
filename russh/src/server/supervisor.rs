@@ -643,6 +643,87 @@ impl DeferredGrantSlot {
     }
 }
 
+/// Test-only: StopDiscard discard / grant-clear counters.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct StopDiscardSlot {
+    discarded_items: AtomicU64,
+    discarded_bytes: AtomicU64,
+    grant_clears: AtomicU64,
+    /// (recipient, msg) of plaintext seal cmds accepted into Writer bulk.
+    queued_unsealed: std::sync::Mutex<Vec<(u32, u8)>>,
+    seal_drops: AtomicU64,
+    /// Last `Session::close` left `pending_close` set (CLOSE still in lane).
+    pending_close: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl StopDiscardSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn note_discard(&self, items: usize, bytes: usize) {
+        self.discarded_items
+            .fetch_add(items as u64, Ordering::SeqCst);
+        self.discarded_bytes
+            .fetch_add(bytes as u64, Ordering::SeqCst);
+    }
+
+    pub fn note_grant_clear(&self) {
+        self.grant_clears.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn discarded_items(&self) -> u64 {
+        self.discarded_items.load(Ordering::SeqCst)
+    }
+
+    pub fn discarded_bytes(&self) -> u64 {
+        self.discarded_bytes.load(Ordering::SeqCst)
+    }
+
+    pub fn grant_clears(&self) -> u64 {
+        self.grant_clears.load(Ordering::SeqCst)
+    }
+
+    pub fn note_queued_unsealed(&self, recipient: u32, msg: u8) {
+        if let Ok(mut g) = self.queued_unsealed.lock() {
+            g.push((recipient, msg));
+        }
+    }
+
+    pub fn queued_unsealed(&self) -> Vec<(u32, u8)> {
+        self.queued_unsealed
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn queued_unsealed_data(&self, recipient: u32) -> usize {
+        self.queued_unsealed()
+            .into_iter()
+            .filter(|(r, m)| *r == recipient && *m == crate::msg::CHANNEL_DATA)
+            .count()
+    }
+
+    pub fn note_seal_drop(&self) {
+        self.seal_drops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn seal_drops(&self) -> u64 {
+        self.seal_drops.load(Ordering::SeqCst)
+    }
+
+    pub fn set_pending_close(&self, pending: bool) {
+        self.pending_close
+            .store(u64::from(pending), Ordering::SeqCst);
+    }
+
+    pub fn pending_close(&self) -> bool {
+        self.pending_close.load(Ordering::SeqCst) != 0
+    }
+}
+
 /// Test-only: outbound channel-message order as packets enter `enc.write`
 /// (the Writer seal FIFO). Used by S2c wire-order assertions.
 /// Third field is the CHANNEL_DATA / EXTENDED_DATA payload length (0 otherwise).

@@ -68,7 +68,7 @@ pub use self::supervisor::{
 pub use self::supervisor::{
     CapacityChainSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate, InstallAckHoldGate,
     KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, OutboundOrderSlot,
-    ReplyQueueSlot, SchedSlot, WatchdogObserveSlot,
+    ReplyQueueSlot, SchedSlot, StopDiscardSlot, WatchdogObserveSlot,
 };
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
@@ -204,6 +204,9 @@ pub struct Config {
     /// Test-only: skip first-packet boost (on/off position contrast).
     #[cfg(feature = "_test_hooks")]
     pub disable_sched_boost: bool,
+    /// Test-only: StopDiscard discarded-item / grant-clear counters.
+    #[cfg(feature = "_test_hooks")]
+    pub stop_discard: Option<std::sync::Arc<supervisor::StopDiscardSlot>>,
 }
 
 impl Default for Config {
@@ -280,6 +283,8 @@ impl Default for Config {
             sched: None,
             #[cfg(feature = "_test_hooks")]
             disable_sched_boost: false,
+            #[cfg(feature = "_test_hooks")]
+            stop_discard: None,
         }
     }
 }

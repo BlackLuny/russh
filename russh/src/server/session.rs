@@ -948,6 +948,17 @@ impl Session {
             .unwrap_or(0)
             .try_into()
             .unwrap_or(u32::MAX);
+        // StopDiscard latch: CLOSE already framed or channel gone —
+        // never register / emit a WINDOW_ADJUST for it.
+        if !self.outbound_channel_accepts_ctrl(id) {
+            if self.deferred_window_grants.remove(&id) {
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref s) = self.common.config.stop_discard {
+                    s.note_grant_clear();
+                }
+            }
+            return Ok(());
+        }
         // WINDOW_ADJUST is 9B payload + 88B wire OH = 97. Do not emit it
         // once the data pipeline is already at the soft HWM — that 97B
         // on top of a last-packet CHANNEL_DATA fill is the F1 +97
@@ -999,14 +1010,12 @@ impl Session {
         }
         let ids: Vec<ChannelId> = self.deferred_window_grants.iter().copied().collect();
         for id in ids {
-            let alive = self.channels.contains_key(&id)
-                || self
-                    .common
-                    .encrypted
-                    .as_ref()
-                    .is_some_and(|enc| enc.channels.contains_key(&id));
-            if !alive {
+            if !self.outbound_channel_accepts_ctrl(id) {
                 self.deferred_window_grants.remove(&id);
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref s) = self.common.config.stop_discard {
+                    s.note_grant_clear();
+                }
                 continue;
             }
             #[cfg(feature = "_test_hooks")]
@@ -1066,13 +1075,56 @@ impl Session {
     /// `Handle::data` callers must resolve to `Err`. Inferring that later from "is the channel
     /// gone?" cannot work — a channel is also removed after an *orderly* flush, where the bytes
     /// really were delivered.
+    /// True while the protocol channel can still emit ADJUST / SUCCESS /
+    /// FAILURE / REQUEST. False after StopDiscard or after CLOSE has
+    /// been framed (`outbound_closed`).
+    pub(crate) fn outbound_channel_accepts_ctrl(&self, id: ChannelId) -> bool {
+        self.common
+            .encrypted
+            .as_ref()
+            .and_then(|enc| enc.channels.get(&id))
+            .is_some_and(|ch| !ch.outbound_closed)
+    }
+
     pub(crate) fn discard_channel_outbound(&mut self, id: ChannelId) -> Result<(), crate::Error> {
-        if let Some(enc) = self.common.encrypted.as_mut() {
-            enc.close_discarding_pending(id)?;
+        // Register the Writer tombstone *before* framing the reply CLOSE
+        // so any plaintext already in bulk FIFO / pending_outbound is
+        // dropped at seal. already_gone / outbound_closed do not register
+        // (no second CLOSE will flow through Writer to clear a stale id).
+        if let Some(enc) = self.common.encrypted.as_ref() {
+            if let Some(ch) = enc.channels.get(&id) {
+                if !ch.outbound_closed {
+                    if let Some(w) = self.writer.as_ref() {
+                        w.close_tombstone().insert(ch.recipient_channel);
+                    }
+                }
+            }
         }
+        let stats = if let Some(enc) = self.common.encrypted.as_mut() {
+            enc.close_discarding_pending(id)?
+        } else {
+            crate::StopDiscardStats {
+                already_gone: true,
+                ..crate::StopDiscardStats::default()
+            }
+        };
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.stop_discard {
+            s.note_discard(stats.discarded_items, stats.discarded_bytes);
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        let _ = stats;
         // Dropping the senders resolves each producer's await to Err.
         self.outbound_acks.remove(&id);
-        self.deferred_window_grants.remove(&id);
+        if self.deferred_window_grants.remove(&id) {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref s) = self.common.config.stop_discard {
+                s.note_grant_clear();
+            }
+        }
+        // CLOSE was appended to enc.write; publish it to the order log
+        // before the next loop flush so tests can see the unique CLOSE.
+        self.record_outbound_from_write();
         Ok(())
     }
 
@@ -1394,6 +1446,7 @@ impl Session {
                 });
                 self.full_ledger = full_ledger.clone();
                 crate::server::writer::WriterHooks {
+                    tombstone: crate::server::writer::CloseTombstone::new(),
                     full_ledger,
                     pending_override: Some(pending_arc),
                     fail_next_seal: self.common.config.fail_next_seal.clone(),
@@ -1402,6 +1455,7 @@ impl Session {
                     force_next_bulk_full: self.common.config.force_next_bulk_full.clone(),
                     capacity_chain: self.common.config.capacity_chain.clone(),
                     dequeue_hold: self.common.config.dequeue_hold.clone(),
+                    stop_discard: self.common.config.stop_discard.clone(),
                 }
             }
             #[cfg(not(feature = "_test_hooks"))]
@@ -3228,6 +3282,7 @@ impl Session {
                 };
                 match msg {
                     crate::msg::CHANNEL_OPEN_CONFIRMATION
+                    | crate::msg::CHANNEL_WINDOW_ADJUST
                     | crate::msg::CHANNEL_DATA
                     | crate::msg::CHANNEL_EXTENDED_DATA
                     | crate::msg::CHANNEL_EOF
@@ -3475,6 +3530,16 @@ impl Session {
         }
         let _ = self.try_drain_channel_under_budget(channel)?;
         let _ = self.flush_pending_fences(channel)?;
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.stop_discard {
+            let pending = self
+                .common
+                .encrypted
+                .as_ref()
+                .and_then(|enc| enc.channels.get(&channel))
+                .is_some_and(|ch| ch.pending_close);
+            s.set_pending_close(pending);
+        }
         let emitted = !self
             .common
             .encrypted
