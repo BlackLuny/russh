@@ -53,9 +53,10 @@ async fn run_max_channel_packet_size_test(compression: Option<&'static [compress
 
     tokio::spawn(async move {
         let (socket, _) = socket.accept().await.unwrap();
-        server::run_stream(server_config, socket, EchoServer {})
+        let running = server::run_stream(server_config, socket, EchoServer {})
             .await
             .unwrap();
+        running.await.unwrap();
     });
 
     let mut client_config = client::Config::default();

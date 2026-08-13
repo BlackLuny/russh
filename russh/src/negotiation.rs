@@ -29,7 +29,7 @@ use crate::keys::key::safe_rng;
 use crate::parsing::ensure_end;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server::Config;
-use crate::sshbuffer::PacketWriter;
+
 use crate::{AlgorithmKind, Error, cipher, compression, kex, mac, msg};
 
 #[cfg(target_arch = "wasm32")]
@@ -408,7 +408,7 @@ impl Select for Client {
 
 pub(crate) fn write_kex(
     prefs: &Preferred,
-    writer: &mut PacketWriter,
+    writer: &mut impl crate::sshbuffer::PacketOut,
     server_config: Option<&Config>,
 ) -> Result<Bytes, Error> {
     writer.packet_bytes(|w| {

@@ -105,6 +105,28 @@ pub struct FaultControls {
     trickle_max: Arc<AtomicU64>,
     trickle_interval_ms: Arc<AtomicU64>,
     trickle_window_start_ms: Arc<AtomicU64>,
+    /// Auto-freeze: once attached, poll_read freezes (Pending) whenever the
+    /// referenced flag is `true`. Used with client `Config::dh_init_sent` to
+    /// deterministically stall the client after its DH-init hits the wire.
+    auto_freeze_flag: Arc<std::sync::OnceLock<Arc<AtomicBool>>>,
+    /// One-shot kill switch for auto-freeze: once disarmed, the flag is never
+    /// consulted again (a later `dh_init_sent` from a *second* rekey must not
+    /// re-engage the stall — R6 ACK-before-Done).
+    auto_freeze_disarmed: Arc<AtomicBool>,
+    /// Coalesce gate: while armed, poll_write appends to `coalesce_buf` and
+    /// reports success without touching the socket; on release the whole
+    /// buffered payload goes out in ONE inner write (NEWKEYS + first
+    /// new-key packet aggregation proof, R1).
+    coalesce_armed: Arc<AtomicBool>,
+    coalesce_buf: Arc<Mutex<Vec<u8>>>,
+    coalesce_appends: Arc<AtomicU64>,
+    coalesce_bytes: Arc<AtomicU64>,
+    /// Inner writes that delivered the ENTIRE buffered payload in one call.
+    coalesce_flushes: Arc<AtomicU64>,
+    /// Bytes delivered by the last full-buffer single write.
+    coalesce_flush_bytes: Arc<AtomicU64>,
+    /// Partial buffer drains (must stay 0 for the aggregation assertion).
+    coalesce_partials: Arc<AtomicU64>,
 }
 
 impl FaultControls {
@@ -118,7 +140,60 @@ impl FaultControls {
             trickle_max: Arc::new(AtomicU64::new(u64::MAX)),
             trickle_interval_ms: Arc::new(AtomicU64::new(0)),
             trickle_window_start_ms: Arc::new(AtomicU64::new(0)),
+            auto_freeze_flag: Arc::new(std::sync::OnceLock::new()),
+            auto_freeze_disarmed: Arc::new(AtomicBool::new(false)),
+            coalesce_armed: Arc::new(AtomicBool::new(false)),
+            coalesce_buf: Arc::new(Mutex::new(Vec::new())),
+            coalesce_appends: Arc::new(AtomicU64::new(0)),
+            coalesce_bytes: Arc::new(AtomicU64::new(0)),
+            coalesce_flushes: Arc::new(AtomicU64::new(0)),
+            coalesce_flush_bytes: Arc::new(AtomicU64::new(0)),
+            coalesce_partials: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Attach auto-freeze: poll_read returns Pending whenever `flag` is true.
+    /// Clear the flag + call [`Self::unfreeze_read`] to resume.
+    pub fn attach_auto_freeze(&self, flag: Arc<AtomicBool>) {
+        let _ = self.auto_freeze_flag.set(flag);
+    }
+
+    /// Permanently disable auto-freeze and resume reads. One-shot: a subsequent
+    /// `dh_init_sent` (e.g. from an injected second rekey) must not re-stall.
+    pub fn disarm_auto_freeze(&self) {
+        self.auto_freeze_disarmed.store(true, Ordering::SeqCst);
+        self.unfreeze_read();
+    }
+
+    /// Arm the coalesce gate: subsequent poll_write calls are buffered, not sent.
+    pub fn arm_coalesce(&self) {
+        self.coalesce_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Release the coalesce gate: the next poll_write delivers the whole
+    /// buffered payload in one inner write before sending new data.
+    pub fn release_coalesce(&self) {
+        self.coalesce_armed.store(false, Ordering::SeqCst);
+    }
+
+    pub fn coalesce_appends(&self) -> u64 {
+        self.coalesce_appends.load(Ordering::Relaxed)
+    }
+
+    pub fn coalesce_bytes(&self) -> u64 {
+        self.coalesce_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn coalesce_flushes(&self) -> u64 {
+        self.coalesce_flushes.load(Ordering::Relaxed)
+    }
+
+    pub fn coalesce_flush_bytes(&self) -> u64 {
+        self.coalesce_flush_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn coalesce_partials(&self) -> u64 {
+        self.coalesce_partials.load(Ordering::Relaxed)
     }
 
     /// Stop delivering bytes from the socket to the SSH client session loop.
@@ -228,6 +303,18 @@ impl AsyncRead for FaultInjectStream {
             }
             return Poll::Pending;
         }
+        // Auto-freeze: deterministic stall driven by an external flag
+        // (e.g. client `dh_init_sent`) — same Pending/waker mechanics.
+        if !self.ctrl.auto_freeze_disarmed.load(Ordering::SeqCst) {
+            if let Some(flag) = self.ctrl.auto_freeze_flag.get() {
+                if flag.load(Ordering::SeqCst) {
+                    if let Ok(mut g) = self.ctrl.read_waker.lock() {
+                        *g = Some(cx.waker().clone());
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
         // Trickle: cap how many bytes this poll may fill.
         let budget = self.ctrl.trickle_remaining();
         if budget == 0 {
@@ -268,12 +355,78 @@ impl AsyncRead for FaultInjectStream {
     }
 }
 
+impl FaultInjectStream {
+    /// If the coalesce gate was released with a non-empty buffer, deliver the
+    /// WHOLE buffered payload in one inner write. `Ready(Ok(()))` once the
+    /// buffer is empty; `Pending` (waker registered or self-woken) otherwise.
+    fn poll_drain_coalesce(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.ctrl.coalesce_armed.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+        let pending = {
+            let mut g = self.ctrl.coalesce_buf.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
+        if pending.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, &pending) {
+            Poll::Ready(Ok(n)) if n == pending.len() => {
+                self.ctrl.coalesce_flushes.fetch_add(1, Ordering::Relaxed);
+                self.ctrl
+                    .coalesce_flush_bytes
+                    .store(n as u64, Ordering::Relaxed);
+                self.ctrl.bytes_written.fetch_add(n as u64, Ordering::Relaxed);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(n)) => {
+                // Partial drain: keep the remainder, note progress, retry.
+                self.ctrl.bytes_written.fetch_add(n as u64, Ordering::Relaxed);
+                self.ctrl.coalesce_partials.fetch_add(1, Ordering::Relaxed);
+                let mut g = self.ctrl.coalesce_buf.lock().unwrap();
+                let mut rem = pending[n..].to_vec();
+                rem.extend_from_slice(&g);
+                *g = rem;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                let mut g = self.ctrl.coalesce_buf.lock().unwrap();
+                let mut rem = pending;
+                rem.extend_from_slice(&g);
+                *g = rem;
+                Poll::Pending
+            }
+        }
+    }
+}
+
 impl AsyncWrite for FaultInjectStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        // Release drain first: buffered payload goes out in one inner write.
+        if let Poll::Pending = self.as_mut().poll_drain_coalesce(cx)? {
+            return Poll::Pending;
+        }
+        // Coalesce armed: buffer the bytes, report success, touch nothing.
+        if self.ctrl.coalesce_armed.load(Ordering::SeqCst) {
+            {
+                let mut g = self.ctrl.coalesce_buf.lock().unwrap();
+                g.extend_from_slice(buf);
+            }
+            self.ctrl.coalesce_appends.fetch_add(1, Ordering::Relaxed);
+            self.ctrl
+                .coalesce_bytes
+                .fetch_add(buf.len() as u64, Ordering::Relaxed);
+            return Poll::Ready(Ok(buf.len()));
+        }
         let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &polled {
             self.ctrl
@@ -284,6 +437,14 @@ impl AsyncWrite for FaultInjectStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // While coalescing, buffered bytes are "flushed" by definition.
+        if self.ctrl.coalesce_armed.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+        // After release, drain the buffered payload before flushing the socket.
+        if let Poll::Pending = self.as_mut().poll_drain_coalesce(cx)? {
+            return Poll::Pending;
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -579,6 +740,53 @@ pub struct FloodServerConfig {
     /// First-cause slot for supervisor assertions (`_test_hooks`).
     #[cfg(feature = "_test_hooks")]
     pub disconnect_cause_slot: Option<Arc<russh::server::DisconnectCauseSlot>>,
+    /// Hold Session InstallAck consumption (`_test_hooks`, R1 Done-before-ACK).
+    #[cfg(feature = "_test_hooks")]
+    pub install_ack_hold: Option<Arc<russh::server::InstallAckHoldGate>>,
+    /// Count NeedSubmit entries (`_test_hooks`, R2/R3).
+    #[cfg(feature = "_test_hooks")]
+    pub need_submit_seen: Option<Arc<russh::server::NeedSubmitSeenSlot>>,
+    /// Live KEX install phase observation (`_test_hooks`, R2/R3/R5/R6).
+    #[cfg(feature = "_test_hooks")]
+    pub kex_install_observe: Option<Arc<russh::server::KexInstallObserveSlot>>,
+    /// Atomic max sealed_backlog (`_test_hooks`, R4).
+    #[cfg(feature = "_test_hooks")]
+    pub ledger_max: Option<Arc<russh::server::LedgerMaxSlot>>,
+    /// Inject one Writer seal failure (`_test_hooks`, R5).
+    #[cfg(feature = "_test_hooks")]
+    pub fail_next_seal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Hang Writer socket writes while still dequeue/seal (`_test_hooks`, R2/R3/R4).
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Force next bulk/batch try_send to Full once (`_test_hooks`, R2/R3/R4).
+    #[cfg(feature = "_test_hooks")]
+    pub force_next_bulk_full: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Inject one Writer socket-write failure at drain (`_test_hooks`, R5).
+    #[cfg(feature = "_test_hooks")]
+    pub fail_next_socket_write: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only disable of the production 20ms NeedSubmit retry timer
+    /// (`_test_hooks`, R3 — notify chain must prove itself).
+    #[cfg(feature = "_test_hooks")]
+    pub need_submit_timer_disable: bool,
+    /// dequeue-notify → capacity-arm → install-advance chain counters
+    /// (`_test_hooks`, R3).
+    #[cfg(feature = "_test_hooks")]
+    pub capacity_chain: Option<Arc<russh::server::CapacityChainSlot>>,
+    /// Count WINDOW_ADJUST packets received by the server (`_test_hooks`, F1).
+    #[cfg(feature = "_test_hooks")]
+    pub window_adjust_seen: Option<Arc<AtomicU64>>,
+    /// Pause Writer mpsc dequeue (`_test_hooks`, R3).
+    #[cfg(feature = "_test_hooks")]
+    pub dequeue_hold: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Wake Session to emit one IGNORE (`_test_hooks`, R3).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_ignore: Option<Arc<russh::server::InjectIgnoreGate>>,
+    /// Deferred WINDOW_ADJUST counters (`_test_hooks`, fix14).
+    #[cfg(feature = "_test_hooks")]
+    pub deferred_grant: Option<Arc<russh::server::DeferredGrantSlot>>,
+    /// Write-watchdog armed/eligible edges (`_test_hooks`, fix14).
+    #[cfg(feature = "_test_hooks")]
+    pub watchdog_observe: Option<Arc<russh::server::WatchdogObserveSlot>>,
 }
 
 impl Default for FloodServerConfig {
@@ -604,6 +812,36 @@ impl Default for FloodServerConfig {
             teardown_grace: Duration::from_secs(5),
             #[cfg(feature = "_test_hooks")]
             disconnect_cause_slot: None,
+            #[cfg(feature = "_test_hooks")]
+            install_ack_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            need_submit_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            kex_install_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            ledger_max: None,
+            #[cfg(feature = "_test_hooks")]
+            fail_next_seal: None,
+            #[cfg(feature = "_test_hooks")]
+            socket_hang: None,
+            #[cfg(feature = "_test_hooks")]
+            force_next_bulk_full: None,
+            #[cfg(feature = "_test_hooks")]
+            fail_next_socket_write: None,
+            #[cfg(feature = "_test_hooks")]
+            need_submit_timer_disable: false,
+            #[cfg(feature = "_test_hooks")]
+            capacity_chain: None,
+            #[cfg(feature = "_test_hooks")]
+            window_adjust_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            dequeue_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_ignore: None,
+            #[cfg(feature = "_test_hooks")]
+            deferred_grant: None,
+            #[cfg(feature = "_test_hooks")]
+            watchdog_observe: None,
         }
     }
 }
@@ -649,6 +887,36 @@ impl FloodServer {
                 teardown_grace: self.cfg.teardown_grace,
                 #[cfg(feature = "_test_hooks")]
                 disconnect_cause_slot: self.cfg.disconnect_cause_slot.clone(),
+                #[cfg(feature = "_test_hooks")]
+                install_ack_hold: self.cfg.install_ack_hold.clone(),
+                #[cfg(feature = "_test_hooks")]
+                need_submit_seen: self.cfg.need_submit_seen.clone(),
+                #[cfg(feature = "_test_hooks")]
+                kex_install_observe: self.cfg.kex_install_observe.clone(),
+                #[cfg(feature = "_test_hooks")]
+                ledger_max: self.cfg.ledger_max.clone(),
+                #[cfg(feature = "_test_hooks")]
+                fail_next_seal: self.cfg.fail_next_seal.clone(),
+                #[cfg(feature = "_test_hooks")]
+                socket_hang: self.cfg.socket_hang.clone(),
+                #[cfg(feature = "_test_hooks")]
+                force_next_bulk_full: self.cfg.force_next_bulk_full.clone(),
+                #[cfg(feature = "_test_hooks")]
+                fail_next_socket_write: self.cfg.fail_next_socket_write.clone(),
+                #[cfg(feature = "_test_hooks")]
+                need_submit_timer_disable: self.cfg.need_submit_timer_disable,
+                #[cfg(feature = "_test_hooks")]
+                capacity_chain: self.cfg.capacity_chain.clone(),
+                #[cfg(feature = "_test_hooks")]
+                window_adjust_seen: self.cfg.window_adjust_seen.clone(),
+                #[cfg(feature = "_test_hooks")]
+                dequeue_hold: self.cfg.dequeue_hold.clone(),
+                #[cfg(feature = "_test_hooks")]
+                inject_ignore: self.cfg.inject_ignore.clone(),
+                #[cfg(feature = "_test_hooks")]
+                deferred_grant: self.cfg.deferred_grant.clone(),
+                #[cfg(feature = "_test_hooks")]
+                watchdog_observe: self.cfg.watchdog_observe.clone(),
                 ..Default::default()
             });
             if let Err(e) = self.run_on_address(config, addr).await {
@@ -728,6 +996,36 @@ impl server::Handler for FloodHandler {
         tokio::spawn(async move {
             run_channel_mode(channel, mode, progress, flood_start).await;
         });
+        Ok(())
+    }
+
+    /// Count client→server data while a pending KEX install is open (R1 Done-before-ACK).
+    /// Does **not** touch downlink `progress` counters used by flood tests.
+    async fn data(
+        &mut self,
+        _channel: russh::ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref o) = self.cfg.kex_install_observe {
+            o.mark_data_while_pending(data.len() as u64);
+        }
+        let _ = data;
+        Ok(())
+    }
+
+    /// Emit CHANNEL_SUCCESS for want_reply exec so fix14b can flood
+    /// the channel-reply path (default Handler returns Ok(()) and
+    /// writes nothing).
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        eprintln!("s0: exec_request → channel_success {channel:?}");
+        session.channel_success(channel)?;
         Ok(())
     }
 }
@@ -847,8 +1145,21 @@ pub async fn connect_faulty(
     progress: Progress,
 ) -> Result<(client::Handle<CountingClient>, FaultControls), anyhow::Error> {
     let (stream, ctrl) = FaultInjectStream::connect(addr).await?;
+    let mut session = connect_on_stream(stream, client_cfg, progress).await?;
+    auth_publickey(&mut session).await?;
+    Ok((session, ctrl))
+}
+
+/// Unauthenticated client over a caller-owned fault-inject stream — the test
+/// keeps `FaultControls` from the start (auto-freeze / coalesce must be armed
+/// before or during the handshake).
+pub async fn connect_on_stream(
+    stream: FaultInjectStream,
+    client_cfg: client::Config,
+    progress: Progress,
+) -> Result<client::Handle<CountingClient>, anyhow::Error> {
     let config = Arc::new(client_cfg);
-    let mut session = client::connect_stream(
+    let session = client::connect_stream(
         config,
         stream,
         CountingClient {
@@ -856,6 +1167,13 @@ pub async fn connect_faulty(
         },
     )
     .await?;
+    Ok(session)
+}
+
+/// Publickey-auth helper mirroring `connect_faulty`'s auth step.
+pub async fn auth_publickey(
+    session: &mut client::Handle<CountingClient>,
+) -> Result<(), anyhow::Error> {
     let key = Arc::new(PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap());
     let authed = session
         .authenticate_publickey(
@@ -868,7 +1186,7 @@ pub async fn connect_faulty(
         .await?
         .success();
     anyhow::ensure!(authed, "auth failed");
-    Ok((session, ctrl))
+    Ok(())
 }
 
 /// Wait until a per-session rekey hold gate has taken effect.

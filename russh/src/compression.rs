@@ -221,7 +221,13 @@ mod tests {
 #[cfg(feature = "flate2")]
 impl Compress {
     fn zlib_output_reserve_bound(input_len: usize) -> usize {
-        input_len.saturating_add(10)
+        // zlib/deflate worst-case expansion (same order as zlib's compressBound):
+        // len + (len>>12) + (len>>14) + (len>>25) + 13 — never under-reserve large packets.
+        input_len
+            .saturating_add(input_len >> 12)
+            .saturating_add(input_len >> 14)
+            .saturating_add(input_len >> 25)
+            .saturating_add(13)
     }
 
     pub fn compress<'a>(
@@ -235,15 +241,19 @@ impl Compress {
                 output.clear();
                 let n_in = z.total_in() as usize;
                 let n_out = z.total_out() as usize;
-                output.resize(input.len() + 10, 0);
+                output.resize(Self::zlib_output_reserve_bound(input.len()), 0);
                 let flush = flate2::FlushCompress::Partial;
                 loop {
                     let n_in_ = z.total_in() as usize - n_in;
                     let n_out_ = z.total_out() as usize - n_out;
                     #[allow(clippy::indexing_slicing)] // length checked
                     let c = z.compress(&input[n_in_..], &mut output[n_out_..], flush)?;
+                    let n_in_after = z.total_in() as usize - n_in;
                     match c {
                         flate2::Status::BufError => {
+                            output.resize(output.len() * 2, 0);
+                        }
+                        _ if n_in_after < input.len() => {
                             output.resize(output.len() * 2, 0);
                         }
                         _ => break,
@@ -280,8 +290,16 @@ impl Compress {
                     let n_out_ = z.total_out() as usize - n_out;
                     #[allow(clippy::indexing_slicing)] // length checked
                     let c = z.compress(&input[n_in_..], &mut output[start_len + n_out_..], flush)?;
+                    let n_in_after = z.total_in() as usize - n_in;
                     match c {
                         flate2::Status::BufError => {
+                            let growth = output.len().saturating_sub(start_len).max(1);
+                            output.resize(output.len() + growth, 0);
+                        }
+                        // Keep going until every input byte is consumed; otherwise the
+                        // stream state carries unconsumed input into the next SSH packet
+                        // and the peer's inflate stream desyncs (SshEncoding::Length).
+                        _ if n_in_after < input.len() => {
                             let growth = output.len().saturating_sub(start_len).max(1);
                             output.resize(output.len() + growth, 0);
                         }

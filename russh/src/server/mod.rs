@@ -41,7 +41,6 @@ use futures::future::Future;
 use log::{debug, error, info, warn};
 use msg::{is_kex_msg, validate_client_msg_strict_kex};
 use russh_util::runtime::JoinHandle;
-use russh_util::time::Instant;
 use ssh_key::{Certificate, PrivateKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, ToSocketAddrs};
@@ -64,6 +63,11 @@ pub mod supervisor;
 pub mod writer;
 pub use self::supervisor::{
     AtomicWriteProgress, DisconnectCause, DisconnectCauseSlot, WriteProgress,
+};
+#[cfg(feature = "_test_hooks")]
+pub use self::supervisor::{
+    CapacityChainSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate, InstallAckHoldGate,
+    KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, WatchdogObserveSlot,
 };
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
@@ -138,6 +142,55 @@ pub struct Config {
     /// Test-only first-cause slot (S1 harness). Production leaves this `None`.
     #[cfg(feature = "_test_hooks")]
     pub disconnect_cause_slot: Option<std::sync::Arc<supervisor::DisconnectCauseSlot>>,
+    /// Test-only: delay Session consumption of Writer InstallAck until released.
+    #[cfg(feature = "_test_hooks")]
+    pub install_ack_hold: Option<std::sync::Arc<supervisor::InstallAckHoldGate>>,
+    /// Test-only: count NeedSubmit entries for atomic KEX install.
+    #[cfg(feature = "_test_hooks")]
+    pub need_submit_seen: Option<std::sync::Arc<supervisor::NeedSubmitSeenSlot>>,
+    /// Test-only: live KEX install phase + non-Idle observation for R2/R3/R5/R6.
+    #[cfg(feature = "_test_hooks")]
+    pub kex_install_observe: Option<std::sync::Arc<supervisor::KexInstallObserveSlot>>,
+    /// Test-only: atomic max of sealed_backlog_bytes (R4 numerical bound).
+    #[cfg(feature = "_test_hooks")]
+    pub ledger_max: Option<std::sync::Arc<supervisor::LedgerMaxSlot>>,
+    /// Test-only: next Writer seal fails once (R5 ACK/Writer-fail inject).
+    #[cfg(feature = "_test_hooks")]
+    pub fail_next_seal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: when true, Writer hangs socket writes (HangWrite) but still
+    /// dequeues/seals into out_q — deterministic Full / NeedSubmit (R2/R3/R4).
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: next bulk try_send / SealBatch returns Full once (R2/R3/R4).
+    #[cfg(feature = "_test_hooks")]
+    pub force_next_bulk_full: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: next Writer socket write fails once with an I/O error (R5).
+    #[cfg(feature = "_test_hooks")]
+    pub fail_next_socket_write: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: disable the 20ms NeedSubmit poll sleep so the ONLY liveness
+    /// source for a parked KEX install is the Writer capacity notify (R3).
+    #[cfg(feature = "_test_hooks")]
+    pub need_submit_timer_disable: bool,
+    /// Test-only: R3 liveness chain counters (dequeue notify → capacity arm →
+    /// install advance).
+    #[cfg(feature = "_test_hooks")]
+    pub capacity_chain: Option<std::sync::Arc<supervisor::CapacityChainSlot>>,
+    /// Test-only: count inbound CHANNEL_WINDOW_ADJUST packets (F1 replenishment
+    /// proof — each arriving adjust is one credit replenishment).
+    #[cfg(feature = "_test_hooks")]
+    pub window_adjust_seen: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Test-only: pause Writer mpsc dequeue (R3 one-cmd gate).
+    #[cfg(feature = "_test_hooks")]
+    pub dequeue_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: wake Session to emit one IGNORE into the Writer mpsc (R3).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_ignore: Option<std::sync::Arc<supervisor::InjectIgnoreGate>>,
+    /// Test-only: deferred WINDOW_ADJUST insert/replay/emitted counters.
+    #[cfg(feature = "_test_hooks")]
+    pub deferred_grant: Option<std::sync::Arc<supervisor::DeferredGrantSlot>>,
+    /// Test-only: write-watchdog armed / eligible / rekey-gen edges.
+    #[cfg(feature = "_test_hooks")]
+    pub watchdog_observe: Option<std::sync::Arc<supervisor::WatchdogObserveSlot>>,
 }
 
 impl Default for Config {
@@ -176,6 +229,36 @@ impl Default for Config {
             teardown_grace: std::time::Duration::from_secs(5),
             #[cfg(feature = "_test_hooks")]
             disconnect_cause_slot: None,
+            #[cfg(feature = "_test_hooks")]
+            install_ack_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            need_submit_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            kex_install_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            ledger_max: None,
+            #[cfg(feature = "_test_hooks")]
+            fail_next_seal: None,
+            #[cfg(feature = "_test_hooks")]
+            socket_hang: None,
+            #[cfg(feature = "_test_hooks")]
+            force_next_bulk_full: None,
+            #[cfg(feature = "_test_hooks")]
+            fail_next_socket_write: None,
+            #[cfg(feature = "_test_hooks")]
+            need_submit_timer_disable: false,
+            #[cfg(feature = "_test_hooks")]
+            capacity_chain: None,
+            #[cfg(feature = "_test_hooks")]
+            window_adjust_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            dequeue_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_ignore: None,
+            #[cfg(feature = "_test_hooks")]
+            deferred_grant: None,
+            #[cfg(feature = "_test_hooks")]
+            watchdog_observe: None,
         }
     }
 }
@@ -1166,6 +1249,11 @@ where
         handshake_deadline_at: Some(handshake_deadline_at),
         writer: None,
         pending_supervisor_cause: None,
+        pending_outbound: crate::server::session::PendingOutbound::default(),
+        pending_kex_install: None,
+        deferred_window_grants: std::collections::HashSet::new(),
+        #[cfg(feature = "_test_hooks")]
+        full_ledger: None,
     };
 
     session.begin_rekey()?;
@@ -1226,8 +1314,19 @@ async fn reply<H: Handler + Send>(
         }
     }
 
-    if pkt.buffer.first() == Some(&msg::KEXINIT) && session.kex == SessionKexState::Idle {
-        // Not currently in a rekey but received KEXINIT
+    // Peer KEXINIT while an outbound-install transaction is still open: park for
+    // replay after finalize (do not begin_rekey or mis-handle as encrypted app data).
+    if pkt.buffer.first() == Some(&msg::KEXINIT) && session.should_park_kexinit() {
+        debug!("parking peer KEXINIT until pending kex install completes");
+        session.park_pending_read(pkt.buffer.clone());
+        return Ok(());
+    }
+
+    if pkt.buffer.first() == Some(&msg::KEXINIT)
+        && session.kex == SessionKexState::Idle
+        && session.pending_kex_install.is_none()
+    {
+        // Not currently in a rekey / pending install but received KEXINIT
         info!("Client has initiated re-key");
         session.begin_rekey()?;
         // Kex will consume the packet right away
@@ -1236,122 +1335,186 @@ async fn reply<H: Handler + Send>(
     let is_kex_msg = pkt.buffer.first().cloned().map(is_kex_msg).unwrap_or(false);
 
     if is_kex_msg {
-        if let SessionKexState::InProgress(kex) = session.kex.take() {
-            let progress = kex
-                .step(Some(pkt), &mut session.common.packet_writer, handler)
-                .await?;
+        if let SessionKexState::InProgress(mut kex) = session.kex.take() {
+            // Collect plaintext; seal via Writer (or atomic batch+install at NEWKEYS).
+            let mut coll = crate::sshbuffer::PayloadCollector::default();
+            let progress = kex.step(Some(pkt), &mut coll, handler).await?;
+            let payloads = std::mem::take(&mut coll.payloads);
 
             match progress {
-                KexProgress::NeedsReply { kex, reset_seqn } => {
+                KexProgress::NeedsReply { mut kex, reset_seqn } => {
                     debug!("kex impl continues: {kex:?}");
-                    session.kex = SessionKexState::InProgress(kex);
-                    if reset_seqn {
-                        debug!("kex impl requests seqno reset");
-                        session.common.reset_seqn();
+                    // §4.4: register atomic seal+install (after=None → wait for peer Done).
+                    if let Some(half) = kex.take_outbound_epoch_install() {
+                        let kex_gen = if kex.is_rekey() {
+                            session.rekey_gen
+                        } else {
+                            0
+                        };
+                        let post_auth = matches!(
+                            session.common.encrypted.as_ref().map(|e| &e.state),
+                            Some(
+                                EncryptedState::InitCompression
+                                    | EncryptedState::Authenticated
+                            )
+                        );
+                        let activate_compress = if half.compression.is_deferred() {
+                            post_auth
+                        } else {
+                            true
+                        };
+                        if session
+                            .register_seal_batch_and_install(
+                                payloads,
+                                kex_gen,
+                                half.cipher,
+                                half.compression,
+                                activate_compress,
+                                half.reset_seqn || reset_seqn,
+                                None, // peer Done not yet
+                            )
+                            .is_err()
+                        {
+                            // cause staged; do not put kex back / do not flush
+                            return Ok(());
+                        }
+                    } else {
+                        if let Err(e) = session.seal_payloads(payloads) {
+                            debug!("kex seal_payloads failed: {e:?}");
+                            session.stage_cause(
+                                crate::server::DisconnectCause::PeerError,
+                            );
+                            return Ok(());
+                        }
+                        let _ = reset_seqn;
                     }
+                    session.kex = SessionKexState::InProgress(kex);
                 }
-                KexProgress::Done { newkeys, .. } => {
+                KexProgress::Done { mut newkeys, .. } => {
                     debug!("kex impl has completed");
                     session.common.strict_kex =
                         session.common.strict_kex || newkeys.names.strict_kex();
 
+                    let need_outbound_install = !payloads.is_empty();
+
                     if session.common.encrypted.is_some() {
-                        // This is a rekey
-                        let outbound_gen = session.rekey_gen;
-                        {
-                            let common = &mut session.common;
-                            common.newkeys(newkeys);
-                            common.packet_writer.buffer().bytes = 0;
-                            if let Some(enc) = common.encrypted.as_mut() {
-                                enc.last_rekey = Instant::now();
-                                enc.flush_all_pending_with_writer(&mut common.packet_writer)?;
+                        // Rekey Done — **inbound commits this turn** (peer NEWKEYS cutover).
+                        if need_outbound_install {
+                            // skip_exchange: register outbound install, then commit inbound.
+                            let kex_gen = session.rekey_gen;
+                            let post_auth = matches!(
+                                session.common.encrypted.as_ref().map(|e| &e.state),
+                                Some(
+                                    EncryptedState::InitCompression
+                                        | EncryptedState::Authenticated
+                                )
+                            );
+                            let half = kex::ServerKex::take_outbound_from_newkeys(
+                                &mut newkeys,
+                                session.common.strict_kex,
+                            );
+                            let activate_compress = if half.compression.is_deferred() {
+                                post_auth
+                            } else {
+                                true
+                            };
+                            if session
+                                .register_seal_batch_and_install(
+                                    payloads,
+                                    kex_gen,
+                                    half.cipher,
+                                    half.compression,
+                                    activate_compress,
+                                    half.reset_seqn,
+                                    Some(
+                                        crate::server::session::KexAfterInstall::RekeyComplete,
+                                    ),
+                                )
+                                .is_err()
+                            {
+                                return Ok(()); // cause staged; no flush
                             }
-                        }
-
-                        // S2a: outbound InstallAck — try_push + deadline-bounded wait (r2 P1).
-                        // On failure: stage first-cause and skip success tail; run() records
-                        // cause and walks unified Cancelling (no early-return past record_cause).
-                        let mut install_ok = true;
-                        if let Some(ref w) = session.writer {
-                            match w.try_install_outbound_epoch(outbound_gen) {
-                                Err(_) => {
-                                    debug!("try_install_outbound_epoch full/closed");
-                                    session.pending_supervisor_cause =
-                                        Some(crate::server::DisconnectCause::PeerError);
-                                    install_ok = false;
-                                }
-                                Ok(ack_rx) => match session.rekey_deadline.remaining() {
-                                    None => {
-                                        // Fail closed: never unbounded-wait ACK.
-                                        debug!("install_outbound: missing rekey deadline");
-                                        session.pending_supervisor_cause =
-                                            Some(crate::server::DisconnectCause::PeerError);
-                                        install_ok = false;
-                                    }
-                                    Some(rem) => {
-                                        let wait = async {
-                                            match ack_rx.await {
-                                                Ok(Ok(())) => Ok(()),
-                                                Ok(Err(_)) | Err(_) => Err(()),
-                                            }
-                                        };
-                                        match tokio::time::timeout(rem, wait).await {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(())) => {
-                                                session.pending_supervisor_cause = Some(
-                                                    crate::server::DisconnectCause::PeerError,
-                                                );
-                                                install_ok = false;
-                                            }
-                                            Err(_elapsed) => {
-                                                session.pending_supervisor_cause = Some(
-                                                    crate::server::DisconnectCause::RekeyTimeout,
-                                                );
-                                                install_ok = false;
-                                            }
-                                        }
-                                    }
-                                },
+                            // Inbound cutover now (not deferred to InstallAck).
+                            session.commit_rekey_inbound(newkeys);
+                            // Completion (Idle/deadline/replay) waits for InstallAck.
+                        } else {
+                            // Normal rekey: inbound now; completion may wait for InstallAck.
+                            session.commit_rekey_inbound(newkeys);
+                            let after =
+                                crate::server::session::KexAfterInstall::RekeyComplete;
+                            if let Some(ready) =
+                                session.merge_peer_done_into_pending(after)
+                            {
+                                session.apply_kex_after_install(ready);
+                                // Unified gate re-entry (not process_packet bypass).
+                                session.replay_pending_reads(handler).await?;
+                                let _ = session.flush();
                             }
-                        }
-
-                        if install_ok {
-                            let mut pending = std::mem::take(&mut session.pending_reads);
-                            for p in pending.drain(..) {
-                                session.process_packet(handler, &p).await?;
-                            }
-                            session.pending_reads = pending;
-                            session.pending_len = 0;
-                            session.flush()?;
-                            session.ship_sealed_to_writer().await?;
+                            // else: wait for InstallAck; kex stays Taken; inbound already live.
                         }
                     } else {
-                        // This is the initial kex
-
-                        session.common.encrypted(
-                            EncryptedState::WaitingAuthServiceRequest {
-                                sent: false,
-                                accepted: false,
-                            },
-                            newkeys,
-                        );
-
-                        session.maybe_send_ext_info()?;
+                        // Initial Done — **inbound/Encrypted commit this turn**.
+                        if need_outbound_install {
+                            let (local, outbound_comp, reset_seqn) =
+                                crate::server::session::Session::take_outbound_from_newkeys_server(
+                                    &mut newkeys,
+                                );
+                            let activate = !outbound_comp.is_deferred();
+                            if session
+                                .register_seal_batch_and_install(
+                                    payloads,
+                                    0,
+                                    local,
+                                    outbound_comp,
+                                    activate,
+                                    reset_seqn,
+                                    Some(
+                                        crate::server::session::KexAfterInstall::InitialComplete,
+                                    ),
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            session.commit_initial_encrypted(
+                                EncryptedState::WaitingAuthServiceRequest {
+                                    sent: false,
+                                    accepted: false,
+                                },
+                                newkeys,
+                            );
+                        } else {
+                            session.commit_initial_encrypted(
+                                EncryptedState::WaitingAuthServiceRequest {
+                                    sent: false,
+                                    accepted: false,
+                                },
+                                newkeys,
+                            );
+                            let after =
+                                crate::server::session::KexAfterInstall::InitialComplete;
+                            if let Some(ready) =
+                                session.merge_peer_done_into_pending(after)
+                            {
+                                session.apply_kex_after_install(ready);
+                            }
+                            // else wait for InstallAck (inbound already committed)
+                        }
                     }
-
-                    session.kex = SessionKexState::Idle;
-                    // S1/S2a: rekey completed (outbound ACK done) — unregister deadline.
-                    session.clear_rekey_deadline();
 
                     if session.common.strict_kex {
                         pkt.seqn = Wrapping(0);
                     }
 
-                    debug!("kex done");
+                    debug!("kex done (inbound committed; completion may wait ACK)");
                 }
             }
 
-            session.flush()?;
+            // Err path (staged cause): do not flush.
+            if session.pending_supervisor_cause.is_some() {
+                return Ok(());
+            }
+            let _ = session.flush();
 
             return Ok(());
         }

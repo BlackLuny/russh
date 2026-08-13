@@ -148,7 +148,42 @@ impl<C> CommonSession<C> {
     }
 
     pub fn encrypted(&mut self, state: EncryptedState, newkeys: NewKeys) {
+        // Client single-task path: outbound = client→server compression.
+        let (local, outbound_comp, _) = self.encrypted_split_outbound(state, newkeys, false);
+        self.packet_writer.set_cipher(local);
+        if let Some(ref mut enc) = self.encrypted {
+            if !outbound_comp.is_deferred() {
+                outbound_comp.init_compress(self.packet_writer.compress());
+            }
+        }
+    }
+
+    /// Build `Encrypted` + install inbound cipher; return outbound sealing key.
+    ///
+    /// Direction depends on endpoint:
+    /// - **client** (`is_server=false`): outbound = `client_compression`,
+    ///   inbound decompress = `server_compression`
+    /// - **server** (`is_server=true`): outbound = `server_compression`,
+    ///   inbound decompress = `client_compression`
+    ///
+    /// Deferred (`zlib@openssh.com`) compress/decompress stay inactive until auth.
+    pub fn encrypted_split_outbound(
+        &mut self,
+        state: EncryptedState,
+        newkeys: NewKeys,
+        is_server: bool,
+    ) -> (
+        Box<dyn crate::cipher::SealingKey + Send>,
+        crate::compression::Compression,
+        bool,
+    ) {
         let strict_kex = newkeys.names.strict_kex();
+        let outbound_comp = if is_server {
+            newkeys.names.server_compression.clone()
+        } else {
+            newkeys.names.client_compression.clone()
+        };
+        let reset_seqn = strict_kex;
         self.encrypted = Some(Encrypted {
             exchange: Some(newkeys.exchange),
             kex: newkeys.kex,
@@ -170,23 +205,21 @@ impl<C> CommonSession<C> {
             extension_info_awaiters: HashMap::new(),
         });
         self.remote_to_local = newkeys.cipher.remote_to_local;
-        self.packet_writer
-            .set_cipher(newkeys.cipher.local_to_remote);
+        let local_to_remote = newkeys.cipher.local_to_remote;
         self.strict_kex = strict_kex;
 
-        // For non-deferred compression (RFC 4253 "zlib"), activate immediately
-        // after initial key exchange. Deferred compression ("zlib@openssh.com")
-        // will be activated later, after authentication succeeds.
         if let Some(ref mut enc) = self.encrypted {
-            if !enc.client_compression.is_deferred() {
-                enc.client_compression
-                    .init_compress(self.packet_writer.compress());
-            }
-            if !enc.server_compression.is_deferred() {
-                enc.server_compression
-                    .init_decompress(&mut enc.decompress);
+            // Inbound decompress: peer→us.
+            let inbound = if is_server {
+                &enc.client_compression
+            } else {
+                &enc.server_compression
+            };
+            if !inbound.is_deferred() {
+                inbound.clone().init_decompress(&mut enc.decompress);
             }
         }
+        (local_to_remote, outbound_comp, reset_seqn)
     }
 
     /// Send a disconnect message.
@@ -448,7 +481,6 @@ impl Encrypted {
         Ok(wrote)
     }
 
-    #[allow(dead_code)]
     pub fn flush_all_pending(&mut self) -> Result<(), crate::Error> {
         let channel_ids: Vec<ChannelId> = self.channels.keys().copied().collect();
         for channel_id in channel_ids {
@@ -633,7 +665,6 @@ impl Encrypted {
         Ok(buf_len)
     }
 
-    #[allow(dead_code)]
     pub fn data(
         &mut self,
         channel: ChannelId,
@@ -695,7 +726,6 @@ impl Encrypted {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn extended_data(
         &mut self,
         channel: ChannelId,

@@ -62,85 +62,111 @@ impl Session {
             rejection_wait_until
         };
 
-        let Some(enc) = self.common.encrypted.as_mut() else {
-            return Err(Error::Inconsistent.into());
-        };
+        // After auth accept: run compress barrier (no unbounded ACK) then auth_succeeded.
+        let mut need_auth_barrier = false;
+        // Residual InitCompression packet body (msg type + rest) if any.
+        let mut residual_auth_packet: Option<(u8, &[u8])> = None;
 
-        // If we've successfully read a packet.
-        match (&mut enc.state, buf.split_first()) {
-            (
-                EncryptedState::WaitingAuthServiceRequest { accepted, .. },
-                Some((&msg::SERVICE_REQUEST, mut r)),
-            ) => {
-                let request = map_err!(String::decode(&mut r))?;
-                map_err!(ensure_end(&r))?;
-                debug!("request: {request:?}");
-                if request == "ssh-userauth" {
-                    let auth_request = server_accept_service(
-                        handler.authentication_banner().await?,
-                        self.common.config.as_ref().methods.clone(),
+        {
+            let Some(enc) = self.common.encrypted.as_mut() else {
+                return Err(Error::Inconsistent.into());
+            };
+
+            // If we've successfully read a packet.
+            match (&mut enc.state, buf.split_first()) {
+                (
+                    EncryptedState::WaitingAuthServiceRequest { accepted, .. },
+                    Some((&msg::SERVICE_REQUEST, mut r)),
+                ) => {
+                    let request = map_err!(String::decode(&mut r))?;
+                    map_err!(ensure_end(&r))?;
+                    debug!("request: {request:?}");
+                    if request == "ssh-userauth" {
+                        let auth_request = server_accept_service(
+                            handler.authentication_banner().await?,
+                            self.common.config.as_ref().methods.clone(),
+                            &mut enc.write,
+                        )?;
+                        *accepted = true;
+                        enc.state = EncryptedState::WaitingAuthRequest(auth_request);
+                    }
+                }
+                (
+                    EncryptedState::WaitingAuthRequest(_),
+                    Some((&msg::USERAUTH_REQUEST, mut r)),
+                ) => {
+                    enc.server_read_auth_request(
+                        rejection_wait_until,
+                        initial_none_rejection_wait_until,
+                        handler,
+                        buf,
+                        &mut r,
+                        &mut self.common.auth_user,
+                    )
+                    .await?;
+                    self.common.auth_attempts += 1;
+                    if let EncryptedState::InitCompression = enc.state {
+                        need_auth_barrier = true;
+                    }
+                }
+                (
+                    EncryptedState::WaitingAuthRequest(auth),
+                    Some((&msg::USERAUTH_INFO_RESPONSE, mut r)),
+                ) => {
+                    let resp = read_userauth_info_response(
+                        rejection_wait_until,
+                        handler,
                         &mut enc.write,
-                    )?;
-                    *accepted = true;
-                    enc.state = EncryptedState::WaitingAuthRequest(auth_request);
-                }
-                Ok(())
-            }
-            (EncryptedState::WaitingAuthRequest(_), Some((&msg::USERAUTH_REQUEST, mut r))) => {
-                enc.server_read_auth_request(
-                    rejection_wait_until,
-                    initial_none_rejection_wait_until,
-                    handler,
-                    buf,
-                    &mut r,
-                    &mut self.common.auth_user,
-                )
-                .await?;
-                self.common.auth_attempts += 1;
-                if let EncryptedState::InitCompression = enc.state {
-                    if enc.client_compression.is_deferred() {
-                        enc.client_compression.init_decompress(&mut enc.decompress);
+                        auth,
+                        &self.common.auth_user,
+                        &mut r,
+                    )
+                    .await?;
+                    if resp {
+                        enc.state = EncryptedState::InitCompression;
+                        need_auth_barrier = true;
                     }
-                    handler.auth_succeeded(self).await?;
                 }
-                Ok(())
-            }
-            (
-                EncryptedState::WaitingAuthRequest(auth),
-                Some((&msg::USERAUTH_INFO_RESPONSE, mut r)),
-            ) => {
-                let resp = read_userauth_info_response(
-                    rejection_wait_until,
-                    handler,
-                    &mut enc.write,
-                    auth,
-                    &self.common.auth_user,
-                    &mut r,
-                )
-                .await?;
-                if resp {
-                    enc.state = EncryptedState::InitCompression;
-                    if enc.client_compression.is_deferred() {
-                        enc.client_compression.init_decompress(&mut enc.decompress);
-                    }
-                    handler.auth_succeeded(self).await
-                } else {
-                    Ok(())
+                // Residual: barrier should already have run on auth turn; re-run
+                // fail-closed if somehow still in InitCompression, then dispatch.
+                (EncryptedState::InitCompression, Some((msg, r))) => {
+                    need_auth_barrier = true;
+                    residual_auth_packet = Some((*msg, r));
                 }
-            }
-            (EncryptedState::InitCompression, Some((msg, mut r))) => {
-                if enc.server_compression.is_deferred() {
-                    enc.server_compression
-                        .init_compress(self.common.packet_writer.compress());
+                (EncryptedState::Authenticated, Some((msg, r))) => {
+                    residual_auth_packet = Some((*msg, r));
                 }
-                enc.state = EncryptedState::Authenticated;
-                self.server_read_authenticated(handler, *msg, &mut r).await
+                _ => {}
             }
-            (EncryptedState::Authenticated, Some((msg, mut r))) => {
-                self.server_read_authenticated(handler, *msg, &mut r).await
+        } // enc borrow ends
+
+        if need_auth_barrier {
+            // Ordered barrier: seal USERAUTH_SUCCESS (uncompressed) → FIFO
+            // activate outbound deferred compress → Authenticated.
+            // Must not await ACK inside reply() (watchdog / cancel stay live).
+            if let Err(e) = self.complete_auth_compress_barrier() {
+                debug!("auth compress barrier failed: {e:?}");
+                self.pending_supervisor_cause =
+                    Some(crate::server::DisconnectCause::PeerError);
+                self.common.disconnected = true;
+                return Ok(());
             }
-            _ => Ok(()),
+            // auth_succeeded only on the auth-accept turn (no residual packet).
+            if residual_auth_packet.is_none() {
+                handler.auth_succeeded(self).await?;
+            }
         }
+
+        if let Some((msg, mut r)) = residual_auth_packet {
+            // Only dispatch authenticated handlers once past barrier.
+            if matches!(
+                self.common.encrypted.as_ref().map(|e| &e.state),
+                Some(EncryptedState::Authenticated)
+            ) {
+                return self.server_read_authenticated(handler, msg, &mut r).await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -561,6 +587,11 @@ mod tests {
             handshake_deadline_at: None,
             writer: None,
             pending_supervisor_cause: None,
+            pending_outbound: crate::server::session::PendingOutbound::default(),
+            pending_kex_install: None,
+            deferred_window_grants: std::collections::HashSet::new(),
+            #[cfg(feature = "_test_hooks")]
+            full_ledger: None,
         }
     }
 
@@ -1281,11 +1312,15 @@ impl Session {
                     new_size = channel.recipient_window_size.saturating_add(amount);
                     channel.recipient_window_size = new_size;
                 }
-                let common = &mut self.common;
-                if let Some(enc) = common.encrypted.as_mut() {
-                    new_size -= enc
-                        .flush_pending_with_writer(&mut common.packet_writer, channel_num)?
-                        as u32;
+                // P-1: HWM/framing-aware drain only (never unbounded flush_pending).
+                // Errors propagate into reply → first-cause / cancel path.
+                let wrote = self.try_drain_channel_under_budget(channel_num)?;
+                new_size = new_size.saturating_sub(wrote as u32);
+                // Reflect residual window after clamp/drain.
+                if let Some(enc) = self.common.encrypted.as_ref() {
+                    if let Some(ch) = enc.channels.get(&channel_num) {
+                        new_size = ch.recipient_window_size;
+                    }
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
                     chan.window_size().update(new_size).await;
@@ -1598,18 +1633,16 @@ impl Session {
                         let result = handler
                             .tcpip_forward(&address, &mut returned_port, self)
                             .await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, {
-                                    enc.write.push(msg::REQUEST_SUCCESS);
-                                    if self.common.wants_reply && port == 0 && returned_port != 0 {
-                                        map_err!(returned_port.encode(&mut enc.write))?;
-                                    }
-                                })
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
-                            }
-                        }
+                        let extra = if result
+                            && self.common.wants_reply
+                            && port == 0
+                            && returned_port != 0
+                        {
+                            Some(returned_port)
+                        } else {
+                            None
+                        };
+                        self.emit_global_request_reply(result, extra)?;
                         Ok(())
                     }
                     "cancel-tcpip-forward" => {
@@ -1618,13 +1651,7 @@ impl Session {
                         map_err!(ensure_end(r))?;
                         debug!("handler.cancel_tcpip_forward {address:?} {port:?}");
                         let result = handler.cancel_tcpip_forward(&address, port, self).await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
-                            }
-                        }
+                        self.emit_global_request_reply(result, None)?;
                         Ok(())
                     }
                     "streamlocal-forward@openssh.com" => {
@@ -1634,13 +1661,7 @@ impl Session {
                         let result = handler
                             .streamlocal_forward(&server_socket_path, self)
                             .await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
-                            }
-                        }
+                        self.emit_global_request_reply(result, None)?;
                         Ok(())
                     }
                     "cancel-streamlocal-forward@openssh.com" => {
@@ -1650,21 +1671,11 @@ impl Session {
                         let result = handler
                             .cancel_streamlocal_forward(&socket_path, self)
                             .await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
-                            }
-                        }
+                        self.emit_global_request_reply(result, None)?;
                         Ok(())
                     }
                     _ => {
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            push_packet!(enc.write, {
-                                enc.write.push(msg::REQUEST_FAILURE);
-                            });
-                        }
+                        self.emit_global_request_reply(false, None)?;
                         Ok(())
                     }
                 }

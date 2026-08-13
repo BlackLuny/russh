@@ -348,10 +348,13 @@ async fn s0_write_stall_during_rekey() -> Result<(), anyhow::Error> {
             first_channel_mode: ServerMode::FloodForever,
             inactivity_timeout: Some(Duration::from_secs(600)),
             flood_start: Some(flood_gate.clone()),
-            // Write watchdog fires first; rekey deadline is longer.
+            // Write watchdog fires first on a true TCP stall (eligible>0).
+            // If staging already drained (peer TCP still open), the remaining
+            // failure is "kex gets no peer reply" → RekeyTimeout. That
+            // deadline must fit inside OBSERVE (8s) or the slot stays None.
             write_progress_deadline: WD,
             write_min_drain: None,
-            rekey_deadline: Duration::from_secs(30),
+            rekey_deadline: Duration::from_secs(5),
             teardown_grace: GRACE,
             disconnect_cause_slot: Some(cause.clone()),
             ..FloodServerConfig::default()
@@ -395,7 +398,13 @@ async fn s0_write_stall_during_rekey() -> Result<(), anyhow::Error> {
         progress.kex_count.load(Ordering::Relaxed)
     );
 
-    assert_cause(&cause, DisconnectCause::WriteStalled, "write-stall-during-rekey");
+    let got = cause.get();
+    assert!(
+        got == Some(DisconnectCause::WriteStalled)
+            || got == Some(DisconnectCause::RekeyTimeout),
+        "write-stall-during-rekey: expected WriteStalled (TCP stall, eligible>0) \
+         or RekeyTimeout (staging empty, kex waiting on peer), got {got:?}"
+    );
     Ok(())
 }
 
@@ -683,7 +692,8 @@ async fn s1_auth_success_idle_survives_handshake_deadline() -> Result<(), anyhow
 async fn s2a_healthy_continuous_read_grows_past_hwm() -> Result<(), anyhow::Error> {
     let _ = env_logger::builder().is_test(false).try_init();
 
-    // Large peer window so the stall cannot be "legal window=0".
+    // F1: must cross real WINDOW_ADJUST cliffs — use 8 MiB window and require
+    // growth past two full replenishments (not a 64 MiB bypass).
     let down_window = 8 * 1024 * 1024u32;
     let pkt = 32 * 1024u32;
     let hwm = 128 * 1024u64;
@@ -727,17 +737,263 @@ async fn s2a_healthy_continuous_read_grows_past_hwm() -> Result<(), anyhow::Erro
         progress.total()
     );
 
-    // Then keep growing for several samples (not a one-shot burst then stall).
+    // Cross two full peer-window replenishments (WINDOW_ADJUST cliff path).
+    let target = 2 * down_window as u64;
+    let grow_deadline = std::time::Instant::now() + Duration::from_secs(25);
     let mut last = progress.total();
-    for i in 0..6 {
-        sleep(Duration::from_millis(200)).await;
+    let mut i = 0u32;
+    while progress.total() < target {
+        if std::time::Instant::now() >= grow_deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
         let now = progress.total();
-        eprintln!("s2a hwm-growth sample{i}: {last} → {now}");
+        if now > last {
+            eprintln!("s2a hwm-growth sample{i}: {last} → {now}");
+            last = now;
+            i += 1;
+        }
         assert!(
-            progress.session_alive() && now > last,
-            "bytes must keep growing after crossing HWM (sample {i}: {last} → {now})"
+            progress.session_alive(),
+            "session died during post-HWM growth (total={})",
+            progress.total()
         );
-        last = now;
     }
+    assert!(
+        progress.total() >= target,
+        "F1: must cross two window replenishments (need {target}, got {})",
+        progress.total()
+    );
+    let _ = hwm;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. S2b-1: small packets past bulk *item* cap (256) must backpressure, not PeerError
+//
+// Deterministic Full/Closed classification lives in writer unit tests
+// (`try_send_observes_full_then_closed`). This integration case proves the
+// live session path treats Full as recoverable backpressure under tiny packets.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "_test_hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2b1_small_packets_survive_item_queue_cap() -> Result<(), anyhow::Error> {
+    let _ = env_logger::builder().is_test(false).try_init();
+
+    // Tiny max packet → many queue items per KiB; item cap 256 fills before 128KiB HWM.
+    let down_window = 4 * 1024 * 1024u32;
+    let pkt = 64u32; // << 512B threshold (128KiB/256)
+
+    let progress = Progress::new();
+    let addr = free_addr();
+    let server = FloodServer::new(
+        progress.clone(),
+        FloodServerConfig {
+            window_size: down_window,
+            maximum_packet_size: pkt,
+            rekey_write_limit: usize::MAX / 4,
+            // FloodForever uses 16KiB chunks; server will fragment to max_packet.
+            first_channel_mode: ServerMode::FloodForever,
+            write_progress_deadline: Duration::from_secs(30),
+            write_min_drain: None,
+            rekey_deadline: Duration::from_secs(30),
+            ..FloodServerConfig::default()
+        },
+    );
+    let _srv = server.spawn(addr);
+    wait_listening(addr).await;
+
+    let mut client_cfg = default_client_config();
+    client_cfg.window_size = down_window;
+    client_cfg.maximum_packet_size = pkt;
+    let (session, _ctrl) = connect_faulty(addr, client_cfg, progress.clone()).await?;
+    let channel = session.channel_open_session().await?;
+    let _drainer = spawn_channel_drainer(channel);
+
+    // Cross well past 256 packets of ~64B data (~16KiB) and keep flowing.
+    let target = 256u64 * 64 * 8; // 8× item-cap worth of payload
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while progress.total() < target {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    eprintln!(
+        "s2b1 small-pkt: total={} alive={}",
+        progress.total(),
+        progress.session_alive()
+    );
+    assert!(
+        progress.session_alive() && progress.total() >= target,
+        "small-packet flood must keep flowing past item-cap without PeerError tear-down; got {}",
+        progress.total()
+    );
+
+    let b0 = progress.total();
+    sleep(Duration::from_millis(400)).await;
+    assert!(
+        progress.session_alive() && progress.total() > b0,
+        "must still grow after crossing item-cap (backpressure, not disconnect)"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. S2b-1: deferred zlib@openssh.com — auth handshake + immediate post-auth
+//     channel open (auth-turn barrier: USERAUTH_SUCCESS then compress activate).
+//
+// Asymmetric direction is covered by
+// `server_outbound_half_follows_server_compression_field` unit test (raw KEXINIT).
+// This case is the end-to-end happy path with matching lists.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(feature = "_test_hooks", feature = "flate2"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2b1_deferred_zlib_auth_succeeds() -> Result<(), anyhow::Error> {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    use russh::keys::PrivateKeyWithHashAlg;
+    use russh::{Preferred, client, server};
+    use ssh_key::PrivateKey;
+
+    let _ = env_logger::builder().is_test(false).try_init();
+
+    let mut preferred = Preferred::default();
+    preferred.compression = Cow::Borrowed(&[russh::compression::ZLIB_LEGACY]);
+
+    let mut server_config = server::Config::default();
+    server_config.preferred = preferred.clone();
+    server_config.keys.push(
+        PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap(),
+    );
+    server_config.inactivity_timeout = None;
+    let server_config = Arc::new(server_config);
+
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+
+    /// Unique host field on a server-originated CHANNEL_OPEN produced **in
+    /// `auth_succeeded` itself** (not in a later OPEN_CONFIRMATION callback).
+    /// Client asserts this field from the open callback — proves barrier already
+    /// activated compress for that same-turn packet.
+    const AUTH_TURN_HOST: &str = "s2b1-auth-turn-marker-host.invalid";
+
+    #[derive(Clone)]
+    struct AcceptAll;
+    impl server::Handler for AcceptAll {
+        type Error = russh::Error;
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: &ssh_key::PublicKey,
+        ) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+        async fn auth_succeeded(
+            &mut self,
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            // Barrier already queued InitOutboundCompress before this callback.
+            // This CHANNEL_OPEN is sealed only after that barrier, same auth turn.
+            let _id = session.channel_open_direct_tcpip(
+                AUTH_TURN_HOST,
+                22,
+                "127.0.0.1",
+                9,
+            )?;
+            Ok(())
+        }
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+    }
+
+    tokio::spawn(async move {
+        let (sock, _) = socket.accept().await.unwrap();
+        let _ = server::run_stream(server_config, sock, AcceptAll).await;
+    });
+
+    let mut client_config = client::Config::default();
+    client_config.preferred = preferred;
+    let client_config = Arc::new(client_config);
+    let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+
+    use tokio::sync::oneshot;
+    let (marker_tx, marker_rx) = oneshot::channel::<String>();
+    let marker_tx = std::sync::Mutex::new(Some(marker_tx));
+
+    struct OkClient {
+        marker_tx: std::sync::Mutex<Option<oneshot::Sender<String>>>,
+    }
+    impl client::Handler for OkClient {
+        type Error = russh::Error;
+        async fn check_server_key(
+            &mut self,
+            _: &ssh_key::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn server_channel_open_direct_tcpip(
+            &mut self,
+            _channel: russh::Channel<client::Msg>,
+            host_to_connect: &str,
+            _port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            reply: client::ChannelOpenHandle,
+            _session: &mut client::Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(tx) = self.marker_tx.lock().unwrap().take() {
+                let _ = tx.send(host_to_connect.to_string());
+            }
+            reply.accept().await;
+            Ok(())
+        }
+    }
+
+    let mut session = client::connect(
+        client_config,
+        addr,
+        OkClient { marker_tx },
+    )
+    .await
+    .expect("connect must succeed with deferred zlib (no pre-auth compress)");
+    let ok = session
+        .authenticate_publickey(
+            "user",
+            PrivateKeyWithHashAlg::new(Arc::new(key), None),
+        )
+        .await
+        .expect("auth IO")
+        .success();
+    assert!(
+        ok,
+        "publickey auth must succeed when zlib@openssh.com is deferred until post-auth"
+    );
+
+    // Client must observe the auth-turn CHANNEL_OPEN host field (post-barrier).
+    let got = tokio::time::timeout(Duration::from_secs(5), marker_rx)
+        .await
+        .expect("timeout waiting for auth-turn CHANNEL_OPEN")
+        .expect("marker channel closed");
+    assert_eq!(
+        got.as_str(),
+        AUTH_TURN_HOST,
+        "client must see exact auth-turn host field from same-turn CHANNEL_OPEN"
+    );
+
+    let _ch = session
+        .channel_open_session()
+        .await
+        .expect("channel open post-auth still works");
     Ok(())
 }

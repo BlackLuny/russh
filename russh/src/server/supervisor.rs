@@ -5,7 +5,7 @@
 //! this module only supplies the supervision state machine and timers that the
 //! current `select!` loop polls.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,628 @@ impl DisconnectCauseSlot {
 
     pub fn clear(&self) {
         self.raw.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Test-only gate: hold Session processing of Writer `InstallAckOutbound` events
+/// until [`InstallAckHoldGate::release`]. Used by S2b-1 Done-before-ACK regressions
+/// so inbound cutover at peer NEWKEYS is observable while completion still waits.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct InstallAckHoldGate {
+    held: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl InstallAckHoldGate {
+    pub fn new_held() -> Arc<Self> {
+        Arc::new(Self {
+            held: std::sync::atomic::AtomicBool::new(true),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    pub fn release(&self) {
+        self.held.store(false, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Re-arm the hold after a prior [`release`] (e.g. hold only across rekey).
+    pub fn hold_again(&self) {
+        self.held.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until the gate is released (cancel-safe).
+    pub async fn wait_released(&self) {
+        loop {
+            if !self.held.load(Ordering::SeqCst) {
+                return;
+            }
+            let n = self.notify.notified();
+            if !self.held.load(Ordering::SeqCst) {
+                return;
+            }
+            n.await;
+        }
+    }
+}
+
+/// Test-only: counts how many times Session entered `NeedSubmit` for KEX install.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct NeedSubmitSeenSlot {
+    count: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl NeedSubmitSeenSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            count: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    pub fn mark(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only: observe pending KEX install phase + non-Idle flag (Session run-loop).
+///
+/// Phase codes: 0=none, 1=NeedSubmit, 2=WaitingAck, 3=InstallAcked.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct KexInstallObserveSlot {
+    phase: AtomicU8,
+    non_idle: std::sync::atomic::AtomicBool,
+    /// Peer Done merged into the open transaction (`after.is_some()`).
+    after_known: std::sync::atomic::AtomicBool,
+    data_while_pending: AtomicU64,
+    /// Inbound packets successfully handled by `reply()` while an install
+    /// transaction was still open (R1 aggregated-write proof).
+    packets_while_pending: AtomicU64,
+    /// Inbound cipher commits at peer Done (`commit_rekey_inbound` /
+    /// `commit_initial_encrypted`).
+    inbound_commits: AtomicU64,
+    /// Completion effects applied (`apply_kex_after_install`: Idle/deadline/
+    /// flush_all_pending/ext-info).
+    completions: AtomicU64,
+    /// Packets re-entered through `replay_pending_reads`.
+    replays: AtomicU64,
+    /// `clear_rekey_deadline` calls.
+    deadline_clears: AtomicU64,
+    /// Peer KEXINITs parked via `park_pending_read`.
+    parks: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl KexInstallObserveSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn set_phase(&self, phase: u8) {
+        self.phase.store(phase, Ordering::SeqCst);
+    }
+
+    pub fn phase(&self) -> u8 {
+        self.phase.load(Ordering::SeqCst)
+    }
+
+    pub fn set_non_idle(&self, v: bool) {
+        self.non_idle.store(v, Ordering::SeqCst);
+    }
+
+    pub fn non_idle(&self) -> bool {
+        self.non_idle.load(Ordering::SeqCst)
+    }
+
+    pub fn set_after_known(&self, v: bool) {
+        self.after_known.store(v, Ordering::SeqCst);
+    }
+
+    pub fn after_known(&self) -> bool {
+        self.after_known.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_data_while_pending(&self, n: u64) {
+        if self.phase.load(Ordering::SeqCst) != 0 {
+            self.data_while_pending.fetch_add(n, Ordering::SeqCst);
+        }
+    }
+
+    pub fn data_while_pending(&self) -> u64 {
+        self.data_while_pending.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_packet_while_pending(&self) {
+        self.packets_while_pending.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn packets_while_pending(&self) -> u64 {
+        self.packets_while_pending.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_inbound_commit(&self) {
+        self.inbound_commits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn inbound_commits(&self) -> u64 {
+        self.inbound_commits.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_completion(&self) {
+        self.completions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn completions(&self) -> u64 {
+        self.completions.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_replay(&self) {
+        self.replays.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn replays(&self) -> u64 {
+        self.replays.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_deadline_clear(&self) {
+        self.deadline_clears.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn deadline_clears(&self) -> u64 {
+        self.deadline_clears.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_park(&self) {
+        self.parks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn parks(&self) -> u64 {
+        self.parks.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only: R3 liveness chain counters — dequeue notify → real Session
+/// capacity select arm → pending KEX install advance (phase 1→2/3).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct CapacityChainSlot {
+    dequeue_notifies: AtomicU64,
+    arm_runs: AtomicU64,
+    install_advances: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl CapacityChainSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Writer dequeued a bulk cmd (mpsc slot freed) and fired `notify_one`.
+    pub fn mark_dequeue_notify(&self) {
+        self.dequeue_notifies.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn dequeue_notifies(&self) -> u64 {
+        self.dequeue_notifies.load(Ordering::SeqCst)
+    }
+
+    /// Session capacity select arm (`session.rs` capacity_notify arm) ran.
+    pub fn mark_arm_run(&self) {
+        self.arm_runs.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn arm_runs(&self) -> u64 {
+        self.arm_runs.load(Ordering::SeqCst)
+    }
+
+    /// The capacity arm moved the pending install out of NeedSubmit.
+    pub fn mark_install_advance(&self) {
+        self.install_advances.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn install_advances(&self) -> u64 {
+        self.install_advances.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only: linearized full-pipeline reservation ledger.
+///
+/// A **single** `total` atomic is the source of truth for the process-wide
+/// max. The four component atomics stay as diagnostics. Cross-stage transfers
+/// (`enc.write` → Writer, KEX NeedSubmit → Writer, Writer Full → Session
+/// pending) adjust components in opposite directions and leave `total`
+/// unchanged, so a torn 4-way load can no longer invent a peak.
+///
+/// The F1 `HWM+allow+97` failures were exactly that torn load: Writer already
+/// held a newly accepted packet while the `enc_write` mirror still included
+/// its per-packet reservation (`CHANNEL_DATA` framing 9 + WIRE_OH 88 = 97).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug)]
+pub struct FullLedger {
+    pub writer_pending: Arc<std::sync::atomic::AtomicUsize>,
+    pub session_pending: Arc<std::sync::atomic::AtomicUsize>,
+    pub kex_need: Arc<std::sync::atomic::AtomicUsize>,
+    pub enc_write: Arc<std::sync::atomic::AtomicUsize>,
+    /// Linearized reservation sum. `fetch_max` / observe go through this.
+    total: std::sync::atomic::AtomicUsize,
+    pub slot: Arc<LedgerMaxSlot>,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl FullLedger {
+    pub fn new(
+        writer_pending: Arc<std::sync::atomic::AtomicUsize>,
+        session_pending: Arc<std::sync::atomic::AtomicUsize>,
+        slot: Arc<LedgerMaxSlot>,
+    ) -> Self {
+        Self {
+            writer_pending,
+            session_pending,
+            kex_need: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            enc_write: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            total: std::sync::atomic::AtomicUsize::new(0),
+            slot,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.total.load(Ordering::Acquire)
+    }
+
+    /// Credit newly accepted reservation (intake / Writer accept / top-up).
+    pub fn credit(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let now = self.total.fetch_add(n, Ordering::AcqRel).saturating_add(n);
+        self.observe_total(now);
+    }
+
+    /// Debit reservation that left the pipeline (socket drain / rollback /
+    /// seal reserved→actual shrink).
+    pub fn debit(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let prev = self.total.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |cur| cur.checked_sub(n),
+        );
+        match prev {
+            Ok(old) => self.observe_total(old.saturating_sub(n)),
+            Err(_) => {
+                self.slot.note_mismatch();
+                self.total.store(0, Ordering::Release);
+                self.observe_total(0);
+            }
+        }
+    }
+
+    /// `enc.write` reservation. Growth is intake; shrink + Writer accept
+    /// (after cursor advance) is a conservation transfer.
+    pub fn set_enc_write(&self, new: usize) {
+        let old = self.enc_write.swap(new, Ordering::AcqRel);
+        if new > old {
+            self.credit(new - old);
+        } else if old > new {
+            self.debit(old - new);
+        }
+    }
+
+    /// KEX NeedSubmit. Growth is intake; shrink + Writer accept is a transfer.
+    pub fn set_kex_need(&self, new: usize) {
+        let old = self.kex_need.swap(new, Ordering::AcqRel);
+        if new > old {
+            self.slot.note_kex_need(new);
+            self.credit(new - old);
+        } else if old > new {
+            self.debit(old - new);
+        }
+    }
+
+    fn observe_total(&self, total: usize) {
+        let parts = [
+            self.writer_pending.load(Ordering::Acquire),
+            self.session_pending.load(Ordering::Acquire),
+            self.kex_need.load(Ordering::Acquire),
+            self.enc_write.load(Ordering::Acquire),
+        ];
+        self.slot.observe_parts(total, parts);
+    }
+
+    /// Diagnostic only — do **not** use for max. Prefer [`Self::credit`]/
+    /// [`Self::debit`] / [`Self::set_enc_write`] / [`Self::set_kex_need`].
+    pub fn sample(&self) {
+        self.observe_total(self.total());
+    }
+}
+
+/// Test-only: process-wide max of `sealed_backlog_bytes` (atomic watermark).
+///
+/// Also carries the ledger-integrity counters: `mismatch` counts every failed
+/// checked subtraction (must stay 0 — a non-zero value is an observable ledger
+/// bug), `full_hits` counts **real** bulk-queue Full events (R4 proof that the
+/// flood really pressed the Writer queue to Full).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct LedgerMaxSlot {
+    max: std::sync::atomic::AtomicUsize,
+    /// Component snapshot `[writer, session_pending, kex_need, enc_write]` taken
+    /// by the sample that set `max` — diagnostic for upper-bound violations.
+    parts: [std::sync::atomic::AtomicUsize; 4],
+    mismatch: AtomicU64,
+    full_hits: AtomicU64,
+    intake_blocks: AtomicU64,
+    /// Peak KEX NeedSubmit component (R4: must be >0 on the kex scene).
+    kex_peak: std::sync::atomic::AtomicUsize,
+    /// Session-thread live `sealed_backlog` has been >= HWM (tiny packets may
+    /// sit in `enc.write` and never enter the linearized Writer total).
+    live_hwm: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl LedgerMaxSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn observe(&self, n: usize) {
+        let mut cur = self.max.load(Ordering::Relaxed);
+        while n > cur {
+            match self.max.compare_exchange_weak(
+                cur,
+                n,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Like [`Self::observe`], plus records the four ledger components that
+    /// produced the new max (diagnostic only — racy on concurrent max updates).
+    pub fn observe_parts(&self, n: usize, parts: [usize; 4]) {
+        let mut cur = self.max.load(Ordering::Relaxed);
+        while n > cur {
+            match self.max.compare_exchange_weak(
+                cur,
+                n,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    for (i, p) in parts.iter().enumerate() {
+                        self.parts[i].store(*p, Ordering::SeqCst);
+                    }
+                    break;
+                }
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// Components of the sample that set the current max:
+    /// `[writer_pending, session_pending, kex_need, enc_write]`.
+    pub fn parts(&self) -> [usize; 4] {
+        [
+            self.parts[0].load(Ordering::SeqCst),
+            self.parts[1].load(Ordering::SeqCst),
+            self.parts[2].load(Ordering::SeqCst),
+            self.parts[3].load(Ordering::SeqCst),
+        ]
+    }
+
+    pub fn max(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
+    }
+
+    /// A checked ledger subtraction underflowed — observable accounting error.
+    pub fn note_mismatch(&self) {
+        self.mismatch.fetch_add(1, Ordering::SeqCst);
+        log::error!("ledger mismatch: checked subtraction underflowed");
+    }
+
+    pub fn mismatch(&self) -> u64 {
+        self.mismatch.load(Ordering::SeqCst)
+    }
+
+    /// A real (non-synthetic) bulk-queue Full backpressure event.
+    pub fn note_full_hit(&self) {
+        self.full_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn full_hits(&self) -> u64 {
+        self.full_hits.load(Ordering::SeqCst)
+    }
+
+    /// Session intake refused new outbound because sealed backlog reached the
+    /// HWM budget (the HWM-boundary hit for large-packet floods, where the
+    /// budget trips long before the mpsc count limit).
+    pub fn note_intake_block(&self) {
+        self.intake_blocks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn intake_blocks(&self) -> u64 {
+        self.intake_blocks.load(Ordering::SeqCst)
+    }
+
+    pub fn note_kex_need(&self, n: usize) {
+        let mut cur = self.kex_peak.load(Ordering::Relaxed);
+        while n > cur {
+            match self.kex_peak.compare_exchange_weak(
+                cur,
+                n,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    pub fn kex_peak(&self) -> usize {
+        self.kex_peak.load(Ordering::SeqCst)
+    }
+
+    pub fn note_live_hwm(&self, n: usize) {
+        if n >= crate::sshbuffer::OUTBOUND_HIGH_WATERMARK {
+            self.live_hwm.store(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn live_hwm(&self) -> bool {
+        self.live_hwm.load(Ordering::SeqCst) != 0
+    }
+
+    pub fn clear(&self) {
+        self.max.store(0, Ordering::SeqCst);
+        self.mismatch.store(0, Ordering::SeqCst);
+        self.full_hits.store(0, Ordering::SeqCst);
+        self.intake_blocks.store(0, Ordering::SeqCst);
+        self.kex_peak.store(0, Ordering::SeqCst);
+        self.live_hwm.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Test-only: wake the Session run-loop to emit one `IGNORE` (R3 one-bulk-cmd).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct InjectIgnoreGate {
+    req: tokio::sync::Notify,
+    done: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl InjectIgnoreGate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Arm one IGNORE and wake the Session select.
+    pub fn request(&self) {
+        self.done.store(0, Ordering::SeqCst);
+        self.req.notify_one();
+    }
+
+    pub async fn wait_requested(&self) {
+        self.req.notified().await;
+    }
+
+    pub fn mark_done(&self) {
+        self.done.store(1, Ordering::SeqCst);
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::SeqCst) != 0
+    }
+}
+
+/// Test-only: deferred WINDOW_ADJUST insert / replay / emitted counters.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct DeferredGrantSlot {
+    inserts: AtomicU64,
+    replays: AtomicU64,
+    emitted: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl DeferredGrantSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn note_insert(&self) {
+        self.inserts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn note_replay(&self) {
+        self.replays.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn note_emitted(&self) {
+        self.emitted.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn inserts(&self) -> u64 {
+        self.inserts.load(Ordering::SeqCst)
+    }
+
+    pub fn replays(&self) -> u64 {
+        self.replays.load(Ordering::SeqCst)
+    }
+
+    pub fn emitted(&self) -> u64 {
+        self.emitted.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only: write-watchdog armed / eligible / rekey-generation edges.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct WatchdogObserveSlot {
+    ever_armed: AtomicU64,
+    armed_now: AtomicU64,
+    last_eligible: AtomicU64,
+    disarmed_after_arm: AtomicU64,
+    last_rekey_gen: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl WatchdogObserveSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn observe(&self, armed: bool, eligible: u64, rekey_gen: u64) {
+        self.last_eligible.store(eligible, Ordering::SeqCst);
+        self.last_rekey_gen.store(rekey_gen, Ordering::SeqCst);
+        if armed {
+            self.ever_armed.store(1, Ordering::SeqCst);
+            self.armed_now.store(1, Ordering::SeqCst);
+        } else {
+            if self.ever_armed.load(Ordering::SeqCst) != 0
+                && self.armed_now.swap(0, Ordering::SeqCst) != 0
+            {
+                self.disarmed_after_arm.store(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub fn ever_armed(&self) -> bool {
+        self.ever_armed.load(Ordering::SeqCst) != 0
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed_now.load(Ordering::SeqCst) != 0
+    }
+
+    pub fn last_eligible(&self) -> u64 {
+        self.last_eligible.load(Ordering::SeqCst)
+    }
+
+    pub fn disarmed_after_arm(&self) -> bool {
+        self.disarmed_after_arm.load(Ordering::SeqCst) != 0
+    }
+
+    pub fn last_rekey_gen(&self) -> u64 {
+        self.last_rekey_gen.load(Ordering::SeqCst)
     }
 }
 
@@ -196,6 +818,10 @@ impl WriteWatchdog {
 
     pub fn snapshot(&self) -> WriteProgress {
         self.snapshot
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed_at.is_some()
     }
 
     /// Map current sealed-but-unflushed bytes into wire_eligible and arm/disarm.

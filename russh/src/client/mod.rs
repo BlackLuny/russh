@@ -97,6 +97,11 @@ mod test;
 #[derive(Debug)]
 pub struct Session {
     kex: SessionKexState<ClientKex>,
+    /// Test-only: a fully-formed second rekey staged by the `inject_kexinit` hook.
+    /// Installed as `InProgress` the moment the current kex completes, so the peer's
+    /// replayed KEXINIT#2 is answered through the normal DH exchange (no KEXINIT ping-pong).
+    #[cfg(feature = "_test_hooks")]
+    stashed_rekey: Option<ClientKex>,
     common: CommonSession<Arc<Config>>,
     receiver: Receiver<Msg>,
     sender: UnboundedSender<Reply>,
@@ -1170,6 +1175,8 @@ impl Session {
             receiver,
             sender,
             kex: SessionKexState::Idle,
+            #[cfg(feature = "_test_hooks")]
+            stashed_rekey: None,
             target_window_size,
             inbound_channel_sender,
             inbound_channel_receiver,
@@ -1977,6 +1984,31 @@ impl Session {
     /// Flush the temporary cleartext buffer into the encryption
     /// buffer. This does *not* flush to the socket.
     fn flush(&mut self) -> Result<(), crate::Error> {
+        // Test-only rekey injection: emit a *real* second KEXINIT (via ClientKex, so
+        // exchange.client_kex_init is recorded and the DH exchange can proceed) and
+        // stash the kex; it is installed as InProgress when the current kex completes.
+        // This keeps the peer a protocol-possible client: the replayed KEXINIT#2 from
+        // the server is answered through the normal kex.step() path.
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref flag) = self.common.config.inject_kexinit {
+            if flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                debug!("_test_hooks: staging real second rekey (KEXINIT#2 on the wire)");
+                let mut kex = ClientKex::new(
+                    self.common.config.clone(),
+                    &self.common.config.client_id,
+                    &self.common.remote_sshid,
+                    match &self.common.encrypted {
+                        None => KexCause::Initial,
+                        Some(enc) => KexCause::Rekey {
+                            strict: self.common.strict_kex,
+                            session_id: enc.session_id.clone(),
+                        },
+                    },
+                );
+                kex.kexinit(&mut self.common.packet_writer)?;
+                self.stashed_rekey = Some(kex);
+            }
+        }
         if let Some(ref mut enc) = self.common.encrypted {
             if enc.flush(
                 &self.common.config.as_ref().limits,
@@ -2093,7 +2125,17 @@ async fn reply<H: Handler>(
                         }
                     }
 
-                    session.kex = SessionKexState::Idle;
+                    #[cfg(feature = "_test_hooks")]
+                    {
+                        session.kex = match session.stashed_rekey.take() {
+                            Some(stashed) => SessionKexState::InProgress(stashed),
+                            None => SessionKexState::Idle,
+                        };
+                    }
+                    #[cfg(not(feature = "_test_hooks"))]
+                    {
+                        session.kex = SessionKexState::Idle;
+                    }
 
                     if session.common.strict_kex {
                         pkt.seqn = Wrapping(0);
@@ -2506,6 +2548,19 @@ pub struct Config {
     /// traffic continues. Production builds omit this field entirely.
     #[cfg(feature = "_test_hooks")]
     pub rekey_hold: Option<std::sync::Arc<test_hooks::RekeyHoldGate>>,
+    /// Test-only (`--features _test_hooks`): when set, the flag is stored `true`
+    /// immediately after the client queues its DH-init packet (KEXDH_INIT /
+    /// KEX_DH_GEX_INIT). Lets a test-side stream freeze inbound delivery at a
+    /// deterministic point: after DH-init is on the wire, before the server's
+    /// KEXDH_REPLY/NEWKEYS can be read.
+    #[cfg(feature = "_test_hooks")]
+    pub dh_init_sent: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only (`--features _test_hooks`): when set, the next session flush
+    /// queues one extra well-formed KEXINIT packet on the wire **without**
+    /// touching kex state (consumed via `swap(false)`). Used to inject a second
+    /// KEXINIT during a pending server-side install window.
+    #[cfg(feature = "_test_hooks")]
+    pub inject_kexinit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for Config {
@@ -2532,6 +2587,10 @@ impl Default for Config {
             nodelay: false,
             #[cfg(feature = "_test_hooks")]
             rekey_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            dh_init_sent: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_kexinit: None,
         }
     }
 }
