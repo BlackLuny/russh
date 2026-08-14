@@ -817,6 +817,14 @@ pub struct FloodServerConfig {
     /// Next Reader transport read becomes ReadError.
     #[cfg(feature = "_test_hooks")]
     pub reader_fail_next_read: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Next ctrl try_push fails (S3b Q7).
+    #[cfg(feature = "_test_hooks")]
+    pub force_ctrl_full: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "_test_hooks")]
+    pub lane_observe: Option<Arc<russh::server::LaneObserveSlot>>,
+    /// Hold Session lane pump (S3b Q6).
+    #[cfg(feature = "_test_hooks")]
+    pub lane_pump_hold: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Optional Preferred override (N6 disable strict-kex).
     pub preferred: Option<russh::Preferred>,
 }
@@ -894,6 +902,12 @@ impl Default for FloodServerConfig {
             socket_hang_seen: None,
             #[cfg(feature = "_test_hooks")]
             reader_fail_next_read: None,
+            #[cfg(feature = "_test_hooks")]
+            force_ctrl_full: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_pump_hold: None,
             preferred: None,
         }
     }
@@ -990,6 +1004,12 @@ impl FloodServer {
                 socket_hang_seen: self.cfg.socket_hang_seen.clone(),
                 #[cfg(feature = "_test_hooks")]
                 reader_fail_next_read: self.cfg.reader_fail_next_read.clone(),
+                #[cfg(feature = "_test_hooks")]
+                force_ctrl_full: self.cfg.force_ctrl_full.clone(),
+                #[cfg(feature = "_test_hooks")]
+                lane_observe: self.cfg.lane_observe.clone(),
+                #[cfg(feature = "_test_hooks")]
+                lane_pump_hold: self.cfg.lane_pump_hold.clone(),
                 preferred: self
                     .cfg
                     .preferred

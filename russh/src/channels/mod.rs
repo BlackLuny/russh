@@ -33,6 +33,9 @@ pub enum ChannelMsg {
     },
     Eof,
     Close,
+    /// `_test_hooks`: already-encoded SSH payload (no window check).
+    #[cfg(feature = "_test_hooks")]
+    Raw(Bytes),
     /// (client only)
     RequestPty {
         want_reply: bool,
@@ -327,6 +330,18 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         self.send_bytes(None, data.into()).await
     }
 
+    /// Test inject: send CHANNEL_DATA even when the payload is empty (Q3).
+    #[cfg(feature = "_test_hooks")]
+    pub async fn data_bytes_allow_empty(&self, data: impl Into<Bytes>) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::Data { data: data.into() }).await
+    }
+
+    /// Seal a complete SSH payload without window / encode checks.
+    #[cfg(feature = "_test_hooks")]
+    pub async fn send_raw_payload(&self, payload: impl Into<Bytes>) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::Raw(payload.into())).await
+    }
+
     /// Send data to a channel. The number of bytes added to the
     /// "sending pipeline" (to be processed by the event loop) is
     /// returned.
@@ -616,6 +631,16 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
     /// Send owned bytes to a channel without copying them into the `AsyncWrite` path.
     pub async fn data_bytes(&self, data: impl Into<Bytes>) -> Result<(), Error> {
         self.write_half.data_bytes(data).await
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    pub async fn data_bytes_allow_empty(&self, data: impl Into<Bytes>) -> Result<(), Error> {
+        self.write_half.data_bytes_allow_empty(data).await
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    pub async fn send_raw_payload(&self, payload: impl Into<Bytes>) -> Result<(), Error> {
+        self.write_half.send_raw_payload(payload).await
     }
 
     /// Send data to a channel. The number of bytes added to the

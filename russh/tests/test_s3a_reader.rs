@@ -3,9 +3,8 @@
 //! Hard rule: target interleaving miss → fail. No soft fallbacks.
 //! Requires `--features _test_hooks`.
 //!
-//! The capacity-1 decoded pipe (Reader waits if Session still holds the
-//! previous packet) is a **temporary S3a exception, deleted in S3b**.
-//! N* asserts are not relaxed because of that pipe.
+//! S3b deleted the capacity-1 decoded pipe. N* still prove epoch install
+//! (open NEWKEYS → apply before next cipher::read).
 
 #![cfg(feature = "_test_hooks")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

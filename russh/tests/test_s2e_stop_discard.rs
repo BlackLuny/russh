@@ -149,23 +149,23 @@ async fn s2e_stop_discard_race() -> Result<(), anyhow::Error> {
     let _ = env_logger::builder().is_test(false).try_init();
     let order = OutboundOrderSlot::new();
     let hang = Arc::new(AtomicBool::new(false));
+    let hang_seen = Arc::new(AtomicBool::new(false));
+    let dump_done = Arc::new(AtomicBool::new(false));
     let discard = StopDiscardSlot::new();
     let progress = Progress::new();
     let addr = free_addr();
     let pkt = 4 * 1024u32;
 
-    let _srv = spawn_s2e(
-        addr,
-        server_config(
-            order.clone(),
-            Some(hang.clone()),
-            Some(discard.clone()),
-            None,
-            4 * 1024 * 1024,
-            pkt,
-        ),
-        S2eMode::FloodForever,
+    let mut cfg = server_config(
+        order.clone(),
+        Some(hang.clone()),
+        Some(discard.clone()),
+        None,
+        4 * 1024 * 1024,
+        pkt,
     );
+    cfg.socket_hang_seen = Some(hang_seen.clone());
+    let _srv = spawn_s2e_with(addr, cfg, S2eMode::FloodForever, dump_done.clone());
     wait_listening(addr).await;
 
     let mut client_cfg = default_client_config();
@@ -183,8 +183,14 @@ async fn s2e_stop_discard_race() -> Result<(), anyhow::Error> {
     })
     .await?;
 
+    // Writer hang first (FloodForever is already writing). hang_seen
+    // means sealed bytes sit in out_q and cannot drain — HWM will
+    // clamp the next 256 KiB dump into pending_data.
     hang.store(true, Ordering::SeqCst);
-    channel.exec(true, "park").await?;
+    wait_for("writer hang seen", Duration::from_secs(5), || {
+        hang_seen.load(Ordering::SeqCst)
+    })
+    .await?;
     wait_for("framed DATA under hang", Duration::from_secs(5), || {
         order
             .snapshot()
@@ -192,6 +198,11 @@ async fn s2e_stop_discard_race() -> Result<(), anyhow::Error> {
             .filter(|(_, m, _)| *m == MSG_DATA)
             .count()
             >= 4
+    })
+    .await?;
+    channel.exec(true, "park").await?;
+    wait_for("256KiB dump in Session", Duration::from_secs(5), || {
+        dump_done.load(Ordering::SeqCst)
     })
     .await?;
 
@@ -923,8 +934,17 @@ fn spawn_s2e(
     config: russh::server::Config,
     mode: S2eMode,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_s2e_with(addr, config, mode, Arc::new(AtomicBool::new(false)))
+}
+
+fn spawn_s2e_with(
+    addr: SocketAddr,
+    config: russh::server::Config,
+    mode: S2eMode,
+    dump_done: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sh = S2eSh { mode };
+        let mut sh = S2eSh { mode, dump_done };
         if let Err(e) = sh.run_on_address(Arc::new(config), addr).await {
             eprintln!("s2e server exited: {e:?}");
         }
@@ -933,6 +953,7 @@ fn spawn_s2e(
 
 struct S2eSh {
     mode: S2eMode,
+    dump_done: Arc<AtomicBool>,
 }
 
 impl Server for S2eSh {
@@ -941,6 +962,7 @@ impl Server for S2eSh {
         S2eH {
             mode: self.mode,
             seq: Arc::new(AtomicU32::new(0)),
+            dump_done: self.dump_done.clone(),
         }
     }
 }
@@ -948,6 +970,7 @@ impl Server for S2eSh {
 struct S2eH {
     mode: S2eMode,
     seq: Arc<AtomicU32>,
+    dump_done: Arc<AtomicBool>,
 }
 
 impl Handler for S2eH {
@@ -1006,6 +1029,7 @@ impl Handler for S2eH {
         match self.mode {
             S2eMode::FloodForever | S2eMode::DualFlood | S2eMode::DualPark => {
                 session.data(channel, Bytes::from(vec![b'p'; 256 * 1024]))?;
+                self.dump_done.store(true, Ordering::SeqCst);
             }
             S2eMode::LocalCloseOnExec => {
                 session.data(channel, Bytes::from(vec![b'p'; 256 * 1024]))?;

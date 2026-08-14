@@ -22,10 +22,14 @@ use crate::pending_inbound::{
 use crate::server::supervisor::{
     AtomicWriteProgress, DisconnectCause, RekeyDeadline, WriteWatchdog,
 };
+use crate::server::inbound_lane::LaneItem;
 use crate::server::reader::{
-    spawn_reader, stop_reader_task, InstallInboundEpoch, ReaderEvent, ReaderHandle, ReaderHooks,
+    spawn_reader_with_budget, stop_reader_task, CtrlMsg, InstallInboundEpoch, ReaderEvent,
+    ReaderHandle,
 };
-use crate::server::writer::{spawn_writer, stop_writer_task, WriterEvent, WriterHandle};
+#[cfg(not(feature = "_test_hooks"))]
+use crate::server::reader::ReaderHooks;
+use crate::server::writer::{stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
 use crate::{ChannelOpenFailure, map_err, msg};
 
@@ -816,6 +820,262 @@ impl Handle {
 }
 
 impl Session {
+    /// S4 replaces the body. S3 only calls it on the grant path.
+    pub(crate) fn reserve_global_inbound_credit(_n: u32) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn register_inbound_lane(&self, id: ChannelId) {
+        let Some(r) = self.reader.as_ref() else {
+            return;
+        };
+        let window = self.common.config.window_size;
+        let max_pkt = self.common.config.maximum_packet_size;
+        // LaneTable assigns a monotonic generation. `new_channel` skips
+        // only *live* enc.channels keys, so a freed id can be reused
+        // immediately; the gen stops a stale CloseDropped from notifying
+        // the replacement. The `1` argument is unused (table assigns).
+        r.open_lane(id, 1, window, max_pkt);
+    }
+
+    /// Pop Reader lanes into `deliver_inbound` / REQUEST dispatch. One
+    /// `InboundItem` is moved — never memcpy'd into Scheme C.
+    async fn pump_reader_lanes<H: Handler + Send>(
+        &mut self,
+        handler: &mut H,
+    ) -> Result<(), H::Error> {
+        #[cfg(feature = "_test_hooks")]
+        if self
+            .common
+            .config
+            .lane_pump_hold
+            .as_ref()
+            .is_some_and(|h| h.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            if let (Some(r), Some(o)) =
+                (self.reader.as_ref(), self.common.config.lane_observe.as_ref())
+            {
+                let lane = r.total_occupancy_bytes();
+                let count = r.total_occupancy_count();
+                let scheme: usize = self.inbound.values().map(|q| q.pending_bytes).sum();
+                o.set_occ(lane, count);
+                o.note_split(lane, scheme);
+            }
+            return Ok(());
+        }
+        loop {
+            let Some(reader) = self.reader.clone() else {
+                break;
+            };
+            let Some((id, item)) = reader.pop_any() else {
+                break;
+            };
+            match item {
+                LaneItem::Data(data) => {
+                    if let Some(enc) = self.common.encrypted.as_mut() {
+                        enc.consume_recv_window(id, data.len());
+                    }
+                    self.dispatch_lane_payload(id, InboundItem::Data(data), handler)
+                        .await?;
+                }
+                LaneItem::ExtendedData { ext, data } => {
+                    if let Some(enc) = self.common.encrypted.as_mut() {
+                        enc.consume_recv_window(id, data.len());
+                    }
+                    self.dispatch_lane_payload(
+                        id,
+                        InboundItem::ExtendedData { ext, data },
+                        handler,
+                    )
+                    .await?;
+                }
+                LaneItem::Eof => {
+                    self.dispatch_lane_payload(id, InboundItem::Eof, handler)
+                        .await?;
+                }
+                LaneItem::Close => {
+                    self.dispatch_lane_payload(id, InboundItem::Close, handler)
+                        .await?;
+                }
+                LaneItem::Request { payload } => {
+                    let mut r = payload.as_ref();
+                    self.server_read_authenticated(handler, msg::CHANNEL_REQUEST, &mut r)
+                        .await?;
+                }
+                LaneItem::Success { payload } => {
+                    let mut r = payload.as_ref();
+                    self.server_read_authenticated(handler, msg::CHANNEL_SUCCESS, &mut r)
+                        .await?;
+                }
+                LaneItem::Failure { payload } => {
+                    let mut r = payload.as_ref();
+                    self.server_read_authenticated(handler, msg::CHANNEL_FAILURE, &mut r)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_lane_payload<H: Handler + Send>(
+        &mut self,
+        id: ChannelId,
+        item: InboundItem,
+        handler: &mut H,
+    ) -> Result<(), H::Error> {
+        let is_close = matches!(item, InboundItem::Close);
+        let is_eof = matches!(item, InboundItem::Eof);
+        let (ext, data) = match &item {
+            InboundItem::Data(d) => (None, Some(d.clone())),
+            InboundItem::ExtendedData { ext, data } => (Some(*ext), Some(data.clone())),
+            _ => (None, None),
+        };
+        #[cfg(feature = "_test_hooks")]
+        if let (Some(r), Some(o)) = (self.reader.as_ref(), self.common.config.lane_observe.as_ref())
+        {
+            // Post-pop: remaining lane bytes are a *different* payload.
+            o.set_scheme(pending_inbound::pending_bytes_for(&self.inbound, id));
+            let _ = r;
+        }
+        if is_close {
+            let we_closed_first = self
+                .common
+                .encrypted
+                .as_ref()
+                .is_some_and(|enc| !enc.channel_exists(id));
+            if !we_closed_first {
+                self.discard_channel_outbound(id).map_err(|e| e.into())?;
+            }
+        }
+        match self.deliver_inbound(id, item) {
+            InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
+                if data.is_some() {
+                    self.maybe_grant_after_delivery(id, handler)?;
+                }
+                if let Some(d) = data {
+                    if let Some(ext) = ext {
+                        handler.extended_data(id, ext, &d, self).await?;
+                    } else {
+                        handler.data(id, &d, self).await?;
+                    }
+                } else if is_eof {
+                    handler.channel_eof(id, self).await?;
+                } else if is_close {
+                    handler.channel_close(id, self).await?;
+                    self.finalize_close(id);
+                }
+            }
+            InboundDelivery::Queued => {}
+            InboundDelivery::Overflow => {
+                log::warn!(
+                    "inbound pending cap exceeded for channel {id:?}; closing channel"
+                );
+                self.discard_channel_outbound(id).map_err(|e| e.into())?;
+                self.teardown_inbound_channel(id);
+                self.channels.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_ctrl_msg<H: Handler + Send>(
+        &mut self,
+        msg: CtrlMsg,
+        handler: &mut H,
+    ) -> Result<bool, H::Error> {
+        if let Some(r) = &self.reader {
+            r.release_ctrl(msg.byte_len());
+        }
+        match msg {
+            CtrlMsg::Packet(pkt) => {
+                Ok(self.handle_ctrl_packet(pkt, handler).await?)
+            }
+            CtrlMsg::WireClose { id, .. } => {
+                let we_closed_first = self
+                    .common
+                    .encrypted
+                    .as_ref()
+                    .is_some_and(|enc| !enc.channel_exists(id));
+                if !we_closed_first {
+                    self.discard_channel_outbound(id).map_err(|e| e.into())?;
+                }
+                Ok(true)
+            }
+            CtrlMsg::Overflow { id, .. } => {
+                log::warn!("reader lane overflow on {id:?}; StopDiscard");
+                self.discard_channel_outbound(id).map_err(|e| e.into())?;
+                self.teardown_inbound_channel(id);
+                // App-known channel: this is the unique Handler close
+                // notification (peer CLOSE may never arrive). Notify
+                // before remove so CloseDropped sees channels gone.
+                if self.channels.contains_key(&id) {
+                    handler.channel_close(id, self).await?;
+                }
+                self.channels.remove(&id);
+                if let Some(r) = &self.reader {
+                    r.close_lane(id, r.lane_gen(id).unwrap_or(0));
+                }
+                Ok(true)
+            }
+            CtrlMsg::CloseDropped { id, generation } => {
+                // Ghost CLOSE: never opened → not in channels. Overflow
+                // already notified + removed. At most one Handler close
+                // per app-known channel.
+                if !self.channels.contains_key(&id) {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref o) = self.common.config.lane_observe {
+                        o.note_unknown();
+                    }
+                    return Ok(true);
+                }
+                let live = self.reader.as_ref().and_then(|r| r.lane_gen(id));
+                if live.is_some_and(|g| generation != 0 && g != generation) {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref o) = self.common.config.lane_observe {
+                        o.note_unknown();
+                    }
+                    return Ok(true);
+                }
+                handler.channel_close(id, self).await?;
+                self.finalize_close(id);
+                Ok(true)
+            }
+        }
+    }
+
+    async fn handle_ctrl_packet<H: Handler + Send>(
+        &mut self,
+        mut pkt: crate::sshbuffer::IncomingSshPacket,
+        handler: &mut H,
+    ) -> Result<bool, H::Error> {
+        match pkt.buffer.first() {
+            None => Ok(true),
+            Some(&crate::msg::DISCONNECT) => Ok(false),
+            Some(_) => {
+                self.common.received_data = true;
+                #[cfg(feature = "_test_hooks")]
+                if pkt.buffer.first() == Some(&crate::msg::CHANNEL_WINDOW_ADJUST) {
+                    if let Some(ref c) = self.common.config.window_adjust_seen {
+                        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                if let Err(e) = super::reply(self, handler, &mut pkt).await {
+                    // Parse/ensure_end reject. Propagate Err (kex-junk
+                    // expects is_err) and stamp PeerError for observers.
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref s) = self.common.config.disconnect_cause_slot {
+                        s.record(DisconnectCause::PeerError);
+                    }
+                    return Err(e);
+                }
+                if let Some(c) = self.pending_supervisor_cause.take() {
+                    self.stage_cause(c);
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Deliver one inbound [`InboundItem`] to a channel's application buffer without ever blocking
     /// the shared session loop (Scheme C). Fast path uses `try_send`; on `Full` the channel becomes
     /// backpressured and the item is queued behind a single in-flight `reserve_owned()` future.
@@ -951,11 +1211,20 @@ impl Session {
         // only the portion already handed to the application may be re-granted. Callers reach
         // here after `pending_bytes` has been decremented for the item just delivered, so this is
         // exactly the still-outstanding backlog.
-        let undelivered = self
+        let scheme_c = self
             .inbound
             .get(&id)
             .map(|q| q.pending_bytes)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let lane_bytes = self
+            .reader
+            .as_ref()
+            .map(|r| r.occupancy_bytes(id))
+            .unwrap_or(0);
+        // Q8: sum both sides. Counting only Scheme C (or only the lane)
+        // mis-grants a full window at the pump handoff.
+        let undelivered = scheme_c
+            .saturating_add(lane_bytes)
             .try_into()
             .unwrap_or(u32::MAX);
         // StopDiscard latch: CLOSE already framed or channel gone —
@@ -982,6 +1251,7 @@ impl Session {
             }
             return Ok(());
         }
+        let _ = Self::reserve_global_inbound_credit(target.saturating_sub(undelivered));
         let granted = self
             .common
             .encrypted
@@ -1162,6 +1432,9 @@ impl Session {
             q.generation = q.generation.wrapping_add(1);
         }
         self.inbound.remove(&id);
+        if let Some(r) = &self.reader {
+            r.close_lane(id, r.lane_gen(id).unwrap_or(0));
+        }
         self.channels.remove(&id);
         // Dropping any parked `Handle::data` producers wakes them with an error, which is the
         // correct signal now that the channel is gone.
@@ -1286,10 +1559,12 @@ impl Session {
             Msg::ChannelOpenAgent { channel_ref } => {
                 let id = self.channel_open_agent()?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::ChannelOpenSession { channel_ref } => {
                 let id = self.channel_open_session()?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::ChannelOpenDirectTcpIp {
                 host_to_connect,
@@ -1305,6 +1580,7 @@ impl Session {
                     originator_port,
                 )?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::ChannelOpenDirectStreamLocal {
                 socket_path,
@@ -1312,6 +1588,7 @@ impl Session {
             } => {
                 let id = self.channel_open_direct_streamlocal(&socket_path)?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::ChannelOpenForwardedTcpIp {
                 connected_address,
@@ -1327,6 +1604,7 @@ impl Session {
                     originator_port,
                 )?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::ChannelOpenForwardedStreamLocal {
                 server_socket_path,
@@ -1334,6 +1612,7 @@ impl Session {
             } => {
                 let id = self.channel_open_forwarded_streamlocal(&server_socket_path)?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::ChannelOpenX11 {
                 originator_address,
@@ -1342,6 +1621,7 @@ impl Session {
             } => {
                 let id = self.channel_open_x11(&originator_address, originator_port)?;
                 self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id);
             }
             Msg::TcpIpForward {
                 address,
@@ -1494,7 +1774,13 @@ impl Session {
                     read_hold: self.common.config.reader_read_hold.clone(),
                     mid_packet_hold: self.common.config.reader_mid_packet_hold.clone(),
                     fail_next_read: self.common.config.reader_fail_next_read.clone(),
+                    post_read_hold: None,
                     apply_hold: self.common.config.reader_apply_hold.clone(),
+                    force_ctrl_full: self.common.config.force_ctrl_full.clone(),
+                    lane_observe: self.common.config.lane_observe.clone(),
+                    inject_zero_data: self.common.config.inject_zero_data.clone(),
+                    inject_until_overflow: self.common.config.inject_until_overflow.clone(),
+                    inject_close_for: self.common.config.inject_close_for.clone(),
                 }
             }
             #[cfg(not(feature = "_test_hooks"))]
@@ -1502,13 +1788,18 @@ impl Session {
                 ReaderHooks::default()
             }
         };
-        let (reader_handle, reader_join_raw, mut decoded_rx, mut reader_events) = spawn_reader(
-            stream_read,
-            opening_cipher,
-            buffer,
-            reader_cancel,
-            reader_hooks,
-        );
+        let (reader_handle, reader_join_raw, mut ctrl_rx, mut reader_events) =
+            spawn_reader_with_budget(
+                stream_read,
+                opening_cipher,
+                buffer,
+                reader_cancel,
+                reader_hooks,
+                self.common.config.inbound_ctrl_budget,
+                self.common.config.inbound_min_packet_size as usize,
+                self.common.config.inbound_lane_count_slack,
+            );
+        let lane_ready = reader_handle.lane_ready();
         self.reader = Some(reader_handle);
         let reader_abort = reader_join_raw.abort_handle();
         let mut reader_join = Some(reader_join_raw);
@@ -1888,142 +2179,106 @@ impl Session {
             let inject_ignore_fut = std::future::pending::<()>();
             tokio::pin!(inject_ignore_fut);
 
+            let lane_notified = lane_ready.notified();
+            tokio::pin!(lane_notified);
+
             tokio::select! {
-                // S3a: Reader delivers already-decrypted packets on a capacity-1
-                // pipe (temporary; S3b deletes the wait-if-full exception).
-                pkt = decoded_rx.recv(), if !self.outbound_blocks_inbound_read() => {
-                    let mut pkt = match pkt {
-                        Some(p) => p,
-                        None => {
-                            // decoded_tx drop races with the terminal event.
-                            // Harvest reader_events until Eof / ReadError /
-                            // channel close — never infer PeerError from None.
-                            debug!("decoded pipe closed; harvest reader terminal");
-                            loop {
-                                match reader_events.recv().await {
-                                    Some(ReaderEvent::InstallAckInbound { generation }) => {
-                                        debug!("session: harvest InstallAck Inbound gen={generation}");
-                                        let hold = {
-                                            #[cfg(feature = "_test_hooks")]
-                                            {
-                                                self.common
-                                                    .config
-                                                    .inbound_ack_hold
-                                                    .as_ref()
-                                                    .is_some_and(|h| h.is_held())
-                                            }
-                                            #[cfg(not(feature = "_test_hooks"))]
-                                            {
-                                                false
-                                            }
-                                        };
-                                        if hold {
-                                            #[cfg(feature = "_test_hooks")]
-                                            {
-                                                deferred_inbound_ack = Some(generation);
-                                            }
-                                        } else if let Some(after) =
-                                            self.on_install_ack_inbound(generation)
-                                        {
-                                            self.apply_kex_after_install(after);
-                                            if let Err(e) = self
-                                                .replay_pending_reads(&mut handler)
-                                                .await
-                                            {
-                                                debug!("pending_reads replay error: inbound ACK");
-                                                let _ = e;
-                                                record_cause(
-                                                    DisconnectCause::PeerError,
-                                                    &mut supervisor_cause,
-                                                );
-                                                self.common.disconnected = true;
-                                            }
-                                            if let Some(c) =
-                                                self.pending_supervisor_cause.take()
-                                            {
-                                                record_cause(c, &mut supervisor_cause);
-                                                self.common.disconnected = true;
-                                            }
-                                            let _ = self.flush();
-                                        }
-                                    }
-                                    Some(ReaderEvent::ReadError) => {
-                                        record_cause(
-                                            DisconnectCause::PeerError,
-                                            &mut supervisor_cause,
-                                        );
-                                        self.common.disconnected = true;
-                                        break;
-                                    }
-                                    Some(ReaderEvent::Eof) => {
-                                        debug!("reader eof (harvest after decoded close)");
-                                        self.common.disconnected = true;
-                                        break;
-                                    }
-                                    None => {
-                                        debug!("reader events closed without terminal (cancel)");
-                                        self.common.disconnected = true;
-                                        break;
+                biased;
+                ctrl = ctrl_rx.recv() => {
+                    let Some(ctrl) = ctrl else {
+                        debug!("ctrl closed; harvest reader terminal");
+                        loop {
+                            match reader_events.recv().await {
+                                Some(ReaderEvent::InstallAckInbound { generation }) => {
+                                    if let Some(after) =
+                                        self.on_install_ack_inbound(generation)
+                                    {
+                                        self.apply_kex_after_install(after);
+                                        let _ = self.flush();
                                     }
                                 }
+                                Some(ReaderEvent::ReadError) => {
+                                    record_cause(
+                                        DisconnectCause::PeerError,
+                                        &mut supervisor_cause,
+                                    );
+                                    self.common.disconnected = true;
+                                    break;
+                                }
+                                Some(ReaderEvent::CtrlFull) => {
+                                    record_cause(
+                                        DisconnectCause::PeerError,
+                                        &mut supervisor_cause,
+                                    );
+                                    self.common.disconnected = true;
+                                    break;
+                                }
+                                Some(ReaderEvent::Eof) | None => {
+                                    self.common.disconnected = true;
+                                    break;
+                                }
                             }
-                            break;
                         }
+                        break;
                     };
-
-                    match pkt.buffer.first() {
-                        None => (),
-                        Some(&crate::msg::DISCONNECT) => {
-                            debug!("break");
-                            break;
-                        }
-                        Some(_) => {
-                            self.common.received_data = true;
-                            // F1: every inbound WINDOW_ADJUST is one credit replenishment.
-                            #[cfg(feature = "_test_hooks")]
-                            if pkt.buffer.first() == Some(&crate::msg::CHANNEL_WINDOW_ADJUST) {
-                                if let Some(ref c) = self.common.config.window_adjust_seen {
-                                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                }
+                    // Handshake: deadline + HandshakeTimeout. Post-handshake:
+                    // bare await (S3a). A 3600s timeout that drops the
+                    // future would cancel reply()/handler mid-packet after
+                    // the ctrl item was already consumed — desync, and the
+                    // silent-continue branch was a third state (neither
+                    // disconnect nor stall). Handler hang is S4.
+                    if !handshake_done {
+                        match tokio::time::timeout_at(
+                            handshake_deadline_at,
+                            self.handle_ctrl_msg(ctrl, &mut handler),
+                        )
+                        .await
+                        {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => {
+                                debug!("break");
+                                break;
                             }
-
-                            let reply_result = if !handshake_done {
-                                match tokio::time::timeout_at(
-                                    handshake_deadline_at,
-                                    reply(&mut self, &mut handler, &mut pkt),
-                                )
-                                .await
-                                {
-                                    Ok(r) => r,
-                                    Err(_) => {
-                                        record_cause(
-                                            DisconnectCause::HandshakeTimeout,
-                                            &mut supervisor_cause,
-                                        );
-                                        self.common.disconnected = true;
-                                        break;
-                                    }
-                                }
-                            } else {
-                                reply(&mut self, &mut handler, &mut pkt).await
-                            };
-                            if let Some(c) = self.pending_supervisor_cause.take() {
-                                record_cause(c, &mut supervisor_cause);
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => {
+                                record_cause(
+                                    DisconnectCause::HandshakeTimeout,
+                                    &mut supervisor_cause,
+                                );
                                 self.common.disconnected = true;
+                                break;
                             }
-                            if let Err(e) = reply_result {
-                                return Err(e);
+                        }
+                    } else {
+                        match self.handle_ctrl_msg(ctrl, &mut handler).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!("break");
+                                break;
                             }
-                            self.drain_needs_reserve(&mut inbound_reserves);
-
-                            #[cfg(feature = "_test_hooks")]
-                            if self.pending_kex_install.is_some() {
-                                if let Some(ref slot) = self.common.config.kex_install_observe {
-                                    slot.mark_packet_while_pending();
-                                }
-                            }
+                            Err(e) => return Err(e),
                         }
                     }
+                    if let Some(c) = self.pending_supervisor_cause.take() {
+                        record_cause(c, &mut supervisor_cause);
+                        self.common.disconnected = true;
+                    }
+                    self.drain_needs_reserve(&mut inbound_reserves);
+                    if let Err(e) = self.pump_reader_lanes(&mut handler).await {
+                        return Err(e);
+                    }
+                    #[cfg(feature = "_test_hooks")]
+                    if self.pending_kex_install.is_some() {
+                        if let Some(ref slot) = self.common.config.kex_install_observe {
+                            slot.mark_packet_while_pending();
+                        }
+                    }
+                }
+                () = &mut lane_notified => {
+                    if let Err(e) = self.pump_reader_lanes(&mut handler).await {
+                        return Err(e);
+                    }
+                    self.drain_needs_reserve(&mut inbound_reserves);
                 }
                 Some((cid, generation, res)) = inbound_reserves.next(), if !inbound_reserves.is_empty() && !self.blocks_outbound_intake() => {
                     // A backpressured channel's application buffer freed a slot: deliver its head
@@ -2103,6 +2358,10 @@ impl Session {
                             }
                         }
                         Some(ReaderEvent::ReadError) => {
+                            record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        }
+                        Some(ReaderEvent::CtrlFull) => {
                             record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                             self.common.disconnected = true;
                         }
@@ -3813,6 +4072,7 @@ impl Session {
         pending: PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
     ) -> Result<(), Error> {
+        let mut opened = None;
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
@@ -3830,6 +4090,7 @@ impl Session {
                     // Head fence: emit now (unbounded, no window, no HWM).
                     enc.flush_pending(id)?;
                     self.record_outbound_from_write();
+                    opened = Some(id);
                 }
                 Err(reason) => {
                     push_packet!(enc.write, {
@@ -3841,6 +4102,9 @@ impl Session {
                     });
                 }
             }
+        }
+        if let Some(id) = opened {
+            self.register_inbound_lane(id);
         }
         Ok(())
     }
@@ -7075,6 +7339,65 @@ mod tests {
             enc.sender_window_size(id),
             (target - undelivered) as usize,
             "grant must leave the undelivered backlog occupying the window"
+        );
+    }
+
+    /// Brief S3b #4: undelivered must be lane + Scheme C. Counting only
+    /// Scheme C would grant `target - scheme_c` and ignore the lane.
+    #[tokio::test]
+    async fn window_grant_sums_lane_and_scheme_c() {
+        use crate::server::inbound_lane::{LaneItem, LaneTable};
+        use crate::server::reader::ReaderHandle;
+        use std::sync::{Arc, Mutex};
+
+        let mut session = authenticated_session();
+        let target = session.target_window_size;
+        let id = insert_encrypted_channel(&mut session, target);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
+
+        session
+            .common
+            .encrypted
+            .as_mut()
+            .unwrap()
+            .consume_recv_window(id, target as usize);
+        assert_eq!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .sender_window_size(id),
+            0
+        );
+
+        let lane_hold = 64usize;
+        let scheme_c = (target / 4) as usize;
+        let lanes = Arc::new(Mutex::new(LaneTable::new(8, 32)));
+        {
+            let mut g = lanes.lock().unwrap();
+            g.open(id, 1, target, 32768);
+            assert_eq!(
+                g.try_push(id, LaneItem::Data(bytes::Bytes::from(vec![0u8; lane_hold]))),
+                crate::server::inbound_lane::LanePush::Accepted
+            );
+        }
+        session.reader = Some(ReaderHandle::test_stub(lanes));
+        session.inbound.entry(id).or_default().pending_bytes = scheme_c;
+
+        let mut handler = TestHandler;
+        session.maybe_grant_after_delivery(id, &mut handler).unwrap();
+
+        let want = target as usize - scheme_c - lane_hold;
+        assert_eq!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .sender_window_size(id),
+            want,
+            "grant must subtract lane_bytes + scheme_c (got sender; want {want} = target {target} - scheme {scheme_c} - lane {lane_hold})"
         );
     }
 

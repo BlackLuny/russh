@@ -113,6 +113,15 @@ pub(crate) struct InboundQueue {
     pub(crate) close_queued: bool,
 }
 
+/// Scheme C occupancy for one channel (0 if not backpressured).
+#[cfg(feature = "_test_hooks")]
+pub(crate) fn pending_bytes_for(
+    inbound: &HashMap<ChannelId, InboundQueue>,
+    id: ChannelId,
+) -> usize {
+    inbound.get(&id).map(|q| q.pending_bytes).unwrap_or(0)
+}
+
 /// Outcome of [`deliver_inbound`].
 pub(crate) enum InboundDelivery {
     /// The item was handed to the application buffer immediately (fast path).

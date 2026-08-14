@@ -62,6 +62,7 @@ mod encrypted;
 pub mod supervisor;
 pub mod writer;
 pub mod reader;
+pub(crate) mod inbound_lane;
 pub use self::supervisor::{
     AtomicWriteProgress, DisconnectCause, DisconnectCauseSlot, WriteProgress,
 };
@@ -73,6 +74,8 @@ pub use self::supervisor::{
 };
 #[cfg(feature = "_test_hooks")]
 pub use self::reader::{MidPacketHold, ReadHoldGate, ReaderObserveSlot};
+#[cfg(feature = "_test_hooks")]
+pub use self::inbound_lane::LaneObserveSlot;
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
 /// Configuration of a server.
@@ -99,6 +102,12 @@ pub struct Config {
     pub channel_buffer_size: usize,
     /// Internal event buffer size
     pub event_buffer_size: usize,
+    /// S3b ctrl byte budget. Full → Cancelling (I2'). Default 2 MiB.
+    pub inbound_ctrl_budget: usize,
+    /// Extra zero-byte / REQUEST slots in the per-channel count bound (`K`).
+    pub inbound_lane_count_slack: usize,
+    /// Smallest packet used for `count_cap = window / min(8, this) + K`.
+    pub inbound_min_packet_size: u32,
     /// Hard safety cap on the number of inbound payload bytes that may be queued per channel
     /// while its application buffer is full (head-of-line backpressure, see
     /// `RC2_HOL_FIX_DESIGN.md`). With delivery-gated window grants a well-behaved peer can hold at
@@ -237,6 +246,22 @@ pub struct Config {
     /// Test-only: StopDiscard discarded-item / grant-clear counters.
     #[cfg(feature = "_test_hooks")]
     pub stop_discard: Option<std::sync::Arc<supervisor::StopDiscardSlot>>,
+    /// Next ctrl try_push fails (S3b Q7).
+    #[cfg(feature = "_test_hooks")]
+    pub force_ctrl_full: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "_test_hooks")]
+    pub lane_observe: Option<std::sync::Arc<inbound_lane::LaneObserveSlot>>,
+    /// Session skips pumping Reader lanes (S3b Q6 fill).
+    #[cfg(feature = "_test_hooks")]
+    pub lane_pump_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "_test_hooks")]
+    pub inject_zero_data: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// After the next real DATA, flood the lane until Overflow (Q5).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_until_overflow: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// After the next real DATA, inject CHANNEL_CLOSE for this channel id (0 = off).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_close_for: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl Default for Config {
@@ -256,6 +281,9 @@ impl Default for Config {
             maximum_packet_size: 32768,
             channel_buffer_size: 100,
             event_buffer_size: 10,
+            inbound_ctrl_budget: crate::server::inbound_lane::INBOUND_CTRL_BUDGET,
+            inbound_lane_count_slack: crate::server::inbound_lane::INBOUND_LANE_COUNT_SLACK,
+            inbound_min_packet_size: crate::server::inbound_lane::INBOUND_LANE_MIN_PACKET as u32,
             max_pending_inbound_bytes: 8 * 2_000_000,
             max_pending_outbound_bytes: 8 * 2_000_000,
             limits: Limits::default(),
@@ -333,6 +361,18 @@ impl Default for Config {
             disable_sched_boost: false,
             #[cfg(feature = "_test_hooks")]
             stop_discard: None,
+            #[cfg(feature = "_test_hooks")]
+            force_ctrl_full: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_pump_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_zero_data: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_until_overflow: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_close_for: None,
         }
     }
 }

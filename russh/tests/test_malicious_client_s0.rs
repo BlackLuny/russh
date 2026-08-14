@@ -832,10 +832,24 @@ async fn s2b1_small_packets_survive_item_queue_cap() -> Result<(), anyhow::Error
     );
 
     let b0 = progress.total();
-    sleep(Duration::from_millis(400)).await;
+    // Liveness, not a 400ms latency SLA. ChannelTx parks on Session mpsc
+    // once sealed_backlog hits HWM (exactly 8×16KiB = 131072). Writer
+    // drain → capacity_notify → loop-top try_recv is intact (no lost
+    // last-wake: a stolen Notify still re-enters the loop and resamples).
+    // Under 12-test binary contention the 400ms one-shot slept through a
+    // live 2048×64B drain cycle. Permanent inactivation (no resample,
+    // watchdog 30s) would still miss this 5s window.
+    let grow_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while progress.session_alive() && progress.total() <= b0 {
+        if std::time::Instant::now() >= grow_deadline {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         progress.session_alive() && progress.total() > b0,
-        "must still grow after crossing item-cap (backpressure, not disconnect)"
+        "must still grow after crossing item-cap (backpressure, not disconnect); b0={b0} now={}",
+        progress.total()
     );
     Ok(())
 }

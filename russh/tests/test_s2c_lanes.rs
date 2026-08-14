@@ -422,8 +422,11 @@ async fn s2c_parked_data_reply_queue_is_bounded() -> Result<(), anyhow::Error> {
     // Tiny peer window so Session::data(32KiB) parks a remainder; SUCCESS
     // sits behind it and never reaches emit until the window moves.
     let win = 1024u32;
-
     let mut cfg = server_config(OutboundOrderSlot::new(), None, win, win);
+    // REQUEST counts toward S3b count_cap (window/8+K). Keep the tiny
+    // window so outbound admit still fires at ~HWM/93; widen K so 2000
+    // CHANNEL_REQUEST do not Overflow the lane first.
+    cfg.inbound_lane_count_slack = 4096;
     cfg.reply_queue = Some(replies.clone());
     cfg.disconnect_cause_slot = Some(cause.clone());
     let _srv = spawn_lane_server(addr, cfg, LaneMode::ReplyFlood);
@@ -441,9 +444,7 @@ async fn s2c_parked_data_reply_queue_is_bounded() -> Result<(), anyhow::Error> {
     for i in 0..FLOOD {
         let _ = channel.exec(true, format!("q-{i}")).await;
     }
-    // S3a capacity-1 decoded pipe serializes inbound REQUEST. A fixed 600ms
-    // sleep under suite load can miss the generation-admit cliff (qmax=1201
-    // < max_legal=1423). Wait for the cap to fire instead.
+    // Wait for generation-admit to fire rather than a fixed sleep.
     wait_for("reply-queue cap → PeerError", Duration::from_secs(8), || {
         matches!(cause.get(), Some(DisconnectCause::PeerError))
     })

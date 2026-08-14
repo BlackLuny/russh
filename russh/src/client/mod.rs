@@ -242,6 +242,9 @@ pub enum Msg {
         extension_name: String,
         reply_channel: oneshot::Sender<()>,
     },
+    /// `_test_hooks`: seal an already-encoded SSH payload (no window check).
+    #[cfg(feature = "_test_hooks")]
+    RawPacket(bytes::Bytes),
     GetServerSigAlgs {
         reply_channel: oneshot::Sender<Option<Vec<Algorithm>>>,
     },
@@ -943,6 +946,15 @@ impl<H: Handler> Handle<H> {
     /// Do not call this from inside a [`Handler`] callback — those run on the session loop, so
     /// awaiting window there would prevent the loop from processing the window adjustment that
     /// would release it.
+    /// Seal a complete SSH payload without window / encode checks (`_test_hooks`).
+    #[cfg(feature = "_test_hooks")]
+    pub async fn send_raw_packet(&self, payload: impl Into<bytes::Bytes>) -> Result<(), crate::Error> {
+        self.sender
+            .send(Msg::RawPacket(payload.into()))
+            .await
+            .map_err(|_| crate::Error::SendError)
+    }
+
     pub async fn data(
         &self,
         id: ChannelId,
@@ -1658,6 +1670,14 @@ impl Session {
                 self.agent_forward(id, want_reply)?
             }
             Msg::Channel(id, ChannelMsg::Close) => self.close(id)?,
+            #[cfg(feature = "_test_hooks")]
+            Msg::Channel(_, ChannelMsg::Raw(payload)) => {
+                self.common.packet_writer.packet_raw(&payload)?;
+            }
+            #[cfg(feature = "_test_hooks")]
+            Msg::RawPacket(payload) => {
+                self.common.packet_writer.packet_raw(&payload)?;
+            }
             Msg::Rekey => self.initiate_rekey()?,
             Msg::AwaitExtensionInfo {
                 extension_name,
