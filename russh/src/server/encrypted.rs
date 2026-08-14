@@ -587,6 +587,7 @@ mod tests {
             handshake_deadline_at: None,
             writer: None,
             reader: None,
+            peer_credit: None,
             pending_supervisor_cause: None,
             pending_outbound: crate::server::session::PendingOutbound::default(),
             pending_kex_install: None,
@@ -1246,11 +1247,13 @@ impl Session {
                 let data = map_err!(Bytes::decode(r))?;
                 map_err!(ensure_end(r))?;
 
-                // I1: consume the inbound receive window now (bytes are off the wire). The grant
-                // (I2) is deferred to delivery time so a backpressured channel withholds its own
-                // window and isolates the slow consumer instead of stalling the session loop.
-                if let Some(enc) = self.common.encrypted.as_mut() {
-                    enc.consume_recv_window(channel_num, data.len());
+                // I1: with a Reader the single ledger is consumed at receive
+                // (ChannelLane.window_remaining). This ctrl fallback is only
+                // for malformed / no-lane packets that never hit that path.
+                if self.reader.is_none() {
+                    if let Some(enc) = self.common.encrypted.as_mut() {
+                        enc.consume_recv_window(channel_num, data.len());
+                    }
                 }
 
                 let item = if let Some(ext) = ext {
@@ -1355,6 +1358,9 @@ impl Session {
                 } else {
                     return Err(Error::Inconsistent.into());
                 };
+                if let Some(r) = self.reader.as_ref() {
+                    r.confirm_lane(local_id);
+                }
 
                 if let Some(channel) = self.channels.get(&local_id) {
                     channel
@@ -1707,6 +1713,28 @@ impl Session {
                         .send(ChannelMsg::OpenFailure(reason))
                         .await
                         .map_err(|_| crate::Error::SendError)?;
+                }
+
+                // Server-open registered an unconfirmed lane. Scheme C
+                // teardown is a no-op if the id is absent; it does *not*
+                // close the lane. Do not discard outbound: the Handle has
+                // not returned a Channel yet, so nothing is queued, and
+                // close_discarding_pending would emit a spurious CLOSE.
+                self.teardown_inbound_channel(channel_num);
+                if let Some(r) = &self.reader {
+                    r.close_lane(channel_num, r.lane_gen(channel_num).unwrap_or(0));
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(o) = self.common.config.window_observe.as_ref() {
+                        if r.is_confirmed(channel_num).is_none() {
+                            o.note_lane_close(channel_num.number());
+                        }
+                        o.set_lane_count(r.lane_count());
+                    }
+                } else {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(o) = self.common.config.window_observe.as_ref() {
+                        o.note_lane_close(channel_num.number());
+                    }
                 }
 
                 Ok(())

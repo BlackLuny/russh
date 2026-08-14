@@ -76,6 +76,9 @@ pub use self::supervisor::{
 pub use self::reader::{MidPacketHold, ReadHoldGate, ReaderObserveSlot};
 #[cfg(feature = "_test_hooks")]
 pub use self::inbound_lane::LaneObserveSlot;
+#[cfg(feature = "_test_hooks")]
+pub use self::inbound_lane::WindowObserveSlot;
+pub use self::inbound_lane::PeerCreditBoard;
 pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
 /// Configuration of a server.
@@ -108,6 +111,10 @@ pub struct Config {
     pub inbound_lane_count_slack: usize,
     /// Smallest packet used for `count_cap = window / min(8, this) + K`.
     pub inbound_min_packet_size: u32,
+    /// When true, over-window inbound DATA would disconnect. Default
+    /// **false**; this slice does not wire the disconnect (RFC 4254 §5.2
+    /// extra-data ignore stays). Independent decision later.
+    pub strict_window_enforcement: bool,
     /// Hard safety cap on the number of inbound payload bytes that may be queued per channel
     /// while its application buffer is full (head-of-line backpressure, see
     /// `RC2_HOL_FIX_DESIGN.md`). With delivery-gated window grants a well-behaved peer can hold at
@@ -262,6 +269,16 @@ pub struct Config {
     /// After the next real DATA, inject CHANNEL_CLOSE for this channel id (0 = off).
     #[cfg(feature = "_test_hooks")]
     pub inject_close_for: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Test-only: grant-order / ADJUST-bypass counters (W2/W3).
+    #[cfg(feature = "_test_hooks")]
+    pub window_observe: Option<std::sync::Arc<inbound_lane::WindowObserveSlot>>,
+    /// Test-only: swap emit-ADJUST / expand in `grant_expand_then_adjust`
+    /// (same two production calls, inverted). Proves W3 is a real must-fail.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_grant_order: bool,
+    /// Test-only: inject the in-flight ADJUST aggregation board.
+    #[cfg(feature = "_test_hooks")]
+    pub peer_credit: Option<std::sync::Arc<inbound_lane::PeerCreditBoard>>,
 }
 
 impl Default for Config {
@@ -284,6 +301,7 @@ impl Default for Config {
             inbound_ctrl_budget: crate::server::inbound_lane::INBOUND_CTRL_BUDGET,
             inbound_lane_count_slack: crate::server::inbound_lane::INBOUND_LANE_COUNT_SLACK,
             inbound_min_packet_size: crate::server::inbound_lane::INBOUND_LANE_MIN_PACKET as u32,
+            strict_window_enforcement: false,
             max_pending_inbound_bytes: 8 * 2_000_000,
             max_pending_outbound_bytes: 8 * 2_000_000,
             limits: Limits::default(),
@@ -373,6 +391,12 @@ impl Default for Config {
             inject_until_overflow: None,
             #[cfg(feature = "_test_hooks")]
             inject_close_for: None,
+            #[cfg(feature = "_test_hooks")]
+            window_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_grant_order: false,
+            #[cfg(feature = "_test_hooks")]
+            peer_credit: None,
         }
     }
 }
@@ -1363,6 +1387,7 @@ where
         handshake_deadline_at: Some(handshake_deadline_at),
         writer: None,
         reader: None,
+        peer_credit: None,
         pending_supervisor_cause: None,
         pending_outbound: crate::server::session::PendingOutbound::default(),
         pending_kex_install: None,

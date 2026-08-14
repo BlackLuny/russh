@@ -2,8 +2,15 @@
 //!
 //! Channel-scoped messages (`DATA`/`EXT`/`EOF`/`CLOSE`/`REQUEST`/
 //! `SUCCESS`/`FAILURE`) go to a dual-bound per-channel lane. Everything
-//! else (kex / DISCONNECT / SERVICE / GLOBAL / OPEN / ADJUST / unknown)
-//! is `try_push`ed onto a 2 MiB fail-closed ctrl queue.
+//! else (kex / DISCONNECT / SERVICE / GLOBAL / OPEN / unknown)
+//! is `try_push`ed onto a 2 MiB fail-closed ctrl queue. Inbound
+//! `CHANNEL_WINDOW_ADJUST` is routed three ways by lane state: a
+//! *confirmed* lane posts to the in-flight `PeerCreditBoard` (not
+//! lane/ctrl/Writer); a live but *unconfirmed* (server-open) lane
+//! falls through to ctrl so the credit stays behind `OPEN_CONFIRMATION`
+//! in wire FIFO; an unknown id is dropped at Reader by lane membership
+//! (same silent ignore as the old established-gate path). Session's
+//! established gate is backup. malformed 落 ctrl 定罪.
 //!
 //! Inbound epoch install is a **capacity-1** Session→Reader channel.
 //! `cipher::read` never sees a newly installed key mid-packet: install
@@ -27,8 +34,8 @@ use crate::cipher::{self, OpeningKey};
 use crate::compression::{Compression, Decompress};
 use crate::msg;
 use crate::server::inbound_lane::{
-    LaneItem, LanePush, LaneTable, INBOUND_CTRL_BUDGET, INBOUND_LANE_COUNT_SLACK,
-    INBOUND_LANE_MIN_PACKET,
+    ExpandCap, LaneItem, LanePush, LaneTable, PeerCreditBoard, INBOUND_CTRL_BUDGET,
+    INBOUND_LANE_COUNT_SLACK, INBOUND_LANE_MIN_PACKET,
 };
 use crate::sshbuffer::{IncomingSshPacket, SSHBuffer};
 use crate::ChannelId;
@@ -149,6 +156,8 @@ pub struct ReaderHooks {
     /// (0 = off). Used to send a ghost CLOSE on a never-opened id.
     #[cfg(feature = "_test_hooks")]
     pub inject_close_for: Option<Arc<AtomicU32>>,
+    #[cfg(feature = "_test_hooks")]
+    pub window_observe: Option<Arc<crate::server::inbound_lane::WindowObserveSlot>>,
 }
 
 /// Live Reader observation (`_test_hooks`).
@@ -439,9 +448,22 @@ impl ReaderHandle {
             })
     }
 
-    pub fn open_lane(&self, id: ChannelId, generation: u64, window: u32, max_packet: u32) {
+    pub fn open_lane(
+        &self,
+        id: ChannelId,
+        generation: u64,
+        window: u32,
+        max_packet: u32,
+        confirmed: bool,
+    ) {
         if let Ok(mut g) = self.lanes.lock() {
-            g.open(id, generation, window, max_packet);
+            g.open(id, generation, window, max_packet, confirmed);
+        }
+    }
+
+    pub fn confirm_lane(&self, id: ChannelId) {
+        if let Ok(mut g) = self.lanes.lock() {
+            g.confirm(id);
         }
     }
 
@@ -514,6 +536,40 @@ impl ReaderHandle {
         self.lanes.lock().ok().and_then(|g| g.generation(id))
     }
 
+    #[cfg(feature = "_test_hooks")]
+    pub fn lane_count(&self) -> usize {
+        self.lanes.lock().ok().map(|g| g.len()).unwrap_or(0)
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    pub fn lane_has(&self, id: ChannelId) -> bool {
+        self.is_confirmed(id).is_some()
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    pub fn is_confirmed(&self, id: ChannelId) -> Option<bool> {
+        self.lanes.lock().ok().and_then(|g| g.is_confirmed(id))
+    }
+
+    /// Single inbound-window ledger. Session must not independently `-=`.
+    pub fn sender_window(&self, id: ChannelId) -> Option<u32> {
+        self.lanes.lock().ok().and_then(|g| g.window_remaining(id))
+    }
+
+    /// try_push ExpandInboundCap. Never await. Full cannot happen.
+    pub fn try_expand_inbound_cap(
+        &self,
+        id: ChannelId,
+        generation: u64,
+        add: u32,
+    ) -> ExpandCap {
+        self.lanes
+            .lock()
+            .ok()
+            .map(|mut g| g.try_expand(id, generation, add))
+            .unwrap_or(ExpandCap::NoLane)
+    }
+
     pub fn release_ctrl(&self, n: usize) {
         let _ = self
             .ctrl_bytes
@@ -550,6 +606,7 @@ where
         INBOUND_CTRL_BUDGET,
         INBOUND_LANE_MIN_PACKET,
         INBOUND_LANE_COUNT_SLACK,
+        PeerCreditBoard::new(),
     )
 }
 
@@ -563,6 +620,7 @@ pub fn spawn_reader_with_budget<R>(
     ctrl_budget: usize,
     min_packet: usize,
     count_slack: usize,
+    credit: Arc<PeerCreditBoard>,
 ) -> (
     ReaderHandle,
     JoinHandle<()>,
@@ -604,6 +662,7 @@ where
         ready,
         evt_tx,
         hooks,
+        credit,
     ));
 
     (handle, join, ctrl_rx, evt_rx)
@@ -686,6 +745,7 @@ fn dispatch_inbound(
     ctrl_budget: usize,
     evt_tx: &mpsc::UnboundedSender<ReaderEvent>,
     hooks: &ReaderHooks,
+    credit: &PeerCreditBoard,
 ) -> bool {
     #[cfg(feature = "_test_hooks")]
     let force_full = hooks
@@ -706,6 +766,58 @@ fn dispatch_inbound(
         | Some(msg::CHANNEL_FAILURE) => true,
         _ => false,
     };
+
+    if pkt.buffer.first() == Some(&msg::CHANNEL_WINDOW_ADJUST) {
+        if let Some((id, amount)) = parse_window_adjust(&pkt) {
+            // Membership + confirmed under the lanes lock, then drop
+            // that lock before credit.post (board lock). Never nest.
+            let confirmed = lanes.lock().ok().and_then(|g| g.is_confirmed(id));
+            match confirmed {
+                None => {
+                    // Silent drop: same semantic as the old established-gate
+                    // ignore. Do not send to ctrl.
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref o) = hooks.window_observe {
+                        o.note_unknown_adjust();
+                    }
+                    return true;
+                }
+                Some(true) => {
+                    // TOCTOU: lane closed after the check, before post → at most
+                    // O(in-flight teardowns) stale entries; next loop-top
+                    // take_all + established gate drops them.
+                    credit.post(id, amount);
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref o) = hooks.window_observe {
+                        o.note_adjust_bypass();
+                    }
+                    return true;
+                }
+                Some(false) => {
+                    // Unconfirmed server-open: fall through to !scoped
+                    // try_push_ctrl so ADJUST joins OPEN_CONFIRMATION on
+                    // ctrl and wire FIFO is preserved. An unconfirmed
+                    // ADJUST flood eats the 2 MiB fail-closed ctrl
+                    // budget; overflow is PeerError. Bounded and intended.
+                    //
+                    // Monotonicity: if Reader observed !confirmed and
+                    // queued ctrl, Session confirming later still sees
+                    // this ADJUST *after* CONFIRMATION in ctrl → old
+                    // handler applies it. The reverse (Reader sees
+                    // confirmed=true while a prior CONFIRMATION is still
+                    // sitting unprocessed in ctrl) cannot happen:
+                    // confirm_lane runs in the same Session turn that
+                    // processes ctrl CONFIRMATION, so Reader cannot
+                    // observe confirmed=true before that turn.
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref o) = hooks.window_observe {
+                        o.note_unconfirmed_adjust();
+                    }
+                }
+            }
+        }
+        // malformed 落 ctrl 定罪; unconfirmed 落 ctrl 保序
+    }
 
     if !scoped {
         if try_push_ctrl(
@@ -820,10 +932,20 @@ fn dispatch_lane_item(
     }
 
     let push = if let Ok(mut g) = lanes.lock() {
+        // I1: consume at receive, regardless of later lane accept/Overflow.
+        // Extra bytes past the advertised window are ignored (RFC 4254 §5.2).
+        match &item {
+            LaneItem::Data(d) => g.consume_window(id, d.len()),
+            LaneItem::ExtendedData { data, .. } => g.consume_window(id, data.len()),
+            _ => {}
+        }
         let p = g.try_push(id, item);
         #[cfg(feature = "_test_hooks")]
         if let Some(ref o) = hooks.lane_observe {
             o.set_occ(g.occupancy_bytes(id), g.occupancy_count(id));
+            if let (Some(bc), Some(cc)) = (g.byte_cap(id), g.count_cap(id)) {
+                o.set_caps(bc, cc);
+            }
         }
         p
     } else {
@@ -955,6 +1077,15 @@ fn note_push(hooks: &ReaderHooks, push: &LanePush, is_close: bool) {
     }
 }
 
+fn parse_window_adjust(pkt: &IncomingSshPacket) -> Option<(ChannelId, u32)> {
+    let rest = pkt.buffer.get(1..)?;
+    let mut r = rest;
+    let id = ChannelId::decode(&mut r).ok()?;
+    let amount = u32::decode(&mut r).ok()?;
+    crate::parsing::ensure_end(&r).ok()?;
+    Some((id, amount))
+}
+
 fn parse_lane_item(pkt: &IncomingSshPacket) -> Option<(ChannelId, LaneItem)> {
     let (first, rest) = pkt.buffer.split_first()?;
     let mut r = rest;
@@ -1035,6 +1166,7 @@ async fn reader_loop<R: AsyncRead + Unpin>(
     ready: Arc<Notify>,
     evt_tx: mpsc::UnboundedSender<ReaderEvent>,
     hooks: ReaderHooks,
+    credit: Arc<PeerCreditBoard>,
 ) {
     #[cfg(not(feature = "_test_hooks"))]
     let _ = &hooks;
@@ -1218,6 +1350,7 @@ async fn reader_loop<R: AsyncRead + Unpin>(
             ctrl_budget,
             &evt_tx,
             &hooks,
+            &credit,
         ) {
             break 'reader;
         }
@@ -1385,6 +1518,7 @@ mod mid_read_tests {
             inject_zero_data: None,
             inject_until_overflow: None,
             inject_close_for: None,
+            window_observe: None,
         };
         let (handle, join, mut ctrl, mut evts) = spawn_reader(
             server,
@@ -1507,6 +1641,7 @@ mod mid_read_tests {
             inject_zero_data: None,
             inject_until_overflow: None,
             inject_close_for: None,
+            window_observe: None,
         };
         let (handle, join, mut ctrl, _evts) = spawn_reader(
             server,

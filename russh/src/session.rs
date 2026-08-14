@@ -428,6 +428,29 @@ impl Encrypted {
         Ok(false)
     }
 
+    /// Write a CHANNEL_WINDOW_ADJUST and SET the inbound-window mirror.
+    /// Reader already expanded the authoritative remaining; this must not `-=`.
+    pub fn emit_window_adjust(
+        &mut self,
+        channel: ChannelId,
+        delta: u32,
+        ceiling: u32,
+    ) -> Result<bool, crate::Error> {
+        let Some(ch) = self.channels.get_mut(&channel) else {
+            return Ok(false);
+        };
+        if ch.outbound_closed {
+            return Ok(false);
+        }
+        push_packet!(self.write, {
+            self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+            ch.recipient_channel.encode(&mut self.write)?;
+            delta.encode(&mut self.write)?;
+        });
+        ch.sender_window_size = ceiling;
+        Ok(true)
+    }
+
     fn encode_ctrl_payload(
         channel: &ChannelParams,
         item: &crate::ChannelCtrlItem,

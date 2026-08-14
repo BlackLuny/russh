@@ -22,7 +22,7 @@ use crate::pending_inbound::{
 use crate::server::supervisor::{
     AtomicWriteProgress, DisconnectCause, RekeyDeadline, WriteWatchdog,
 };
-use crate::server::inbound_lane::LaneItem;
+use crate::server::inbound_lane::{LaneItem, PeerCreditBoard};
 use crate::server::reader::{
     spawn_reader_with_budget, stop_reader_task, CtrlMsg, InstallInboundEpoch, ReaderEvent,
     ReaderHandle,
@@ -74,6 +74,8 @@ pub struct Session {
     pub(crate) writer: Option<WriterHandle>,
     /// S3a: handle to the independent ReaderTask (None until stream is split).
     pub(crate) reader: Option<ReaderHandle>,
+    /// In-flight ADJUST credit staging (Reader↔Session). Not a window book.
+    pub(crate) peer_credit: Option<Arc<PeerCreditBoard>>,
     /// Supervisor first-cause staged from `reply()` (InstallAck fail etc.) so the
     /// main loop can `record_cause` and take the unified Cancelling path (r2 P1).
     pub(crate) pending_supervisor_cause: Option<DisconnectCause>,
@@ -820,12 +822,13 @@ impl Handle {
 }
 
 impl Session {
-    /// S4 replaces the body. S3 only calls it on the grant path.
+    /// S4 replaces the body. S3c only calls it on the grant path.
+    /// Always `Ok(())` — no global inbound budget in this slice.
     pub(crate) fn reserve_global_inbound_credit(_n: u32) -> Result<(), ()> {
         Ok(())
     }
 
-    fn register_inbound_lane(&self, id: ChannelId) {
+    fn register_inbound_lane(&self, id: ChannelId, confirmed: bool) {
         let Some(r) = self.reader.as_ref() else {
             return;
         };
@@ -835,7 +838,12 @@ impl Session {
         // only *live* enc.channels keys, so a freed id can be reused
         // immediately; the gen stops a stale CloseDropped from notifying
         // the replacement. The `1` argument is unused (table assigns).
-        r.open_lane(id, 1, window, max_pkt);
+        r.open_lane(id, 1, window, max_pkt, confirmed);
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref o) = self.common.config.window_observe {
+            o.note_lane_open(id.number(), confirmed);
+            o.set_lane_count(r.lane_count());
+        }
     }
 
     /// Pop Reader lanes into `deliver_inbound` / REQUEST dispatch. One
@@ -872,16 +880,11 @@ impl Session {
             };
             match item {
                 LaneItem::Data(data) => {
-                    if let Some(enc) = self.common.encrypted.as_mut() {
-                        enc.consume_recv_window(id, data.len());
-                    }
+                    // Window already consumed at Reader receive (single ledger).
                     self.dispatch_lane_payload(id, InboundItem::Data(data), handler)
                         .await?;
                 }
                 LaneItem::ExtendedData { ext, data } => {
-                    if let Some(enc) = self.common.encrypted.as_mut() {
-                        enc.consume_recv_window(id, data.len());
-                    }
                     self.dispatch_lane_payload(
                         id,
                         InboundItem::ExtendedData { ext, data },
@@ -1252,13 +1255,7 @@ impl Session {
             return Ok(());
         }
         let _ = Self::reserve_global_inbound_credit(target.saturating_sub(undelivered));
-        let granted = self
-            .common
-            .encrypted
-            .as_mut()
-            .map(|enc| enc.maybe_grant_recv_window(id, target, undelivered))
-            .transpose()?
-            .unwrap_or(false);
+        let granted = self.grant_expand_then_adjust(id, target, undelivered)?;
         if granted {
             self.deferred_window_grants.remove(&id);
             #[cfg(feature = "_test_hooks")]
@@ -1278,6 +1275,144 @@ impl Session {
             self.deferred_window_grants.remove(&id);
         }
         Ok(())
+    }
+
+    /// Hard grant order: expand Reader cap first, then seal ADJUST.
+    /// Expand fail (gone / wrong gen) → no ADJUST + count. Never awaits Reader.
+    fn grant_expand_then_adjust(
+        &mut self,
+        id: ChannelId,
+        target: u32,
+        undelivered: u32,
+    ) -> Result<bool, crate::Error> {
+        use crate::server::inbound_lane::ExpandCap;
+        let ceiling = target.saturating_sub(undelivered);
+        let remaining = if let Some(r) = self.reader.as_ref() {
+            r.sender_window(id).unwrap_or(0)
+        } else {
+            self.common
+                .encrypted
+                .as_ref()
+                .map(|enc| enc.sender_window_size(id) as u32)
+                .unwrap_or(0)
+        };
+        if remaining >= ceiling / 2 {
+            return Ok(false);
+        }
+        let delta = ceiling.saturating_sub(remaining);
+        if delta == 0 {
+            return Ok(false);
+        }
+        let invert = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common.config.invert_grant_order
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                false
+            }
+        };
+
+        if invert {
+            // `_test_hooks` inject: same two production calls, swapped.
+            let emitted = self.emit_inbound_adjust(id, delta, ceiling)?;
+            let _ = self.expand_inbound_cap(id, delta);
+            return Ok(emitted);
+        }
+
+        match self.expand_inbound_cap(id, delta) {
+            ExpandCap::Expanded => {}
+            ExpandCap::NoLane | ExpandCap::GenMismatch => return Ok(false),
+        }
+        self.emit_inbound_adjust(id, delta, ceiling)
+    }
+
+    fn expand_inbound_cap(
+        &self,
+        id: ChannelId,
+        delta: u32,
+    ) -> crate::server::inbound_lane::ExpandCap {
+        use crate::server::inbound_lane::ExpandCap;
+        let result = if let Some(r) = self.reader.as_ref() {
+            let lane_gen = r.lane_gen(id).unwrap_or(0);
+            r.try_expand_inbound_cap(id, lane_gen, delta)
+        } else {
+            ExpandCap::Expanded
+        };
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref o) = self.common.config.window_observe {
+            match result {
+                ExpandCap::Expanded => o.note_expand_ok(),
+                ExpandCap::NoLane | ExpandCap::GenMismatch => o.note_expand_fail(),
+            }
+        }
+        result
+    }
+
+    fn emit_inbound_adjust(
+        &mut self,
+        id: ChannelId,
+        delta: u32,
+        ceiling: u32,
+    ) -> Result<bool, crate::Error> {
+        let Some(enc) = self.common.encrypted.as_mut() else {
+            return Ok(false);
+        };
+        let emitted = enc.emit_window_adjust(id, delta, ceiling)?;
+        if emitted {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref o) = self.common.config.window_observe {
+                o.note_adjust_emitted();
+            }
+        }
+        Ok(emitted)
+    }
+
+    /// Inbound ADJUST applied from the aggregation-board drain. Authority
+    /// stays Session `recipient_window_size` + WindowSizeRef — the board
+    /// is in-flight staging, not a third window book.
+    async fn apply_peer_window_credit<H: Handler + Send>(
+        &mut self,
+        id: ChannelId,
+        amount: u32,
+        handler: &mut H,
+    ) -> Result<(), H::Error> {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref c) = self.common.config.window_adjust_seen {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let established = self
+            .common
+            .encrypted
+            .as_ref()
+            .and_then(|enc| enc.channels.get(&id))
+            .is_some_and(|ch| ch.confirmed);
+        if !established {
+            return Ok(());
+        }
+        let mut new_size = 0;
+        if let Some(ref mut enc) = self.common.encrypted {
+            let channel = enc
+                .channels
+                .get_mut(&id)
+                .ok_or(crate::Error::Inconsistent)
+                .map_err(|e| e.into())?;
+            new_size = channel.recipient_window_size.saturating_add(amount);
+            channel.recipient_window_size = new_size;
+        }
+        let wrote = self.try_drain_channel_under_budget(id).map_err(|e| e.into())?;
+        new_size = new_size.saturating_sub(wrote as u32);
+        if let Some(enc) = self.common.encrypted.as_ref() {
+            if let Some(ch) = enc.channels.get(&id) {
+                new_size = ch.recipient_window_size;
+            }
+        }
+        if let Some(chan) = self.channels.get(&id) {
+            chan.window_size().update(new_size).await;
+            let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
+        }
+        handler.window_adjusted(id, new_size, self).await
     }
 
     /// Replay WINDOW_ADJUST grants skipped while outbound sat at the hard cap.
@@ -1559,12 +1694,12 @@ impl Session {
             Msg::ChannelOpenAgent { channel_ref } => {
                 let id = self.channel_open_agent()?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::ChannelOpenSession { channel_ref } => {
                 let id = self.channel_open_session()?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::ChannelOpenDirectTcpIp {
                 host_to_connect,
@@ -1580,7 +1715,7 @@ impl Session {
                     originator_port,
                 )?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::ChannelOpenDirectStreamLocal {
                 socket_path,
@@ -1588,7 +1723,7 @@ impl Session {
             } => {
                 let id = self.channel_open_direct_streamlocal(&socket_path)?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::ChannelOpenForwardedTcpIp {
                 connected_address,
@@ -1604,7 +1739,7 @@ impl Session {
                     originator_port,
                 )?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::ChannelOpenForwardedStreamLocal {
                 server_socket_path,
@@ -1612,7 +1747,7 @@ impl Session {
             } => {
                 let id = self.channel_open_forwarded_streamlocal(&server_socket_path)?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::ChannelOpenX11 {
                 originator_address,
@@ -1621,7 +1756,7 @@ impl Session {
             } => {
                 let id = self.channel_open_x11(&originator_address, originator_port)?;
                 self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id);
+                self.register_inbound_lane(id, false);
             }
             Msg::TcpIpForward {
                 address,
@@ -1781,6 +1916,7 @@ impl Session {
                     inject_zero_data: self.common.config.inject_zero_data.clone(),
                     inject_until_overflow: self.common.config.inject_until_overflow.clone(),
                     inject_close_for: self.common.config.inject_close_for.clone(),
+                    window_observe: self.common.config.window_observe.clone(),
                 }
             }
             #[cfg(not(feature = "_test_hooks"))]
@@ -1788,6 +1924,21 @@ impl Session {
                 ReaderHooks::default()
             }
         };
+        let credit = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common
+                    .config
+                    .peer_credit
+                    .clone()
+                    .unwrap_or_else(PeerCreditBoard::new)
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                PeerCreditBoard::new()
+            }
+        };
+        self.peer_credit = Some(credit.clone());
         let (reader_handle, reader_join_raw, mut ctrl_rx, mut reader_events) =
             spawn_reader_with_budget(
                 stream_read,
@@ -1798,6 +1949,7 @@ impl Session {
                 self.common.config.inbound_ctrl_budget,
                 self.common.config.inbound_min_packet_size as usize,
                 self.common.config.inbound_lane_count_slack,
+                credit.clone(),
             );
         let lane_ready = reader_handle.lane_ready();
         self.reader = Some(reader_handle);
@@ -1967,6 +2119,23 @@ impl Session {
                 record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                 self.common.disconnected = true;
                 continue;
+            }
+            // Aggregation board drain: always here, never in the notify arm.
+            if let Some(board) = self.peer_credit.as_ref() {
+                let pending = board.take_all();
+                for (id, amt) in pending {
+                    let amount = if amt > u32::MAX as u64 {
+                        u32::MAX
+                    } else {
+                        amt as u32
+                    };
+                    if let Err(e) = self
+                        .apply_peer_window_credit(id, amount, &mut handler)
+                        .await
+                    {
+                        return Err(e);
+                    }
+                }
             }
 
             // S2b: single sealed-backlog ledger for HWM / write-watchdog =
@@ -2181,9 +2350,102 @@ impl Session {
 
             let lane_notified = lane_ready.notified();
             tokio::pin!(lane_notified);
+            let credit_notified = credit.notify().notified();
+            tokio::pin!(credit_notified);
 
             tokio::select! {
                 biased;
+                // This queue must not grow per-packet / peer-rate-driven
+                // variants (this round's lesson). Rare events only.
+                evt = writer_events.recv() => {
+                    match evt {
+                        Some(WriterEvent::InstallAckOutbound { generation }) => {
+                            debug!("session: got InstallAck Outbound gen={generation}");
+                            #[cfg(feature = "_test_hooks")]
+                            if self
+                                .common
+                                .config
+                                .install_ack_hold
+                                .as_ref()
+                                .is_some_and(|h| h.is_held())
+                            {
+                                deferred_install_ack = Some(generation);
+                            } else if let Some(after) =
+                                self.on_install_ack_outbound(generation)
+                            {
+                                self.apply_kex_after_install(after);
+                                if let Err(e) =
+                                    self.replay_pending_reads(&mut handler).await
+                                {
+                                    debug!("pending_reads replay error");
+                                    let _ = e;
+                                    record_cause(
+                                        DisconnectCause::PeerError,
+                                        &mut supervisor_cause,
+                                    );
+                                    self.common.disconnected = true;
+                                }
+                                if let Some(c) =
+                                    self.pending_supervisor_cause.take()
+                                {
+                                    record_cause(c, &mut supervisor_cause);
+                                    self.common.disconnected = true;
+                                }
+                                let _ = self.flush();
+                            }
+                            #[cfg(not(feature = "_test_hooks"))]
+                            if let Some(after) =
+                                self.on_install_ack_outbound(generation)
+                            {
+                                self.apply_kex_after_install(after);
+                                if let Err(e) =
+                                    self.replay_pending_reads(&mut handler).await
+                                {
+                                    debug!("pending_reads replay error");
+                                    let _ = e;
+                                    record_cause(
+                                        DisconnectCause::PeerError,
+                                        &mut supervisor_cause,
+                                    );
+                                    self.common.disconnected = true;
+                                }
+                                if let Some(c) =
+                                    self.pending_supervisor_cause.take()
+                                {
+                                    record_cause(c, &mut supervisor_cause);
+                                    self.common.disconnected = true;
+                                }
+                                let _ = self.flush();
+                            }
+                        }
+                        Some(WriterEvent::KexQueueFull)
+                        | Some(WriterEvent::WriteError(_))
+                        | Some(WriterEvent::SealError) => {
+                            self.fail_pending_kex_install();
+                            if let Some(c) = self.pending_supervisor_cause.take() {
+                                record_cause(c, &mut supervisor_cause);
+                            } else {
+                                record_cause(
+                                    DisconnectCause::PeerError,
+                                    &mut supervisor_cause,
+                                );
+                            }
+                            self.common.disconnected = true;
+                        }
+                        None => {
+                            self.fail_pending_kex_install();
+                            if let Some(c) = self.pending_supervisor_cause.take() {
+                                record_cause(c, &mut supervisor_cause);
+                            } else if supervisor_cause.is_none() {
+                                record_cause(
+                                    DisconnectCause::PeerError,
+                                    &mut supervisor_cause,
+                                );
+                            }
+                            self.common.disconnected = true;
+                        }
+                    }
+                }
                 ctrl = ctrl_rx.recv() => {
                     let Some(ctrl) = ctrl else {
                         debug!("ctrl closed; harvest reader terminal");
@@ -2280,6 +2542,9 @@ impl Session {
                     }
                     self.drain_needs_reserve(&mut inbound_reserves);
                 }
+                () = &mut credit_notified => {
+                    // Wake-only: drain is always at loop-top.
+                }
                 Some((cid, generation, res)) = inbound_reserves.next(), if !inbound_reserves.is_empty() && !self.blocks_outbound_intake() => {
                     // A backpressured channel's application buffer freed a slot: deliver its head
                     // item and re-arm. The grant for that channel is emitted into `self.write` and
@@ -2372,106 +2637,6 @@ impl Session {
                             {
                                 // Clean EOF: leave first-cause unset so a
                                 // supervisor cause already recorded wins.
-                            }
-                            self.common.disconnected = true;
-                        }
-                    }
-                }
-                // Writer events (InstallAck, write/seal errors, kex queue full).
-                evt = writer_events.recv() => {
-                    match evt {
-                        Some(WriterEvent::InstallAckOutbound { generation }) => {
-                            debug!("session: got InstallAck Outbound gen={generation}");
-                            // Hold gate: stash generation and keep select arms (esp. read)
-                            // live so Done-before-ACK post-NEWKEYS packets still decrypt.
-                            #[cfg(feature = "_test_hooks")]
-                            if self
-                                .common
-                                .config
-                                .install_ack_hold
-                                .as_ref()
-                                .is_some_and(|h| h.is_held())
-                            {
-                                deferred_install_ack = Some(generation);
-                            } else {
-                                // Completion only — inbound cipher already committed at Done.
-                                if let Some(after) =
-                                    self.on_install_ack_outbound(generation)
-                                {
-                                    self.apply_kex_after_install(after);
-                                    if let Err(e) =
-                                        self.replay_pending_reads(&mut handler).await
-                                    {
-                                        debug!("pending_reads replay error");
-                                        let _ = e;
-                                        record_cause(
-                                            DisconnectCause::PeerError,
-                                            &mut supervisor_cause,
-                                        );
-                                        self.common.disconnected = true;
-                                    }
-                                    if let Some(c) =
-                                        self.pending_supervisor_cause.take()
-                                    {
-                                        record_cause(c, &mut supervisor_cause);
-                                        self.common.disconnected = true;
-                                    }
-                                    let _ = self.flush();
-                                }
-                            }
-                            #[cfg(not(feature = "_test_hooks"))]
-                            {
-                                // Completion only — inbound cipher already committed at Done.
-                                if let Some(after) =
-                                    self.on_install_ack_outbound(generation)
-                                {
-                                    self.apply_kex_after_install(after);
-                                    if let Err(e) =
-                                        self.replay_pending_reads(&mut handler).await
-                                    {
-                                        debug!("pending_reads replay error");
-                                        let _ = e;
-                                        record_cause(
-                                            DisconnectCause::PeerError,
-                                            &mut supervisor_cause,
-                                        );
-                                        self.common.disconnected = true;
-                                    }
-                                    if let Some(c) =
-                                        self.pending_supervisor_cause.take()
-                                    {
-                                        record_cause(c, &mut supervisor_cause);
-                                        self.common.disconnected = true;
-                                    }
-                                    let _ = self.flush();
-                                }
-                                // else: InstallAcked but peer Done not yet — keep waiting
-                            }
-                        }
-                        Some(WriterEvent::KexQueueFull)
-                        | Some(WriterEvent::WriteError(_))
-                        | Some(WriterEvent::SealError) => {
-                            self.fail_pending_kex_install();
-                            if let Some(c) = self.pending_supervisor_cause.take() {
-                                record_cause(c, &mut supervisor_cause);
-                            } else {
-                                record_cause(
-                                    DisconnectCause::PeerError,
-                                    &mut supervisor_cause,
-                                );
-                            }
-                            self.common.disconnected = true;
-                        }
-                        None => {
-                            // Writer task ended unexpectedly.
-                            self.fail_pending_kex_install();
-                            if let Some(c) = self.pending_supervisor_cause.take() {
-                                record_cause(c, &mut supervisor_cause);
-                            } else if supervisor_cause.is_none() {
-                                record_cause(
-                                    DisconnectCause::PeerError,
-                                    &mut supervisor_cause,
-                                );
                             }
                             self.common.disconnected = true;
                         }
@@ -3647,20 +3812,24 @@ impl Session {
     }
 
     pub fn writable_packet_size(&self, channel: &ChannelId) -> u32 {
+        let win = self.window_size(channel);
         if let Some(ref enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(channel) {
-                return channel
-                    .sender_window_size
-                    .min(channel.sender_maximum_packet_size);
+            if let Some(ch) = enc.channels.get(channel) {
+                return win.min(ch.sender_maximum_packet_size);
             }
         }
         0
     }
 
     pub fn window_size(&self, channel: &ChannelId) -> u32 {
+        if let Some(r) = self.reader.as_ref() {
+            if let Some(w) = r.sender_window(*channel) {
+                return w;
+            }
+        }
         if let Some(ref enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(channel) {
-                return channel.sender_window_size;
+            if let Some(ch) = enc.channels.get(channel) {
+                return ch.sender_window_size;
             }
         }
         0
@@ -3904,6 +4073,11 @@ impl Session {
     }
 
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
+        if let Some(r) = self.reader.as_ref() {
+            if let Some(w) = r.sender_window(channel) {
+                return w as usize;
+            }
+        }
         if let Some(ref enc) = self.common.encrypted {
             enc.sender_window_size(channel)
         } else {
@@ -4087,9 +4261,6 @@ impl Session {
                     enc.channels.insert(id, params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
-                    // Head fence: emit now (unbounded, no window, no HWM).
-                    enc.flush_pending(id)?;
-                    self.record_outbound_from_write();
                     opened = Some(id);
                 }
                 Err(reason) => {
@@ -4104,7 +4275,15 @@ impl Session {
             }
         }
         if let Some(id) = opened {
-            self.register_inbound_lane(id);
+            // Lane must exist before CHANNEL_OPEN_CONFIRMATION is
+            // encoded into enc.write (and can leave on the wire). The
+            // peer only learns this id from that packet.
+            self.register_inbound_lane(id, true);
+            if let Some(ref mut enc) = self.common.encrypted {
+                // Head fence: emit now (unbounded, no window, no HWM).
+                enc.flush_pending(id)?;
+            }
+            self.record_outbound_from_write();
         }
         Ok(())
     }
@@ -4732,6 +4911,10 @@ impl Session {
         } else {
             return Err(Error::Inconsistent);
         };
+        // CHANNEL_OPEN is only buffered in enc.write. The caller
+        // (`dispatch_msg` ChannelOpen*) registers the inbound lane in
+        // the same turn: no await and no Writer submit between this
+        // write and `register_inbound_lane`.
         Ok(result)
     }
 
@@ -5000,6 +5183,7 @@ mod tests {
             handshake_deadline_at: None,
             writer: None,
             reader: None,
+            peer_credit: None,
             pending_supervisor_cause: None,
             pending_outbound: PendingOutbound::default(),
             pending_kex_install: None,
@@ -7355,28 +7539,16 @@ mod tests {
         let id = insert_encrypted_channel(&mut session, target);
         let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
 
-        session
-            .common
-            .encrypted
-            .as_mut()
-            .unwrap()
-            .consume_recv_window(id, target as usize);
-        assert_eq!(
-            session
-                .common
-                .encrypted
-                .as_ref()
-                .unwrap()
-                .sender_window_size(id),
-            0
-        );
-
         let lane_hold = 64usize;
         let scheme_c = (target / 4) as usize;
         let lanes = Arc::new(Mutex::new(LaneTable::new(8, 32)));
         {
             let mut g = lanes.lock().unwrap();
-            g.open(id, 1, target, 32768);
+            g.open(id, 1, target, 32768, true);
+            // Single ledger: consume the whole granted window on the Reader
+            // cell (Session Encrypted must not independently -=).
+            g.consume_window(id, target as usize);
+            assert_eq!(g.window_remaining(id), Some(0));
             assert_eq!(
                 g.try_push(id, LaneItem::Data(bytes::Bytes::from(vec![0u8; lane_hold]))),
                 crate::server::inbound_lane::LanePush::Accepted
