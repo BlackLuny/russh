@@ -57,6 +57,7 @@ use crate::*;
 
 mod kex;
 mod session;
+mod session_facade;
 pub use self::session::*;
 mod encrypted;
 pub mod supervisor;

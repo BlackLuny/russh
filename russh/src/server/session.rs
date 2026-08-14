@@ -35,6 +35,10 @@ use crate::{ChannelOpenFailure, map_err, msg};
 
 
 /// A connected server session. This type is unique to a client.
+///
+/// S4a: this struct is the G5 facade type. Public method signatures live in
+/// [`session_facade`] and forward 1:1 into `*_apply` (today's implementation).
+/// S4b replaces those facade bodies only; field layout and `*_apply` stay.
 #[derive(Debug)]
 pub struct Session {
     pub(crate) common: CommonSession<Arc<Config>>,
@@ -3807,11 +3811,11 @@ impl Session {
     }
 
     /// Get a handle to this session.
-    pub fn handle(&self) -> Handle {
+    pub(crate) fn handle_apply(&self) -> Handle {
         self.sender.clone()
     }
 
-    pub fn writable_packet_size(&self, channel: &ChannelId) -> u32 {
+    pub(crate) fn writable_packet_size_apply(&self, channel: &ChannelId) -> u32 {
         let win = self.window_size(channel);
         if let Some(ref enc) = self.common.encrypted {
             if let Some(ch) = enc.channels.get(channel) {
@@ -3821,7 +3825,7 @@ impl Session {
         0
     }
 
-    pub fn window_size(&self, channel: &ChannelId) -> u32 {
+    pub(crate) fn window_size_apply(&self, channel: &ChannelId) -> u32 {
         if let Some(r) = self.reader.as_ref() {
             if let Some(w) = r.sender_window(*channel) {
                 return w;
@@ -3835,7 +3839,7 @@ impl Session {
         0
     }
 
-    pub fn max_packet_size(&self, channel: &ChannelId) -> u32 {
+    pub(crate) fn max_packet_size_apply(&self, channel: &ChannelId) -> u32 {
         if let Some(ref enc) = self.common.encrypted {
             if let Some(channel) = enc.channels.get(channel) {
                 return channel.sender_maximum_packet_size;
@@ -3849,7 +3853,7 @@ impl Session {
     ///
     /// Always retries [`pending_outbound`] first; never lets a newer `enc.write`
     /// bulk leapfrog older parked cmds (incl. compress barrier).
-    pub fn flush(&mut self) -> Result<(), Error> {
+    pub(crate) fn flush_apply(&mut self) -> Result<(), Error> {
         use byteorder::{BigEndian, ByteOrder};
         use crate::server::writer::TrySendWireError;
 
@@ -3993,13 +3997,13 @@ impl Session {
         Ok(())
     }
 
-    pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, Error> {
+    pub(crate) fn flush_pending_apply(&mut self, channel: ChannelId) -> Result<usize, Error> {
         self.flush_pending_ex(channel, !self.blocks_outbound_intake())
     }
 
     /// Emit head-of-lane fences only (no DATA). Used so EOF/CLOSE/SUCCESS
     /// are not locked by a zero window, without dumping DATA past HWM.
-    pub fn flush_pending_fences(&mut self, channel: ChannelId) -> Result<usize, Error> {
+    pub(crate) fn flush_pending_fences_apply(&mut self, channel: ChannelId) -> Result<usize, Error> {
         self.flush_pending_ex(channel, false)
     }
 
@@ -4072,7 +4076,7 @@ impl Session {
         let _ = self;
     }
 
-    pub fn sender_window_size(&self, channel: ChannelId) -> usize {
+    pub(crate) fn sender_window_size_apply(&self, channel: ChannelId) -> usize {
         if let Some(r) = self.reader.as_ref() {
             if let Some(w) = r.sender_window(channel) {
                 return w as usize;
@@ -4085,7 +4089,7 @@ impl Session {
         }
     }
 
-    pub fn has_pending_data(&self, channel: ChannelId) -> bool {
+    pub(crate) fn has_pending_data_apply(&self, channel: ChannelId) -> bool {
         if let Some(ref enc) = self.common.encrypted {
             enc.has_pending_data(channel)
         } else {
@@ -4094,12 +4098,12 @@ impl Session {
     }
 
     /// Retrieves the configuration of this session.
-    pub fn config(&self) -> &Config {
+    pub(crate) fn config_apply(&self) -> &Config {
         &self.common.config
     }
 
     /// Sends a disconnect message.
-    pub fn disconnect(
+    pub(crate) fn disconnect_apply(
         &mut self,
         reason: Disconnect,
         description: &str,
@@ -4126,7 +4130,7 @@ impl Session {
     /// This message is informational and does not affect the SSH session
     /// state. Most clients (e.g., OpenSSH) will only display the message
     /// if verbose mode is enabled.
-    pub fn debug(
+    pub(crate) fn debug_apply(
         &mut self,
         always_display: bool,
         message: &str,
@@ -4139,26 +4143,26 @@ impl Session {
     /// a channel number, such as TCP/IP forwarding or
     /// cancelling). Always call this function if the request was
     /// successful (it checks whether the client expects an answer).
-    pub fn request_success(&mut self) {
+    pub(crate) fn request_success_apply(&mut self) {
         if self.common.wants_reply {
             let _ = self.emit_global_request_reply(true, None);
         }
     }
 
     /// Send a "failure" reply to a global request.
-    pub fn request_failure(&mut self) {
+    pub(crate) fn request_failure_apply(&mut self) {
         let _ = self.emit_global_request_reply(false, None);
     }
 
     /// Send a "success" reply to a channel request. Always call this
     /// function if the request was successful (it checks whether the
     /// client expects an answer).
-    pub fn channel_success(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+    pub(crate) fn channel_success_apply(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         self.emit_channel_request_reply(channel, true)
     }
 
     /// Send a "failure" reply to a channel request.
-    pub fn channel_failure(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+    pub(crate) fn channel_failure_apply(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
         self.emit_channel_request_reply(channel, false)
     }
 
@@ -4289,7 +4293,7 @@ impl Session {
     }
 
     /// Send a "failure" reply to a request to open a channel open.
-    pub fn channel_open_failure(
+    pub(crate) fn channel_open_failure_apply(
         &mut self,
         channel: ChannelId,
         reason: ChannelOpenFailure,
@@ -4309,7 +4313,7 @@ impl Session {
     }
 
     /// Close a channel.
-    pub fn close(&mut self, channel: ChannelId) -> Result<(), Error> {
+    pub(crate) fn close_apply(&mut self, channel: ChannelId) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             enc.park_close(channel);
         } else {
@@ -4351,7 +4355,7 @@ impl Session {
     }
 
     /// Send EOF to a channel
-    pub fn eof(&mut self, channel: ChannelId) -> Result<(), Error> {
+    pub(crate) fn eof_apply(&mut self, channel: ChannelId) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             enc.park_eof(channel);
         } else {
@@ -4368,7 +4372,7 @@ impl Session {
     ///
     /// The number of bytes added to the "sending pipeline" (to be
     /// processed by the event loop) is returned.
-    pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
+    pub(crate) fn data_apply(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
         // Submission budget: KEX/pending-install always parks like rekey.
         // HWM clamps how much enters enc.write this call (remainder → pending_data);
         // `try_drain_pending_data_under_budget` unparks when Writer frees capacity.
@@ -4651,7 +4655,7 @@ impl Session {
     ///
     /// The number of bytes added to the "sending pipeline" (to be
     /// processed by the event loop) is returned.
-    pub fn extended_data(
+    pub(crate) fn extended_data_apply(
         &mut self,
         channel: ChannelId,
         extended: u32,
@@ -4675,7 +4679,7 @@ impl Session {
     /// Inform the client of whether they may perform
     /// control-S/control-Q flow control. See
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-6.8).
-    pub fn xon_xoff_request(
+    pub(crate) fn xon_xoff_request_apply(
         &mut self,
         channel: ChannelId,
         client_can_do: bool,
@@ -4697,7 +4701,7 @@ impl Session {
     }
 
     /// Ping the client to verify there is still connectivity.
-    pub fn keepalive_request(&mut self) -> Result<(), Error> {
+    pub(crate) fn keepalive_request_apply(&mut self) -> Result<(), Error> {
         let want_reply = u8::from(true);
         if let Some(ref mut enc) = self.common.encrypted {
             self.open_global_requests
@@ -4712,7 +4716,7 @@ impl Session {
     }
 
     /// Ping the client with a Keepalive and get a notification when the client responds.
-    pub fn send_ping(&mut self, reply_channel: oneshot::Sender<()>) -> Result<(), Error> {
+    pub(crate) fn send_ping_apply(&mut self, reply_channel: oneshot::Sender<()>) -> Result<(), Error> {
         let want_reply = u8::from(true);
         if let Some(ref mut enc) = self.common.encrypted {
             self.open_global_requests
@@ -4727,7 +4731,7 @@ impl Session {
     }
 
     /// Send the exit status of a program.
-    pub fn exit_status_request(
+    pub(crate) fn exit_status_request_apply(
         &mut self,
         channel: ChannelId,
         exit_status: u32,
@@ -4749,7 +4753,7 @@ impl Session {
     }
 
     /// If the program was killed by a signal, send the details about the signal to the client.
-    pub fn exit_signal_request(
+    pub(crate) fn exit_signal_request_apply(
         &mut self,
         channel: ChannelId,
         signal: Sig,
@@ -4777,12 +4781,12 @@ impl Session {
     }
 
     /// Opens a new session channel on the client.
-    pub fn channel_open_session(&mut self) -> Result<ChannelId, Error> {
+    pub(crate) fn channel_open_session_apply(&mut self) -> Result<ChannelId, Error> {
         self.channel_open_generic(b"session", |_| Ok(()))
     }
 
     /// Opens a direct-tcpip channel on the client (non-standard).
-    pub fn channel_open_direct_tcpip(
+    pub(crate) fn channel_open_direct_tcpip_apply(
         &mut self,
         host_to_connect: &str,
         port_to_connect: u32,
@@ -4799,7 +4803,7 @@ impl Session {
     }
 
     /// Opens a direct-streamlocal channel on the client (non-standard).
-    pub fn channel_open_direct_streamlocal(
+    pub(crate) fn channel_open_direct_streamlocal_apply(
         &mut self,
         socket_path: &str,
     ) -> Result<ChannelId, Error> {
@@ -4816,7 +4820,7 @@ impl Session {
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-7). The
     /// TCP/IP packets can then be tunneled through the channel using
     /// `.data()`.
-    pub fn channel_open_forwarded_tcpip(
+    pub(crate) fn channel_open_forwarded_tcpip_apply(
         &mut self,
         connected_address: &str,
         connected_port: u32,
@@ -4832,7 +4836,7 @@ impl Session {
         })
     }
 
-    pub fn channel_open_forwarded_streamlocal(
+    pub(crate) fn channel_open_forwarded_streamlocal_apply(
         &mut self,
         socket_path: &str,
     ) -> Result<ChannelId, Error> {
@@ -4846,7 +4850,7 @@ impl Session {
     /// Open a new X11 channel, when a connection comes to a
     /// local port. See [RFC4254](https://tools.ietf.org/html/rfc4254#section-6.3.2).
     /// TCP/IP packets can then be tunneled through the channel using `.data()`.
-    pub fn channel_open_x11(
+    pub(crate) fn channel_open_x11_apply(
         &mut self,
         originator_address: &str,
         originator_port: u32,
@@ -4859,7 +4863,7 @@ impl Session {
     }
 
     /// Opens a new agent channel on the client.
-    pub fn channel_open_agent(&mut self) -> Result<ChannelId, Error> {
+    pub(crate) fn channel_open_agent_apply(&mut self) -> Result<ChannelId, Error> {
         self.channel_open_generic(b"auth-agent@openssh.com", |_| Ok(()))
     }
 
@@ -4921,7 +4925,7 @@ impl Session {
     /// Requests that the client forward connections to the given host and port.
     /// See [RFC4254](https://tools.ietf.org/html/rfc4254#section-7). The client
     /// will open forwarded_tcpip channels for each connection.
-    pub fn tcpip_forward(
+    pub(crate) fn tcpip_forward_apply(
         &mut self,
         address: &str,
         port: u32,
@@ -4946,7 +4950,7 @@ impl Session {
     }
 
     /// Cancels a previously tcpip_forward request.
-    pub fn cancel_tcpip_forward(
+    pub(crate) fn cancel_tcpip_forward_apply(
         &mut self,
         address: &str,
         port: u32,
@@ -4979,7 +4983,7 @@ impl Session {
     /// > characters and the minus sign (-).
     ///
     /// So it usually is fine to convert it to a [`String`] using [`String::from_utf8_lossy`]
-    pub fn remote_sshid(&self) -> &[u8] {
+    pub(crate) fn remote_sshid_apply(&self) -> &[u8] {
         &self.common.remote_sshid
     }
 
