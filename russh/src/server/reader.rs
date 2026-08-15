@@ -17,6 +17,7 @@
 //! is received only at a packet boundary after NEWKEYS, never selected
 //! against an in-flight read.
 
+use std::collections::HashSet;
 use std::num::Wrapping;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -522,6 +523,23 @@ impl ReaderHandle {
 
     pub fn pop_any(&self) -> Option<(ChannelId, LaneItem)> {
         self.lanes.lock().ok().and_then(|mut g| g.pop_any())
+    }
+
+    pub fn pop_any_except(&self, skip: &HashSet<ChannelId>) -> Option<(ChannelId, LaneItem)> {
+        self.lanes
+            .lock()
+            .ok()
+            .and_then(|mut g| g.pop_any_except(skip))
+    }
+
+    pub fn pop_any_non_payload_except(
+        &self,
+        skip: &HashSet<ChannelId>,
+    ) -> Option<(ChannelId, LaneItem)> {
+        self.lanes
+            .lock()
+            .ok()
+            .and_then(|mut g| g.pop_any_non_payload_except(skip))
     }
 
     pub fn has_ready(&self) -> bool {

@@ -192,6 +192,10 @@ pub enum Error {
     #[error("Handshake timeout (supervisor)")]
     HandshakeTimeout,
 
+    /// Per-queue want-reply obligation cap exceeded (protocol abuse).
+    #[error("Too many pending want-reply obligations")]
+    ReplyObligationOverflow,
+
     /// Missing authentication method.
     #[error("No authentication method")]
     NoAuthMethod,
@@ -577,6 +581,80 @@ impl ChannelCtrlItem {
     }
 }
 
+/// Per-scope want-reply obligations. Emit only decided heads so a later
+/// FAILURE cannot overtake an earlier pending SUCCESS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyVerdict {
+    Pending,
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplyObligation {
+    pub(crate) verdict: ReplyVerdict,
+    pub(crate) extra_port: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReplyQueue {
+    items: std::collections::VecDeque<ReplyObligation>,
+}
+
+impl ReplyQueue {
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn enqueue_pending(&mut self) {
+        self.items.push_back(ReplyObligation {
+            verdict: ReplyVerdict::Pending,
+            extra_port: None,
+        });
+    }
+
+    pub(crate) fn decide_last_if_pending(&mut self, success: bool, extra: Option<u32>) -> bool {
+        if let Some(o) = self.items.back_mut() {
+            if o.verdict == ReplyVerdict::Pending {
+                o.verdict = if success {
+                    ReplyVerdict::Success
+                } else {
+                    ReplyVerdict::Failure
+                };
+                o.extra_port = extra;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn decide_oldest_pending(&mut self, success: bool, extra: Option<u32>) -> bool {
+        for o in &mut self.items {
+            if o.verdict == ReplyVerdict::Pending {
+                o.verdict = if success {
+                    ReplyVerdict::Success
+                } else {
+                    ReplyVerdict::Failure
+                };
+                o.extra_port = extra;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn pop_ready(&mut self) -> Option<ReplyObligation> {
+        match self.items.front() {
+            Some(o) if o.verdict != ReplyVerdict::Pending => self.items.pop_front(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.items.clear();
+    }
+}
+
 /// The parameters of a channel.
 #[derive(Debug)]
 pub(crate) struct ChannelParams {
@@ -590,6 +668,10 @@ pub(crate) struct ChannelParams {
     pub confirmed: bool,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) wants_reply: bool,
+    /// Outstanding want-reply CHANNEL_REQUESTs (S4b). A bool is not
+    /// enough once Session posts Invokes without waiting: several
+    /// REQUESTs can be parsed before the first SUCCESS is applied.
+    pub(crate) want_reply_count: u32,
     /// (buffer, extended stream #, data offset in buffer)
     pub(crate) pending_data: std::collections::VecDeque<(bytes::Bytes, Option<u32>, usize)>,
     /// EOF has been submitted. Sticky after the fence is emitted so
@@ -611,6 +693,8 @@ pub(crate) struct ChannelParams {
     /// Submission sequence parallel to `pending_data`.
     data_seqs: std::collections::VecDeque<u64>,
     pending_ctrl: std::collections::VecDeque<(u64, ChannelCtrlItem)>,
+    /// RFC 4254 §5.4 want-reply FIFO. Lifetime = this channel.
+    pub(crate) reply_queue: ReplyQueue,
 }
 
 impl ChannelParams {
@@ -633,6 +717,7 @@ impl ChannelParams {
             sender_maximum_packet_size,
             confirmed,
             wants_reply: false,
+            want_reply_count: 0,
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
             pending_close: false,
@@ -642,6 +727,7 @@ impl ChannelParams {
             next_seq: 0,
             data_seqs: std::collections::VecDeque::new(),
             pending_ctrl: std::collections::VecDeque::new(),
+            reply_queue: ReplyQueue::default(),
         }
     }
 

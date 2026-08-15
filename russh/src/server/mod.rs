@@ -58,7 +58,10 @@ use crate::*;
 mod kex;
 mod session;
 mod session_facade;
+pub(crate) mod executor;
 pub use self::session::*;
+#[cfg(feature = "_test_hooks")]
+pub use self::executor::{HandleObserveSlot, HandlerObserveSlot};
 mod encrypted;
 pub mod supervisor;
 pub mod writer;
@@ -262,6 +265,10 @@ pub struct Config {
     /// Session skips pumping Reader lanes (S3b Q6 fill).
     #[cfg(feature = "_test_hooks")]
     pub lane_pump_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: sleep after each REQUEST pop so a live producer can
+    /// keep the lane non-empty (H21). Production is always `None`.
+    #[cfg(feature = "_test_hooks")]
+    pub lane_request_pop_delay: Option<std::time::Duration>,
     #[cfg(feature = "_test_hooks")]
     pub inject_zero_data: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// After the next real DATA, flood the lane until Overflow (Q5).
@@ -280,6 +287,29 @@ pub struct Config {
     /// Test-only: inject the in-flight ADJUST aggregation board.
     #[cfg(feature = "_test_hooks")]
     pub peer_credit: Option<std::sync::Arc<inbound_lane::PeerCreditBoard>>,
+    /// Per-callback timeout for HandlerExecutor (S4b). Default 30s.
+    pub handler_callback_timeout: std::time::Duration,
+    /// Invoke queue depth (1 running + queued). Default 32.
+    pub max_in_flight_handler_queue: usize,
+    /// Cap on pending want-reply obligations per queue (one global
+    /// queue, one per channel). Exceeding it is protocol abuse and
+    /// tears the connection down. Default 4096.
+    pub max_pending_want_replies: usize,
+    /// Test-only: Handle event-queue occupancy / parked sender (H9).
+    #[cfg(feature = "_test_hooks")]
+    pub handle_observe: Option<std::sync::Arc<executor::HandleObserveSlot>>,
+    /// Test-only: Handler::data call count / timeout linger / dropped Invokes.
+    #[cfg(feature = "_test_hooks")]
+    pub handler_observe: Option<std::sync::Arc<executor::HandlerObserveSlot>>,
+    /// Test-only H1 invert: Delivered DATA also calls Handler::data and waits.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_delivered_handler_data: bool,
+    /// Test-only H4 invert: skip facade drain while a callback is in-flight.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_facade_drain: bool,
+    /// Test-only: Session does not recv ctrl (w7 used to pin the loop in Handler::data).
+    #[cfg(feature = "_test_hooks")]
+    pub hold_session_ctrl: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for Config {
@@ -387,6 +417,8 @@ impl Default for Config {
             #[cfg(feature = "_test_hooks")]
             lane_pump_hold: None,
             #[cfg(feature = "_test_hooks")]
+            lane_request_pop_delay: None,
+            #[cfg(feature = "_test_hooks")]
             inject_zero_data: None,
             #[cfg(feature = "_test_hooks")]
             inject_until_overflow: None,
@@ -398,6 +430,19 @@ impl Default for Config {
             invert_grant_order: false,
             #[cfg(feature = "_test_hooks")]
             peer_credit: None,
+            handler_callback_timeout: crate::server::executor::DEFAULT_HANDLER_TIMEOUT,
+            max_in_flight_handler_queue: crate::server::executor::DEFAULT_HANDLER_QUEUE,
+            max_pending_want_replies: crate::server::executor::DEFAULT_MAX_PENDING_WANT_REPLIES,
+            #[cfg(feature = "_test_hooks")]
+            handle_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            handler_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_delivered_handler_data: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_facade_drain: false,
+            #[cfg(feature = "_test_hooks")]
+            hold_session_ctrl: None,
         }
     }
 }
@@ -426,6 +471,9 @@ impl Debug for Config {
             .field("inactivity_timeout", &self.inactivity_timeout)
             .field("keepalive_interval", &self.keepalive_interval)
             .field("keepalive_max", &self.keepalive_max)
+            .field("handler_callback_timeout", &self.handler_callback_timeout)
+            .field("max_in_flight_handler_queue", &self.max_in_flight_handler_queue)
+            .field("max_pending_want_replies", &self.max_pending_want_replies)
             .finish()
     }
 }
@@ -1356,6 +1404,8 @@ where
     let handle = server::session::Handle {
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        #[cfg(feature = "_test_hooks")]
+        observe: config.handle_observe.clone(),
     };
 
     let common = match tokio::time::timeout_at(
@@ -1400,6 +1450,15 @@ where
         sched_next: None,
         sched_since_boost: crate::BOOST_PERIOD,
         sched_debt: None,
+        facade_cmd_tx: None,
+        facade_cmd_rx: None,
+        executor: None,
+        next_invoke_gen: 0,
+        pending_harvest: HashMap::new(),
+        facade_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        pending_open_ids: std::collections::HashSet::new(),
+        global_replies: crate::ReplyQueue::default(),
     };
 
     session.begin_rekey()?;
@@ -1441,7 +1500,7 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
 
 async fn reply<H: Handler + Send>(
     session: &mut Session,
-    handler: &mut H,
+    mut handler: Option<&mut H>,
     pkt: &mut IncomingSshPacket,
 ) -> Result<(), H::Error> {
     if let Some(message_type) = pkt.buffer.first() {
@@ -1484,7 +1543,7 @@ async fn reply<H: Handler + Send>(
         if let SessionKexState::InProgress(mut kex) = session.kex.take() {
             // Collect plaintext; seal via Writer (or atomic batch+install at NEWKEYS).
             let mut coll = crate::sshbuffer::PayloadCollector::default();
-            let progress = kex.step(Some(pkt), &mut coll, handler).await?;
+            let progress = kex.step(Some(pkt), &mut coll, session, handler.as_mut().map(|h| &mut **h)).await?;
             let payloads = std::mem::take(&mut coll.payloads);
 
             match progress {

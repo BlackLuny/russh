@@ -207,7 +207,8 @@ impl ServerKex {
         mut self,
         input: Option<&mut IncomingSshPacket>,
         output: &mut impl crate::sshbuffer::PacketOut,
-        handler: &mut H,
+        session: &mut Session,
+        handler: Option<&mut H>,
     ) -> Result<KexProgress<Self>, H::Error> {
         match self.state {
             ServerKexState::Created => {
@@ -292,7 +293,7 @@ impl ServerKex {
                 ensure_end(&r)?;
                 debug!("client requests a gex group: {gex_params:?}");
 
-                let Some(dh_group) = handler.lookup_dh_gex_group(&gex_params).await? else {
+                let Some(dh_group) = session.dispatch_lookup_gex(handler, &gex_params).await? else {
                     debug!(
                         "server::Handler impl did not find a matching DH group (is lookup_dh_gex_group implemented?)"
                     );

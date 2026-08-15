@@ -1,29 +1,87 @@
-//! S4a G5 facade skin: public `Session` methods forward 1:1 into `*_apply`.
-//!
-//! S4b replaces these bodies with command-queue sends. Do not change
-//! signatures. Do not move field layout or `*_apply` implementations here.
+//! G5 facade skin. Handshake / SessionTask (`facade_cmd_tx == None`) still
+//! forward 1:1 into `*_apply`. After the auth barrier the Executor-side proxy
+//! (`facade_cmd_tx == Some`) sends a bounded command + waits the oneshot so
+//! the method returns only after SessionTask has run the same `*_apply` body
+//! (scheme 2). Queue full → `Err` (never park on enqueue). `accept`/`reject`
+//! do not enter this queue.
 
 use tokio::sync::oneshot;
 
+use super::executor::{facade_try_send, wait_facade_oneshot, FacadeCmd};
 use super::session::{Handle, Session};
 use super::Config;
 use crate::{ChannelId, Disconnect, Error, Sig};
 
 impl Session {
+    fn push_facade(&self, cmd: FacadeCmd) -> Result<(), Error> {
+        let tx = self.facade_cmd_tx.as_ref().ok_or(Error::SendError)?;
+        facade_try_send(tx, cmd)?;
+        self.facade_notify.notify_waiters();
+        Ok(())
+    }
+
+    fn facade_ok(&self, cmd: FacadeCmd, rx: oneshot::Receiver<Result<(), Error>>) -> Result<(), Error> {
+        self.push_facade(cmd)?;
+        wait_facade_oneshot(rx)?
+    }
+
     /// Get a handle to this session.
     pub fn handle(&self) -> Handle {
         self.handle_apply()
     }
 
     pub fn writable_packet_size(&self, channel: &ChannelId) -> u32 {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            if self
+                .push_facade(FacadeCmd::WritablePacketSize {
+                    channel: *channel,
+                    reply: r,
+                })
+                .is_err()
+            {
+                return 0;
+            }
+            return wait_facade_oneshot(rx).unwrap_or(0);
+        }
         self.writable_packet_size_apply(channel)
     }
 
     pub fn window_size(&self, channel: &ChannelId) -> u32 {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            if self.push_facade(
+
+                FacadeCmd::WindowSize {
+                    channel: *channel,
+                    reply: r,
+                },
+            )
+            .is_err()
+            {
+                return 0;
+            }
+            return wait_facade_oneshot(rx).unwrap_or(0);
+        }
         self.window_size_apply(channel)
     }
 
     pub fn max_packet_size(&self, channel: &ChannelId) -> u32 {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            if self.push_facade(
+
+                FacadeCmd::MaxPacketSize {
+                    channel: *channel,
+                    reply: r,
+                },
+            )
+            .is_err()
+            {
+                return 0;
+            }
+            return wait_facade_oneshot(rx).unwrap_or(0);
+        }
         self.max_packet_size_apply(channel)
     }
 
@@ -33,24 +91,58 @@ impl Session {
     /// Always retries [`pending_outbound`] first; never lets a newer `enc.write`
     /// bulk leapfrog older parked cmds (incl. compress barrier).
     pub fn flush(&mut self) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(FacadeCmd::Flush { reply: r }, rx);
+        }
         self.flush_apply()
     }
 
     pub fn flush_pending(&mut self, channel: ChannelId) -> Result<usize, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(FacadeCmd::FlushPending { channel, reply: r })?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.flush_pending_apply(channel)
     }
 
     /// Emit head-of-lane fences only (no DATA). Used so EOF/CLOSE/SUCCESS
     /// are not locked by a zero window, without dumping DATA past HWM.
     pub fn flush_pending_fences(&mut self, channel: ChannelId) -> Result<usize, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(FacadeCmd::FlushPendingFences { channel, reply: r })?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.flush_pending_fences_apply(channel)
     }
 
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            if self
+                .push_facade(FacadeCmd::SenderWindowSize { channel, reply: r })
+                .is_err()
+            {
+                return 0;
+            }
+            return wait_facade_oneshot(rx).unwrap_or(0);
+        }
         self.sender_window_size_apply(channel)
     }
 
     pub fn has_pending_data(&self, channel: ChannelId) -> bool {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            if self
+                .push_facade(FacadeCmd::HasPendingData { channel, reply: r })
+                .is_err()
+            {
+                return false;
+            }
+            return wait_facade_oneshot(rx).unwrap_or(false);
+        }
         self.has_pending_data_apply(channel)
     }
 
@@ -66,6 +158,18 @@ impl Session {
         description: &str,
         language_tag: &str,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::Disconnect {
+                    reason,
+                    description: description.to_string(),
+                    language_tag: language_tag.to_string(),
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.disconnect_apply(reason, description, language_tag)
     }
 
@@ -93,6 +197,18 @@ impl Session {
         message: &str,
         language_tag: &str,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::Debug {
+                    always_display,
+                    message: message.to_string(),
+                    language_tag: language_tag.to_string(),
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.debug_apply(always_display, message, language_tag)
     }
 
@@ -101,11 +217,21 @@ impl Session {
     /// cancelling). Always call this function if the request was
     /// successful (it checks whether the client expects an answer).
     pub fn request_success(&mut self) {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            let _ = self.facade_ok(FacadeCmd::RequestSuccess { reply: r }, rx);
+            return;
+        }
         self.request_success_apply()
     }
 
     /// Send a "failure" reply to a global request.
     pub fn request_failure(&mut self) {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            let _ = self.facade_ok(FacadeCmd::RequestFailure { reply: r }, rx);
+            return;
+        }
         self.request_failure_apply()
     }
 
@@ -113,11 +239,19 @@ impl Session {
     /// function if the request was successful (it checks whether the
     /// client expects an answer).
     pub fn channel_success(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(FacadeCmd::ChannelSuccess { channel, reply: r }, rx);
+        }
         self.channel_success_apply(channel)
     }
 
     /// Send a "failure" reply to a channel request.
     pub fn channel_failure(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(FacadeCmd::ChannelFailure { channel, reply: r }, rx);
+        }
         self.channel_failure_apply(channel)
     }
 
@@ -129,16 +263,37 @@ impl Session {
         description: &str,
         language: &str,
     ) -> Result<(), crate::Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::ChannelOpenFailure {
+                    channel,
+                    reason,
+                    description: description.to_string(),
+                    language: language.to_string(),
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.channel_open_failure_apply(channel, reason, description, language)
     }
 
     /// Close a channel.
     pub fn close(&mut self, channel: ChannelId) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(FacadeCmd::Close { channel, reply: r }, rx);
+        }
         self.close_apply(channel)
     }
 
     /// Send EOF to a channel
     pub fn eof(&mut self, channel: ChannelId) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(FacadeCmd::Eof { channel, reply: r }, rx);
+        }
         self.eof_apply(channel)
     }
 
@@ -149,6 +304,17 @@ impl Session {
     /// The number of bytes added to the "sending pipeline" (to be
     /// processed by the event loop) is returned.
     pub fn data(&mut self, channel: ChannelId, data: impl Into<bytes::Bytes>) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::Data {
+                    channel,
+                    data: data.into(),
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.data_apply(channel, data)
     }
 
@@ -164,6 +330,18 @@ impl Session {
         extended: u32,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::ExtendedData {
+                    channel,
+                    ext: extended,
+                    data: data.into(),
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.extended_data_apply(channel, extended, data)
     }
 
@@ -175,16 +353,41 @@ impl Session {
         channel: ChannelId,
         client_can_do: bool,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::XonXoff {
+                    channel,
+                    client_can_do,
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.xon_xoff_request_apply(channel, client_can_do)
     }
 
     /// Ping the client to verify there is still connectivity.
     pub fn keepalive_request(&mut self) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(FacadeCmd::Keepalive { reply: r }, rx);
+        }
         self.keepalive_request_apply()
     }
 
     /// Ping the client with a Keepalive and get a notification when the client responds.
     pub fn send_ping(&mut self, reply_channel: oneshot::Sender<()>) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::SendPing {
+                    reply_channel,
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.send_ping_apply(reply_channel)
     }
 
@@ -194,6 +397,17 @@ impl Session {
         channel: ChannelId,
         exit_status: u32,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::ExitStatus {
+                    channel,
+                    exit_status,
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.exit_status_request_apply(channel, exit_status)
     }
 
@@ -206,11 +420,30 @@ impl Session {
         error_message: &str,
         language_tag: &str,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            return self.facade_ok(
+                FacadeCmd::ExitSignal {
+                    channel,
+                    signal,
+                    core_dumped,
+                    error_message: error_message.to_string(),
+                    language_tag: language_tag.to_string(),
+                    reply: r,
+                },
+                rx,
+            );
+        }
         self.exit_signal_request_apply(channel, signal, core_dumped, error_message, language_tag)
     }
 
     /// Opens a new session channel on the client.
     pub fn channel_open_session(&mut self) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(FacadeCmd::ChannelOpenSession { reply: r })?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_session_apply()
     }
 
@@ -222,6 +455,20 @@ impl Session {
         originator_address: &str,
         originator_port: u32,
     ) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::ChannelOpenDirectTcpip {
+                    host_to_connect: host_to_connect.to_string(),
+                    port_to_connect,
+                    originator_address: originator_address.to_string(),
+                    originator_port,
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_direct_tcpip_apply(
             host_to_connect,
             port_to_connect,
@@ -235,6 +482,17 @@ impl Session {
         &mut self,
         socket_path: &str,
     ) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::ChannelOpenDirectStreamlocal {
+                    socket_path: socket_path.to_string(),
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_direct_streamlocal_apply(socket_path)
     }
 
@@ -250,6 +508,20 @@ impl Session {
         originator_address: &str,
         originator_port: u32,
     ) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::ChannelOpenForwardedTcpip {
+                    connected_address: connected_address.to_string(),
+                    connected_port,
+                    originator_address: originator_address.to_string(),
+                    originator_port,
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_forwarded_tcpip_apply(
             connected_address,
             connected_port,
@@ -262,6 +534,17 @@ impl Session {
         &mut self,
         socket_path: &str,
     ) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::ChannelOpenForwardedStreamlocal {
+                    socket_path: socket_path.to_string(),
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_forwarded_streamlocal_apply(socket_path)
     }
 
@@ -274,11 +557,28 @@ impl Session {
         originator_address: &str,
         originator_port: u32,
     ) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::ChannelOpenX11 {
+                    originator_address: originator_address.to_string(),
+                    originator_port,
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_x11_apply(originator_address, originator_port)
     }
 
     /// Opens a new agent channel on the client.
     pub fn channel_open_agent(&mut self) -> Result<ChannelId, Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(FacadeCmd::ChannelOpenAgent { reply: r })?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.channel_open_agent_apply()
     }
 
@@ -291,6 +591,19 @@ impl Session {
         port: u32,
         reply_channel: Option<oneshot::Sender<Option<u32>>>,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::TcpipForward {
+                    address: address.to_string(),
+                    port,
+                    reply_channel,
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.tcpip_forward_apply(address, port, reply_channel)
     }
 
@@ -301,6 +614,19 @@ impl Session {
         port: u32,
         reply_channel: Option<oneshot::Sender<bool>>,
     ) -> Result<(), Error> {
+        if self.facade_cmd_tx.is_some() {
+            let (r, rx) = oneshot::channel();
+            self.push_facade(
+
+                FacadeCmd::CancelTcpipForward {
+                    address: address.to_string(),
+                    port,
+                    reply_channel,
+                    reply: r,
+                },
+            )?;
+            return wait_facade_oneshot(rx)?;
+        }
         self.cancel_tcpip_forward_apply(address, port, reply_channel)
     }
 

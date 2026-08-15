@@ -4,7 +4,7 @@
 //! `pending_bytes` are mutually exclusive: Session pops an item, then
 //! `deliver_inbound`. Grant `undelivered` must sum both.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 #[cfg(feature = "_test_hooks")]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -125,6 +125,13 @@ impl ChannelLane {
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    fn head_is_payload_data(&self) -> bool {
+        matches!(
+            self.items.front(),
+            Some(LaneItem::Data(_)) | Some(LaneItem::ExtendedData { .. })
+        )
     }
 
     pub fn window_remaining(&self) -> u32 {
@@ -278,7 +285,40 @@ impl LaneTable {
     }
 
     pub fn pop_any(&mut self) -> Option<(ChannelId, LaneItem)> {
-        let id = self.lanes.iter().find(|(_, l)| !l.is_empty()).map(|(id, _)| *id)?;
+        self.pop_any_except(&HashSet::new())
+    }
+
+    /// Like [`pop_any`], but do not pop **DATA/EXT** from `hold` lanes
+    /// (OPEN callback still holds `Channel`). REQUEST/EOF/CLOSE stay
+    /// FIFO-poppable: a data head on a held lane blocks that lane only.
+    pub fn pop_any_except(&mut self, hold: &HashSet<ChannelId>) -> Option<(ChannelId, LaneItem)> {
+        let id = self
+            .lanes
+            .iter()
+            .find(|(id, l)| {
+                !l.is_empty() && !(hold.contains(id) && l.head_is_payload_data())
+            })
+            .map(|(id, _)| *id)?;
+        let item = self.lanes.get_mut(&id)?.pop()?;
+        Some((id, item))
+    }
+
+    /// Pop REQUEST/EOF/CLOSE/SUCCESS/FAILURE only. Used when the
+    /// Executor is full so want-reply can still be decided (Full →
+    /// FAILURE) without taking DATA off the lane.
+    pub fn pop_any_non_payload_except(
+        &mut self,
+        hold: &HashSet<ChannelId>,
+    ) -> Option<(ChannelId, LaneItem)> {
+        let id = self
+            .lanes
+            .iter()
+            .find(|(id, l)| {
+                !l.is_empty()
+                    && !l.head_is_payload_data()
+                    && !(hold.contains(id) && l.head_is_payload_data())
+            })
+            .map(|(id, _)| *id)?;
         let item = self.lanes.get_mut(&id)?.pop()?;
         Some((id, item))
     }
@@ -427,6 +467,10 @@ pub struct LaneObserveSlot {
     last_scheme: std::sync::atomic::AtomicUsize,
     /// Seen both lane and Scheme C occupancy for the same snapshot (Q8).
     overlap: AtomicU64,
+    /// Q2: a DATA pop happened before a REQUEST pop (same Session pump era).
+    data_pops: AtomicU64,
+    request_pops: AtomicU64,
+    data_before_request: AtomicU64,
 }
 
 #[cfg(feature = "_test_hooks")]
@@ -486,6 +530,18 @@ impl LaneObserveSlot {
     }
     pub fn note_overlap(&self) {
         self.overlap.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn note_pop_data(&self) {
+        self.data_pops.fetch_add(1, Ordering::SeqCst);
+        if self.request_pops.load(Ordering::SeqCst) == 0 {
+            self.data_before_request.store(1, Ordering::SeqCst);
+        }
+    }
+    pub fn note_pop_request(&self) {
+        self.request_pops.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn data_before_request(&self) -> bool {
+        self.data_before_request.load(Ordering::SeqCst) != 0
     }
     pub fn overlap(&self) -> u64 {
         self.overlap.load(Ordering::SeqCst)

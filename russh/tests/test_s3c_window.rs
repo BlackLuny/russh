@@ -848,11 +848,13 @@ async fn w6_unknown_id_flood_board_bounded() -> Result<(), anyhow::Error> {
     let rec = Rec::default();
     let wobs = WindowObserveSlot::new();
     let board = PeerCreditBoard::new();
+    let hold_ctrl = Arc::new(AtomicBool::new(false));
     let mut cfg = base_cfg();
     cfg.window_size = 256;
     cfg.maximum_packet_size = 64;
     cfg.window_observe = Some(wobs.clone());
     cfg.peer_credit = Some(board.clone());
+    cfg.hold_session_ctrl = Some(hold_ctrl.clone());
     let addr = spawn_rec(rec.clone(), cfg, 0).await;
     let mut ccfg = default_client_config();
     ccfg.window_size = 64 * 1024;
@@ -868,6 +870,7 @@ async fn w6_unknown_id_flood_board_bounded() -> Result<(), anyhow::Error> {
 
     rec.data_hold.store(true, Ordering::SeqCst);
     rec.in_data.store(false, Ordering::SeqCst);
+    hold_ctrl.store(true, Ordering::SeqCst);
     victim.data_bytes(vec![9u8; 8]).await?;
     wait_for("session inside Handler::data", Duration::from_secs(4), || {
         rec.in_data.load(Ordering::SeqCst)
@@ -909,6 +912,7 @@ async fn w6_unknown_id_flood_board_bounded() -> Result<(), anyhow::Error> {
     .await?;
     assert_eq!(wobs.unknown_adjust(), 3000);
     rec.data_hold.store(false, Ordering::SeqCst);
+    hold_ctrl.store(false, Ordering::SeqCst);
     // Loop-top must apply known credit before CLOSE teardown, otherwise
     // the established gate would drop the board entry without callback.
     wait_for("known credit applied", Duration::from_secs(4), || {
@@ -1048,6 +1052,7 @@ async fn w7_server_open_confirmation_then_adjust_credits() -> Result<(), anyhow:
     let robs = ReaderObserveSlot::new();
     let read_hold = ReadHoldGate::new();
     let cause = DisconnectCauseSlot::new();
+    let hold_ctrl = Arc::new(AtomicBool::new(false));
     let mut cfg = base_cfg();
     cfg.window_size = 256;
     cfg.maximum_packet_size = 64;
@@ -1055,6 +1060,7 @@ async fn w7_server_open_confirmation_then_adjust_credits() -> Result<(), anyhow:
     cfg.reader_observe = Some(robs.clone());
     cfg.reader_read_hold = Some(read_hold.clone());
     cfg.disconnect_cause_slot = Some(cause.clone());
+    cfg.hold_session_ctrl = Some(hold_ctrl.clone());
     let addr = spawn_rec(rec.clone(), cfg, 0).await;
 
     let mut ccfg = default_client_config();
@@ -1081,6 +1087,7 @@ async fn w7_server_open_confirmation_then_adjust_credits() -> Result<(), anyhow:
     // the test would miss the R3-P1-1 board-drop.
     rec.in_data.store(false, Ordering::SeqCst);
     rec.data_hold.store(true, Ordering::SeqCst);
+    hold_ctrl.store(true, Ordering::SeqCst);
     dummy.data_bytes(vec![2u8; 1]).await?;
     wait_for("session inside Handler::data", Duration::from_secs(4), || {
         rec.in_data.load(Ordering::SeqCst)
@@ -1113,6 +1120,7 @@ async fn w7_server_open_confirmation_then_adjust_credits() -> Result<(), anyhow:
     })
     .await?;
     rec.data_hold.store(false, Ordering::SeqCst);
+    hold_ctrl.store(false, Ordering::SeqCst);
 
     let mut got = 0u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(4);

@@ -26,6 +26,10 @@ pub enum DisconnectCause {
     PeerError = 4,
     /// Explicit local disconnect / clean shutdown.
     LocalShutdown = 5,
+    /// HandlerExecutor invoke queue Closed (task gone). Not a PeerError.
+    HandlerExecutorGone = 6,
+    /// A want-reply obligation queue exceeded `max_pending_want_replies`.
+    ReplyObligationOverflow = 7,
 }
 
 impl DisconnectCause {
@@ -36,6 +40,8 @@ impl DisconnectCause {
             3 => Some(Self::HandshakeTimeout),
             4 => Some(Self::PeerError),
             5 => Some(Self::LocalShutdown),
+            6 => Some(Self::HandlerExecutorGone),
+            7 => Some(Self::ReplyObligationOverflow),
             _ => None,
         }
     }
@@ -925,6 +931,7 @@ impl OutboundOrderSlot {
 pub struct ReplyQueueSlot {
     current: AtomicUsize,
     max: AtomicUsize,
+    obligations: AtomicUsize,
 }
 
 #[cfg(feature = "_test_hooks")]
@@ -944,6 +951,14 @@ impl ReplyQueueSlot {
 
     pub fn max(&self) -> usize {
         self.max.load(Ordering::SeqCst)
+    }
+
+    pub fn observe_obligations(&self, n: usize) {
+        self.obligations.store(n, Ordering::SeqCst);
+    }
+
+    pub fn obligations(&self) -> usize {
+        self.obligations.load(Ordering::SeqCst)
     }
 }
 

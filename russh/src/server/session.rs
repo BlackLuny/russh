@@ -31,7 +31,7 @@ use crate::server::reader::{
 use crate::server::reader::ReaderHooks;
 use crate::server::writer::{stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
-use crate::{ChannelOpenFailure, map_err, msg};
+use crate::{ChannelOpenFailure, ReplyQueue, ReplyVerdict, map_err, msg};
 
 
 /// A connected server session. This type is unique to a client.
@@ -107,6 +107,25 @@ pub struct Session {
     pub(crate) sched_since_boost: u32,
     /// Fairness debt: skip this channel in the regular quantum after a boost.
     pub(crate) sched_debt: Option<ChannelId>,
+    /// Some = this `Session` is an Executor-side facade proxy (scheme 2).
+    pub(crate) facade_cmd_tx: Option<tokio::sync::mpsc::Sender<crate::server::executor::FacadeCmd>>,
+    /// SessionTask-side facade command receiver (None on the proxy).
+    pub(crate) facade_cmd_rx: Option<tokio::sync::mpsc::Receiver<crate::server::executor::FacadeCmd>>,
+    /// Live HandlerExecutor (SessionTask). JoinHandle stays in `run()`.
+    pub(crate) executor: Option<crate::server::executor::HandlerExecutor>,
+    pub(crate) next_invoke_gen: u64,
+    pub(crate) pending_harvest:
+        std::collections::HashMap<u64, crate::server::executor::PendingHarvest>,
+    /// Wakes SessionTask when the Executor-side proxy enqueues a facade cmd.
+    pub(crate) facade_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Wakes SessionTask when the Executor posts a Result.
+    pub(crate) result_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// CHANNEL_OPEN Invokes still in-flight. Those lanes are not pumped
+    /// until harvest so a handler that drops `Channel` still gets
+    /// `Handler::data` (ChannelGone), not Delivered-into-a-dropped-rx.
+    pub(crate) pending_open_ids: HashSet<ChannelId>,
+    /// RFC 4254 §4 want-reply FIFO (global).
+    pub(crate) global_replies: ReplyQueue,
 }
 
 /// Completion actions when **both** outbound InstallAck and peer-Done are satisfied.
@@ -444,6 +463,8 @@ pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
 pub struct Handle {
     pub(crate) sender: Sender<Msg>,
     pub(crate) channel_buffer_size: usize,
+    #[cfg(feature = "_test_hooks")]
+    pub(crate) observe: Option<std::sync::Arc<crate::server::executor::HandleObserveSlot>>,
 }
 
 impl Handle {
@@ -485,18 +506,44 @@ impl Handle {
         data: bytes::Bytes,
     ) -> Result<(), bytes::Bytes> {
         let (ack, acked) = oneshot::channel();
-        self.sender
+        #[cfg(feature = "_test_hooks")]
+        let parked = {
+            let cap = self.sender.capacity();
+            if let Some(ref o) = self.observe {
+                let occ = self.sender.max_capacity().saturating_sub(cap);
+                o.note_occupancy(occ);
+                if cap == 0 {
+                    o.note_full();
+                    o.park_inc();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        let send_res = self
+            .sender
             .send(Msg::ChannelDataAcked {
                 id,
                 ext,
                 data,
                 ack,
             })
-            .await
-            .map_err(|e| match e.0 {
-                Msg::ChannelDataAcked { data, .. } => data,
-                _ => unreachable!(),
-            })?;
+            .await;
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref o) = self.observe {
+            if parked {
+                o.park_dec();
+            }
+            let cap = self.sender.capacity();
+            o.note_occupancy(self.sender.max_capacity().saturating_sub(cap));
+        }
+        send_res.map_err(|e| match e.0 {
+            Msg::ChannelDataAcked { data, .. } => data,
+            _ => unreachable!(),
+        })?;
         // Resolves when the bytes reach the peer's window; errors if the channel was torn down
         // first, in which case the payload is already owned by the session and cannot be handed
         // back.
@@ -850,12 +897,18 @@ impl Session {
         }
     }
 
+    /// Items popped per `pump_reader_lanes` call. Hitting this returns
+    /// to the outer loop so facade/result can drain; loop-top pumps
+    /// again if the quantum was exhausted.
+    const LANE_PUMP_QUANTUM: usize = 64;
+
     /// Pop Reader lanes into `deliver_inbound` / REQUEST dispatch. One
     /// `InboundItem` is moved — never memcpy'd into Scheme C.
+    /// Returns `true` when the quantum was exhausted (more work may remain).
     async fn pump_reader_lanes<H: Handler + Send>(
         &mut self,
-        handler: &mut H,
-    ) -> Result<(), H::Error> {
+        mut handler: Option<&mut H>,
+    ) -> Result<bool, H::Error> {
         #[cfg(feature = "_test_hooks")]
         if self
             .common
@@ -873,62 +926,109 @@ impl Session {
                 o.set_occ(lane, count);
                 o.note_split(lane, scheme);
             }
-            return Ok(());
+            return Ok(false);
         }
+        let mut popped = 0usize;
         loop {
+            if popped >= Self::LANE_PUMP_QUANTUM {
+                return Ok(true);
+            }
             let Some(reader) = self.reader.clone() else {
                 break;
             };
-            let Some((id, item)) = reader.pop_any() else {
+            let Some((id, item)) = (if self.executor_full() {
+                reader.pop_any_non_payload_except(&self.pending_open_ids)
+            } else {
+                reader.pop_any_except(&self.pending_open_ids)
+            }) else {
                 break;
             };
+            popped += 1;
             match item {
                 LaneItem::Data(data) => {
                     // Window already consumed at Reader receive (single ledger).
-                    self.dispatch_lane_payload(id, InboundItem::Data(data), handler)
-                        .await?;
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(o) = self.common.config.lane_observe.as_ref() {
+                        o.note_pop_data();
+                    }
+                    self.dispatch_lane_payload(
+                        id,
+                        InboundItem::Data(data),
+                        handler.as_mut().map(|h| &mut **h),
+                    )
+                    .await?;
                 }
                 LaneItem::ExtendedData { ext, data } => {
                     self.dispatch_lane_payload(
                         id,
                         InboundItem::ExtendedData { ext, data },
-                        handler,
+                        handler.as_mut().map(|h| &mut **h),
                     )
                     .await?;
                 }
                 LaneItem::Eof => {
-                    self.dispatch_lane_payload(id, InboundItem::Eof, handler)
-                        .await?;
+                    self.dispatch_lane_payload(
+                        id,
+                        InboundItem::Eof,
+                        handler.as_mut().map(|h| &mut **h),
+                    )
+                    .await?;
                 }
                 LaneItem::Close => {
-                    self.dispatch_lane_payload(id, InboundItem::Close, handler)
-                        .await?;
+                    self.dispatch_lane_payload(
+                        id,
+                        InboundItem::Close,
+                        handler.as_mut().map(|h| &mut **h),
+                    )
+                    .await?;
                 }
                 LaneItem::Request { payload } => {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(o) = self.common.config.lane_observe.as_ref() {
+                        o.note_pop_request();
+                    }
                     let mut r = payload.as_ref();
-                    self.server_read_authenticated(handler, msg::CHANNEL_REQUEST, &mut r)
-                        .await?;
+                    self.server_read_authenticated(
+                        handler.as_mut().map(|h| &mut **h),
+                        msg::CHANNEL_REQUEST,
+                        &mut r,
+                    )
+                    .await?;
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(d) = self.common.config.lane_request_pop_delay {
+                        if !d.is_zero() {
+                            tokio::time::sleep(d).await;
+                        }
+                    }
                 }
                 LaneItem::Success { payload } => {
                     let mut r = payload.as_ref();
-                    self.server_read_authenticated(handler, msg::CHANNEL_SUCCESS, &mut r)
-                        .await?;
+                    self.server_read_authenticated(
+                        handler.as_mut().map(|h| &mut **h),
+                        msg::CHANNEL_SUCCESS,
+                        &mut r,
+                    )
+                    .await?;
                 }
                 LaneItem::Failure { payload } => {
                     let mut r = payload.as_ref();
-                    self.server_read_authenticated(handler, msg::CHANNEL_FAILURE, &mut r)
-                        .await?;
+                    self.server_read_authenticated(
+                        handler.as_mut().map(|h| &mut **h),
+                        msg::CHANNEL_FAILURE,
+                        &mut r,
+                    )
+                    .await?;
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn dispatch_lane_payload<H: Handler + Send>(
         &mut self,
         id: ChannelId,
         item: InboundItem,
-        handler: &mut H,
+        mut handler: Option<&mut H>,
     ) -> Result<(), H::Error> {
         let is_close = matches!(item, InboundItem::Close);
         let is_eof = matches!(item, InboundItem::Eof);
@@ -954,21 +1054,48 @@ impl Session {
                 self.discard_channel_outbound(id).map_err(|e| e.into())?;
             }
         }
-        match self.deliver_inbound(id, item) {
+        let delivery = self.deliver_inbound(id, item);
+        let delivered = matches!(delivery, InboundDelivery::Delivered);
+        let gone = matches!(delivery, InboundDelivery::ChannelGone);
+        match delivery {
             InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
                 if data.is_some() {
-                    self.maybe_grant_after_delivery(id, handler)?;
+                    self.maybe_grant_after_delivery(id, handler.as_mut().map(|h| &mut **h))
+                        .await?;
                 }
                 if let Some(d) = data {
-                    if let Some(ext) = ext {
-                        handler.extended_data(id, ext, &d, self).await?;
-                    } else {
-                        handler.data(id, &d, self).await?;
+                    let invert = {
+                        #[cfg(feature = "_test_hooks")]
+                        {
+                            self.common.config.invert_delivered_handler_data
+                        }
+                        #[cfg(not(feature = "_test_hooks"))]
+                        {
+                            false
+                        }
+                    };
+                    // Delivered DATA skips Handler::data (H1/H8). ChannelGone
+                    // (handler-mode) still posts. Invert restores the old
+                    // inline-wait so H1 goes red.
+                    #[cfg(feature = "_test_hooks")]
+                    if delivered && self.pending_kex_install.is_some() {
+                        if let Some(ref slot) = self.common.config.kex_install_observe {
+                            slot.mark_data_while_pending(d.len() as u64);
+                        }
+                    }
+                    let call_data = gone || (delivered && invert);
+                    if call_data {
+                        if let Some(ext) = ext {
+                            self.dispatch_extended_data(handler, id, ext, &d).await?;
+                        } else {
+                            self.dispatch_data(handler, id, &d, delivered && invert)
+                                .await?;
+                        }
                     }
                 } else if is_eof {
-                    handler.channel_eof(id, self).await?;
+                    self.dispatch_eof(handler, id).await?;
                 } else if is_close {
-                    handler.channel_close(id, self).await?;
+                    self.dispatch_close(handler, id).await?;
                     self.finalize_close(id);
                 }
             }
@@ -988,14 +1115,14 @@ impl Session {
     async fn handle_ctrl_msg<H: Handler + Send>(
         &mut self,
         msg: CtrlMsg,
-        handler: &mut H,
+        mut handler: Option<&mut H>,
     ) -> Result<bool, H::Error> {
         if let Some(r) = &self.reader {
             r.release_ctrl(msg.byte_len());
         }
         match msg {
             CtrlMsg::Packet(pkt) => {
-                Ok(self.handle_ctrl_packet(pkt, handler).await?)
+                Ok(self.handle_ctrl_packet(pkt, handler.as_mut().map(|h| &mut **h)).await?)
             }
             CtrlMsg::WireClose { id, .. } => {
                 let we_closed_first = self
@@ -1016,7 +1143,8 @@ impl Session {
                 // notification (peer CLOSE may never arrive). Notify
                 // before remove so CloseDropped sees channels gone.
                 if self.channels.contains_key(&id) {
-                    handler.channel_close(id, self).await?;
+                    self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
+                        .await?;
                 }
                 self.channels.remove(&id);
                 if let Some(r) = &self.reader {
@@ -1043,7 +1171,8 @@ impl Session {
                     }
                     return Ok(true);
                 }
-                handler.channel_close(id, self).await?;
+                self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
+                    .await?;
                 self.finalize_close(id);
                 Ok(true)
             }
@@ -1053,7 +1182,7 @@ impl Session {
     async fn handle_ctrl_packet<H: Handler + Send>(
         &mut self,
         mut pkt: crate::sshbuffer::IncomingSshPacket,
-        handler: &mut H,
+        handler: Option<&mut H>,
     ) -> Result<bool, H::Error> {
         match pkt.buffer.first() {
             None => Ok(true),
@@ -1112,12 +1241,12 @@ impl Session {
     /// buffer, grant window (I2) if it was payload, fire the item's handler callback **after**
     /// delivery (so a custom `Handler` never observes data before it reaches the channel buffer —
     /// matching the fast path), finalize a delivered `Close`, and re-arm the next reserve.
-    pub(crate) async fn pump_inbound<H: Handler>(
+    pub(crate) async fn pump_inbound<H: Handler + Send>(
         &mut self,
         id: ChannelId,
         generation: u64,
         res: Result<tokio::sync::mpsc::OwnedPermit<ChannelMsg>, ()>,
-        handler: &mut H,
+        mut handler: Option<&mut H>,
     ) -> Result<(), H::Error> {
         {
             let q = match self.inbound.get_mut(&id) {
@@ -1145,7 +1274,8 @@ impl Session {
                     .get(&id)
                     .is_some_and(|q| q.close_queued);
                 if close_queued {
-                    handler.channel_close(id, self).await?;
+                    self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
+                        .await?;
                     self.finalize_close(id);
                 } else {
                     self.teardown_inbound_channel(id);
@@ -1172,17 +1302,57 @@ impl Session {
         permit.send(item.into_msg());
 
         if grants {
-            self.maybe_grant_after_delivery(id, handler)?;
+            self.maybe_grant_after_delivery(id, handler.as_mut().map(|h| &mut **h))
+                .await?;
         }
 
         match callback {
-            DeferredCallback::Data(data) => handler.data(id, &data, self).await?,
-            DeferredCallback::ExtendedData { ext, data } => {
-                handler.extended_data(id, ext, &data, self).await?
+            DeferredCallback::Data(data) => {
+                // Scheme C delivery is always into the app buffer (Delivered).
+                // Skip Handler::data unless invert restores the old call.
+                let invert = {
+                    #[cfg(feature = "_test_hooks")]
+                    {
+                        self.common.config.invert_delivered_handler_data
+                    }
+                    #[cfg(not(feature = "_test_hooks"))]
+                    {
+                        false
+                    }
+                };
+                if invert {
+                    self.dispatch_data(handler.as_mut().map(|h| &mut **h), id, &data, true)
+                        .await?;
+                }
             }
-            DeferredCallback::Eof => handler.channel_eof(id, self).await?,
+            DeferredCallback::ExtendedData { ext, data } => {
+                let invert = {
+                    #[cfg(feature = "_test_hooks")]
+                    {
+                        self.common.config.invert_delivered_handler_data
+                    }
+                    #[cfg(not(feature = "_test_hooks"))]
+                    {
+                        false
+                    }
+                };
+                if invert {
+                    self.dispatch_extended_data(
+                        handler.as_mut().map(|h| &mut **h),
+                        id,
+                        ext,
+                        &data,
+                    )
+                    .await?;
+                }
+            }
+            DeferredCallback::Eof => {
+                self.dispatch_eof(handler.as_mut().map(|h| &mut **h), id)
+                    .await?;
+            }
             DeferredCallback::Close => {
-                handler.channel_close(id, self).await?;
+                self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
+                    .await?;
                 self.finalize_close(id);
                 return Ok(());
             }
@@ -1208,10 +1378,10 @@ impl Session {
     /// I2: grant more inbound receive window for a channel after its data was accepted into the
     /// application buffer. Only granted at delivery time, so a backpressured channel withholds its
     /// own grant (per-channel backpressure replacing the removed blocking `.await`).
-    pub(crate) fn maybe_grant_after_delivery<H: Handler>(
+    pub(crate) async fn maybe_grant_after_delivery<H: Handler + Send>(
         &mut self,
         id: ChannelId,
-        handler: &mut H,
+        handler: Option<&mut H>,
     ) -> Result<(), crate::Error> {
         let target = self.target_window_size;
         // Bytes still queued undelivered for this channel keep occupying its advertised window;
@@ -1266,7 +1436,9 @@ impl Session {
             if let Some(ref s) = self.common.config.deferred_grant {
                 s.note_emitted();
             }
-            let w = handler.adjust_window(id, self.target_window_size);
+            let w = self
+                .dispatch_adjust_window(handler, id, self.target_window_size)
+                .await;
             if w > 0 {
                 self.target_window_size = w;
             }
@@ -1380,7 +1552,7 @@ impl Session {
         &mut self,
         id: ChannelId,
         amount: u32,
-        handler: &mut H,
+        handler: Option<&mut H>,
     ) -> Result<(), H::Error> {
         #[cfg(feature = "_test_hooks")]
         if let Some(ref c) = self.common.config.window_adjust_seen {
@@ -1416,13 +1588,13 @@ impl Session {
             chan.window_size().update(new_size).await;
             let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
         }
-        handler.window_adjusted(id, new_size, self).await
+        self.dispatch_window_adjusted(handler, id, new_size).await
     }
 
     /// Replay WINDOW_ADJUST grants skipped while outbound sat at the hard cap.
-    pub(crate) fn retry_deferred_window_grants<H: Handler>(
+    pub(crate) async fn retry_deferred_window_grants<H: Handler + Send>(
         &mut self,
-        handler: &mut H,
+        mut handler: Option<&mut H>,
     ) -> Result<(), crate::Error> {
         if self.deferred_window_grants.is_empty() {
             return Ok(());
@@ -1441,7 +1613,8 @@ impl Session {
             if let Some(ref s) = self.common.config.deferred_grant {
                 s.note_replay();
             }
-            self.maybe_grant_after_delivery(id, handler)?;
+            self.maybe_grant_after_delivery(id, handler.as_mut().map(|h| &mut **h))
+                .await?;
         }
         Ok(())
     }
@@ -1618,7 +1791,7 @@ impl Session {
     /// queued that channel's reply, so finalizing replies first guarantees no `Data` is ever
     /// dispatched against a channel that is not yet registered (such data would be silently
     /// discarded, since the channel maps have no entry to route it to).
-    fn drain_open_replies(&mut self) -> Result<(), Error> {
+    pub(crate) fn drain_open_replies(&mut self) -> Result<(), Error> {
         while let Ok(msg) = self.open_reply_rx.try_recv() {
             if let Msg::ChannelOpenReply { pending, result } = msg {
                 self.finalize_channel_open_reply(pending, result)?;
@@ -1670,10 +1843,10 @@ impl Session {
                 self.close(id)?;
             }
             Msg::Channel(id, ChannelMsg::Success) => {
-                self.channel_success(id)?;
+                self.channel_success_apply(id)?;
             }
             Msg::Channel(id, ChannelMsg::Failure) => {
-                self.channel_failure(id)?;
+                self.channel_failure_apply(id)?;
             }
             Msg::Channel(id, ChannelMsg::XonXoff { client_can_do }) => {
                 self.xon_xoff_request(id, client_can_do)?;
@@ -1795,12 +1968,15 @@ impl Session {
     pub(crate) async fn run<H, R>(
         mut self,
         mut stream: SshRead<R>,
-        mut handler: H,
+        handler: H,
     ) -> Result<(), H::Error>
     where
         H: Handler + Send + 'static,
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let mut handler = Some(handler);
+        let mut executor_join: Option<tokio::task::JoinHandle<()>> = None;
+        let mut executor_abort: Option<tokio::task::AbortHandle> = None;
         self.flush()?;
 
         // Absolute handshake deadline from run_stream (banner already counted). Fallback
@@ -1965,6 +2141,7 @@ impl Session {
         struct IoTeardownGuard {
             writer_abort: tokio::task::AbortHandle,
             reader_abort: tokio::task::AbortHandle,
+            executor_abort: Option<tokio::task::AbortHandle>,
             cancel_tx: tokio::sync::watch::Sender<bool>,
             armed: bool,
         }
@@ -1974,12 +2151,16 @@ impl Session {
                     let _ = self.cancel_tx.send(true);
                     self.writer_abort.abort();
                     self.reader_abort.abort();
+                    if let Some(a) = self.executor_abort.take() {
+                        a.abort();
+                    }
                 }
             }
         }
         let mut io_guard = IoTeardownGuard {
             writer_abort: writer_abort.clone(),
             reader_abort: reader_abort.clone(),
+            executor_abort: None,
             cancel_tx: cancel_tx.clone(),
             armed: true,
         };
@@ -2031,7 +2212,7 @@ impl Session {
                     deferred_inbound_ack = None;
                     if let Some(after) = self.on_install_ack_inbound(generation) {
                         self.apply_kex_after_install(after);
-                        if let Err(e) = self.replay_pending_reads(&mut handler).await {
+                        if let Err(e) = self.replay_pending_reads(handler.as_mut()).await {
                             debug!("pending_reads replay error: deferred inbound ACK");
                             let _ = e;
                             record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
@@ -2060,7 +2241,7 @@ impl Session {
                     deferred_install_ack = None;
                     if let Some(after) = self.on_install_ack_outbound(generation) {
                         self.apply_kex_after_install(after);
-                        if let Err(e) = self.replay_pending_reads(&mut handler).await {
+                        if let Err(e) = self.replay_pending_reads(handler.as_mut()).await {
                             debug!("pending_reads replay error: deferred InstallAck");
                             let _ = e;
                             record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
@@ -2093,6 +2274,27 @@ impl Session {
                 }
             }
 
+            // Auth barrier: move Handler into Executor. Subsequent channel/global
+            // callbacks are posted; handshake auth/GEX stay inline (already done).
+            if handshake_done && self.executor.is_none() {
+                if let Some(h) = handler.take() {
+                    let spawned = crate::server::executor::spawn_handler_executor(
+                        h,
+                        self.common.config.clone(),
+                        self.sender.clone(),
+                        self.common.remote_sshid.clone(),
+                        self.open_reply_tx.clone(),
+                        self.facade_notify.clone(),
+                        self.result_notify.clone(),
+                    );
+                    self.facade_cmd_rx = Some(spawned.facade_rx);
+                    self.executor = Some(spawned.exec);
+                    executor_join = Some(spawned.join);
+                    executor_abort = Some(spawned.abort.clone());
+                    io_guard.executor_abort = Some(spawned.abort);
+                }
+            }
+
             // Transfer parked seals / enc.write into Writer before the HWM
             // / watchdog sample. Hard-cap park can hold >=HWM in
             // `pending_outbound` or `enc.write` after Writer has drained
@@ -2118,10 +2320,49 @@ impl Session {
                 self.common.disconnected = true;
                 continue;
             }
-            if let Err(e) = self.retry_deferred_window_grants(&mut handler) {
+            if let Err(e) = self.retry_deferred_window_grants(handler.as_mut()).await {
                 debug!("retry deferred WINDOW_ADJUST (loop-top): {e:?}");
                 record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                 self.common.disconnected = true;
+                continue;
+            }
+            self.drain_facade_cmds();
+            match self.try_harvest_result() {
+                Ok(_) => {}
+                Err(e) => {
+                    record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                    return Err(e.into());
+                }
+            }
+            // Resume lane pump after Executor space frees. Skipping this
+            // when we gated the notify arm on `exec_full` would miss the
+            // already-signaled `lane_ready` and stall remaining REQUESTs.
+            let more_lanes = match self.pump_reader_lanes(handler.as_mut()).await {
+                Ok(more) => more,
+                Err(e) => {
+                    if let Some(c) = self.pending_supervisor_cause.take() {
+                        record_cause(c, &mut supervisor_cause);
+                        self.common.disconnected = true;
+                        false
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+            if !self.common.disconnected {
+                self.drain_needs_reserve(&mut inbound_reserves);
+            }
+            // Pump may have posted Invokes whose callbacks already queued
+            // facade commands (notify fired while we were still popping).
+            self.drain_facade_cmds();
+            match self.try_harvest_result() {
+                Ok(_) => {}
+                Err(e) => {
+                    record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                    return Err(e.into());
+                }
+            }
+            if more_lanes && !self.common.disconnected {
                 continue;
             }
             // Aggregation board drain: always here, never in the notify arm.
@@ -2134,7 +2375,7 @@ impl Session {
                         amt as u32
                     };
                     if let Err(e) = self
-                        .apply_peer_window_credit(id, amount, &mut handler)
+                        .apply_peer_window_credit(id, amount, handler.as_mut())
                         .await
                     {
                         return Err(e);
@@ -2357,6 +2598,39 @@ impl Session {
             let credit_notified = credit.notify().notified();
             tokio::pin!(credit_notified);
 
+            let skip_facade = self.skip_facade_drain();
+            let exec_full = self.executor_full();
+            let ctrl_held = {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    self.common
+                        .config
+                        .hold_session_ctrl
+                        .as_ref()
+                        .is_some_and(|h| h.load(std::sync::atomic::Ordering::SeqCst))
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    false
+                }
+            };
+            // Subscribe *before* the last drain so a notify during drain
+            // still wakes select (register-then-check).
+            let facade_n = self.facade_notify.clone();
+            let result_n = self.result_notify.clone();
+            let facade_notified = facade_n.notified();
+            tokio::pin!(facade_notified);
+            let result_notified = result_n.notified();
+            tokio::pin!(result_notified);
+            self.drain_facade_cmds();
+            match self.try_harvest_result() {
+                Ok(_) => {}
+                Err(e) => {
+                    record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                    return Err(e.into());
+                }
+            }
+
             tokio::select! {
                 biased;
                 // This queue must not grow per-packet / peer-rate-driven
@@ -2379,7 +2653,7 @@ impl Session {
                             {
                                 self.apply_kex_after_install(after);
                                 if let Err(e) =
-                                    self.replay_pending_reads(&mut handler).await
+                                    self.replay_pending_reads(handler.as_mut()).await
                                 {
                                     debug!("pending_reads replay error");
                                     let _ = e;
@@ -2403,7 +2677,7 @@ impl Session {
                             {
                                 self.apply_kex_after_install(after);
                                 if let Err(e) =
-                                    self.replay_pending_reads(&mut handler).await
+                                    self.replay_pending_reads(handler.as_mut()).await
                                 {
                                     debug!("pending_reads replay error");
                                     let _ = e;
@@ -2450,7 +2724,19 @@ impl Session {
                         }
                     }
                 }
-                ctrl = ctrl_rx.recv() => {
+                () = &mut facade_notified, if !skip_facade => {
+                    self.drain_facade_cmds();
+                }
+                () = &mut result_notified => {
+                    match self.try_harvest_result() {
+                        Ok(_) => {}
+                        Err(e) => {
+                            record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                            return Err(e.into());
+                        }
+                    }
+                }
+                ctrl = ctrl_rx.recv(), if !exec_full && !ctrl_held => {
                     let Some(ctrl) = ctrl else {
                         debug!("ctrl closed; harvest reader terminal");
                         loop {
@@ -2496,7 +2782,7 @@ impl Session {
                     if !handshake_done {
                         match tokio::time::timeout_at(
                             handshake_deadline_at,
-                            self.handle_ctrl_msg(ctrl, &mut handler),
+                            self.handle_ctrl_msg(ctrl, handler.as_mut()),
                         )
                         .await
                         {
@@ -2516,7 +2802,7 @@ impl Session {
                             }
                         }
                     } else {
-                        match self.handle_ctrl_msg(ctrl, &mut handler).await {
+                        match self.handle_ctrl_msg(ctrl, handler.as_mut()).await {
                             Ok(true) => {}
                             Ok(false) => {
                                 debug!("break");
@@ -2530,8 +2816,13 @@ impl Session {
                         self.common.disconnected = true;
                     }
                     self.drain_needs_reserve(&mut inbound_reserves);
-                    if let Err(e) = self.pump_reader_lanes(&mut handler).await {
-                        return Err(e);
+                    if let Err(e) = self.pump_reader_lanes(handler.as_mut()).await {
+                        if let Some(c) = self.pending_supervisor_cause.take() {
+                            record_cause(c, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        } else {
+                            return Err(e);
+                        }
                     }
                     #[cfg(feature = "_test_hooks")]
                     if self.pending_kex_install.is_some() {
@@ -2541,10 +2832,16 @@ impl Session {
                     }
                 }
                 () = &mut lane_notified => {
-                    if let Err(e) = self.pump_reader_lanes(&mut handler).await {
-                        return Err(e);
+                    if let Err(e) = self.pump_reader_lanes(handler.as_mut()).await {
+                        if let Some(c) = self.pending_supervisor_cause.take() {
+                            record_cause(c, &mut supervisor_cause);
+                            self.common.disconnected = true;
+                        } else {
+                            return Err(e);
+                        }
+                    } else {
+                        self.drain_needs_reserve(&mut inbound_reserves);
                     }
-                    self.drain_needs_reserve(&mut inbound_reserves);
                 }
                 () = &mut credit_notified => {
                     // Wake-only: drain is always at loop-top.
@@ -2553,7 +2850,7 @@ impl Session {
                     // A backpressured channel's application buffer freed a slot: deliver its head
                     // item and re-arm. The grant for that channel is emitted into `self.write` and
                     // goes out via the flush below — never blocking the loop on this channel.
-                    self.pump_inbound(cid, generation, res, &mut handler).await?;
+                    self.pump_inbound(cid, generation, res, handler.as_mut()).await?;
                     self.drain_needs_reserve(&mut inbound_reserves);
                 }
                 // Channel-open replies from handlers that stashed the `ChannelOpenHandle` and
@@ -2609,7 +2906,7 @@ impl Session {
                             {
                                 self.apply_kex_after_install(after);
                                 if let Err(e) =
-                                    self.replay_pending_reads(&mut handler).await
+                                    self.replay_pending_reads(handler.as_mut()).await
                                 {
                                     debug!("pending_reads replay error: inbound ACK");
                                     let _ = e;
@@ -2656,7 +2953,7 @@ impl Session {
                         debug!("retry_pending_outbound: {e:?}");
                         record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                         self.common.disconnected = true;
-                    } else if let Err(e) = self.retry_deferred_window_grants(&mut handler) {
+                    } else if let Err(e) = self.retry_deferred_window_grants(handler.as_mut()).await {
                         debug!("retry deferred WINDOW_ADJUST (capacity): {e:?}");
                         record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                         self.common.disconnected = true;
@@ -2744,7 +3041,7 @@ impl Session {
                 record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                 self.common.disconnected = true;
             }
-            if let Err(e) = self.retry_deferred_window_grants(&mut handler) {
+            if let Err(e) = self.retry_deferred_window_grants(handler.as_mut()).await {
                 debug!("retry deferred WINDOW_ADJUST: {e:?}");
                 record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                 self.common.disconnected = true;
@@ -2799,6 +3096,17 @@ impl Session {
         )
         .await;
         stop_reader_task(&mut reader_join, grace_at).await;
+        // Drop the facade receiver first so queued oneshot senders
+        // fire RecvError and Executor-side blocking waits wake
+        // before cancel/join.
+        drop(self.facade_cmd_rx.take());
+        crate::server::executor::stop_handler_executor(
+            self.executor.as_ref(),
+            &mut executor_join,
+            grace_at,
+        )
+        .await;
+        let _ = executor_abort;
         io_guard.armed = false;
 
         // Convert supervisor first-cause into a typed Error so callers/tests see it.
@@ -2810,6 +3118,8 @@ impl Session {
                 DisconnectCause::PeerError | DisconnectCause::LocalShutdown => {
                     return Ok(());
                 }
+                DisconnectCause::HandlerExecutorGone => crate::Error::SendError,
+                DisconnectCause::ReplyObligationOverflow => crate::Error::ReplyObligationOverflow,
             };
             return Err(err.into());
         }
@@ -3274,6 +3584,126 @@ impl Session {
             });
         }
         self.common.wants_reply = false;
+        self.record_outbound_from_write();
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_global_obligation(&mut self) -> Result<(), Error> {
+        let max = self.common.config.max_pending_want_replies.max(1);
+        if self.global_replies.len() >= max {
+            self.stage_cause(DisconnectCause::ReplyObligationOverflow);
+            return Err(Error::ReplyObligationOverflow);
+        }
+        self.global_replies.enqueue_pending();
+        self.publish_reply_queue();
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_channel_obligation(&mut self, id: ChannelId) -> Result<(), Error> {
+        let max = self.common.config.max_pending_want_replies.max(1);
+        let over = self
+            .common
+            .encrypted
+            .as_ref()
+            .and_then(|enc| enc.channels.get(&id))
+            .map(|ch| ch.reply_queue.len() >= max)
+            .unwrap_or(false);
+        if over {
+            self.stage_cause(DisconnectCause::ReplyObligationOverflow);
+            return Err(Error::ReplyObligationOverflow);
+        }
+        if let Some(ch) = self
+            .common
+            .encrypted
+            .as_mut()
+            .and_then(|enc| enc.channels.get_mut(&id))
+        {
+            ch.reply_queue.enqueue_pending();
+            ch.want_reply_count = ch.want_reply_count.saturating_add(1);
+            ch.wants_reply = true;
+        }
+        self.publish_reply_queue();
+        Ok(())
+    }
+
+    pub(crate) fn fail_last_channel_obligation(&mut self, id: ChannelId) -> Result<(), Error> {
+        if let Some(ch) = self
+            .common
+            .encrypted
+            .as_mut()
+            .and_then(|enc| enc.channels.get_mut(&id))
+        {
+            ch.reply_queue.decide_last_if_pending(false, None);
+        }
+        self.flush_channel_replies(id)
+    }
+
+    pub(crate) fn on_channel_invoke_posted(
+        &mut self,
+        id: ChannelId,
+        posted: bool,
+        had_obligation: bool,
+    ) -> Result<(), Error> {
+        if posted || !had_obligation {
+            Ok(())
+        } else {
+            self.fail_last_channel_obligation(id)
+        }
+    }
+
+    pub(crate) fn fail_last_global_obligation(&mut self) -> Result<(), Error> {
+        self.global_replies.decide_last_if_pending(false, None);
+        self.flush_global_replies()
+    }
+
+    pub(crate) fn fail_pending_obligation(
+        &mut self,
+        harvest: Option<crate::server::executor::PendingHarvest>,
+    ) -> Result<(), Error> {
+        use crate::server::executor::PendingHarvest;
+        match harvest {
+            // Channel want-reply stays open: Handle::channel_success may
+            // decide it after the callback returns. Auto-FAILURE here
+            // double-sends when the app replies late (fix2).
+            Some(PendingHarvest::ChannelReq) => Ok(()),
+            Some(PendingHarvest::GlobalForward { wants_reply, .. })
+            | Some(PendingHarvest::GlobalBool { wants_reply })
+                if wants_reply =>
+            {
+                self.fail_global_obligation()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn fail_global_obligation(&mut self) -> Result<(), Error> {
+        self.global_replies.decide_oldest_pending(false, None);
+        self.flush_global_replies()
+    }
+
+    pub(crate) fn flush_global_replies(&mut self) -> Result<(), Error> {
+        while let Some(ob) = self.global_replies.pop_ready() {
+            let success = ob.verdict == ReplyVerdict::Success;
+            self.common.wants_reply = true;
+            self.emit_global_request_reply(success, ob.extra_port)?;
+        }
+        let _ = self.flush();
+        Ok(())
+    }
+
+    pub(crate) fn flush_channel_replies(&mut self, channel: ChannelId) -> Result<(), Error> {
+        loop {
+            let ready = self
+                .common
+                .encrypted
+                .as_mut()
+                .and_then(|enc| enc.channels.get_mut(&channel))
+                .and_then(|ch| ch.reply_queue.pop_ready());
+            let Some(ob) = ready else {
+                break;
+            };
+            self.write_one_channel_reply(channel, ob.verdict == ReplyVerdict::Success)?;
+        }
         Ok(())
     }
 
@@ -3770,7 +4200,7 @@ impl Session {
     /// this helper on Done finalize) — required by edition-2024 / E0733.
     pub(crate) fn replay_pending_reads<'a, H: Handler + Send + 'a>(
         &'a mut self,
-        handler: &'a mut H,
+        mut handler: Option<&'a mut H>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), H::Error>> + Send + 'a>> {
         Box::pin(async move {
             let mut pending = std::mem::take(&mut self.pending_reads);
@@ -3784,7 +4214,7 @@ impl Session {
                     buffer: p,
                     seqn: std::num::Wrapping(0),
                 };
-                super::reply(self, handler, &mut fake).await?;
+                super::reply(self, handler.as_mut().map(|h| &mut **h), &mut fake).await?;
                 if self.pending_supervisor_cause.is_some() {
                     break;
                 }
@@ -4066,6 +4496,9 @@ impl Session {
                     | crate::msg::CHANNEL_SUCCESS
                     | crate::msg::CHANNEL_FAILURE
                     | crate::msg::CHANNEL_REQUEST => log.push(chan, msg, payload_len),
+                    crate::msg::REQUEST_SUCCESS | crate::msg::REQUEST_FAILURE => {
+                        log.push(u32::MAX, msg, 0)
+                    }
                     _ => {}
                 }
                 cursor += 4 + len;
@@ -4144,33 +4577,51 @@ impl Session {
     /// cancelling). Always call this function if the request was
     /// successful (it checks whether the client expects an answer).
     pub(crate) fn request_success_apply(&mut self) {
-        if self.common.wants_reply {
-            let _ = self.emit_global_request_reply(true, None);
+        if self.global_replies.decide_oldest_pending(true, None) || self.common.wants_reply {
+            let _ = self.flush_global_replies();
         }
     }
 
     /// Send a "failure" reply to a global request.
     pub(crate) fn request_failure_apply(&mut self) {
-        let _ = self.emit_global_request_reply(false, None);
+        if self.global_replies.decide_oldest_pending(false, None) || self.common.wants_reply {
+            let _ = self.flush_global_replies();
+        }
     }
 
     /// Send a "success" reply to a channel request. Always call this
     /// function if the request was successful (it checks whether the
     /// client expects an answer).
     pub(crate) fn channel_success_apply(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        self.emit_channel_request_reply(channel, true)
+        if let Some(ch) = self
+            .common
+            .encrypted
+            .as_mut()
+            .and_then(|enc| enc.channels.get_mut(&channel))
+        {
+            ch.reply_queue.decide_oldest_pending(true, None);
+        }
+        self.flush_channel_replies(channel)
     }
 
     /// Send a "failure" reply to a channel request.
     pub(crate) fn channel_failure_apply(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
-        self.emit_channel_request_reply(channel, false)
+        if let Some(ch) = self
+            .common
+            .encrypted
+            .as_mut()
+            .and_then(|enc| enc.channels.get_mut(&channel))
+        {
+            ch.reply_queue.decide_oldest_pending(false, None);
+        }
+        self.flush_channel_replies(channel)
     }
 
     /// RFC4254 §5.4: CHANNEL_SUCCESS / CHANNEL_FAILURE are `byte +
     /// uint32 recipient` = 5. Ledger weight = 5 + WIRE_OH(88) = 93,
     /// the same reservation as REQUEST_SUCCESS+port. Over hard:
     /// refuse the write; `wants_reply` or kex → PeerError.
-    fn emit_channel_request_reply(
+    fn write_one_channel_reply(
         &mut self,
         channel: ChannelId,
         success: bool,
@@ -4182,7 +4633,7 @@ impl Session {
             .and_then(|enc| enc.channels.get(&channel))
             .map(|ch| {
                 assert!(ch.confirmed);
-                ch.wants_reply
+                ch.want_reply_count > 0 || ch.wants_reply
             })
             .unwrap_or(false);
         if !wants {
@@ -4205,7 +4656,16 @@ impl Session {
                 .as_mut()
                 .and_then(|enc| enc.channels.get_mut(&channel))
             {
+                ch.want_reply_count = 0;
                 ch.wants_reply = false;
+            }
+            if let Some(ch) = self
+                .common
+                .encrypted
+                .as_mut()
+                .and_then(|enc| enc.channels.get_mut(&channel))
+            {
+                ch.reply_queue.clear();
             }
             self.publish_reply_queue();
             return Ok(());
@@ -4216,7 +4676,8 @@ impl Session {
             .as_mut()
             .and_then(|enc| enc.channels.get_mut(&channel))
         {
-            ch.wants_reply = false;
+            ch.want_reply_count = ch.want_reply_count.saturating_sub(1);
+            ch.wants_reply = ch.want_reply_count > 0;
             if success {
                 debug!("channel_success {channel:?}");
             }
@@ -4242,6 +4703,14 @@ impl Session {
                 .map(|enc| enc.queued_reply_count())
                 .unwrap_or(0);
             slot.observe(n);
+            let obl = self.global_replies.len()
+                + self
+                    .common
+                    .encrypted
+                    .as_ref()
+                    .map(|enc| enc.channels.values().map(|c| c.reply_queue.len()).sum())
+                    .unwrap_or(0);
+            slot.observe_obligations(obl);
         }
     }
 
@@ -5131,6 +5600,8 @@ mod tests {
         let handle = Handle {
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            #[cfg(feature = "_test_hooks")]
+            observe: config.handle_observe.clone(),
         };
 
         Session {
@@ -5199,6 +5670,15 @@ mod tests {
             sched_next: None,
             sched_since_boost: crate::BOOST_PERIOD,
             sched_debt: None,
+            facade_cmd_tx: None,
+            facade_cmd_rx: None,
+            executor: None,
+            next_invoke_gen: 0,
+            pending_harvest: HashMap::new(),
+            facade_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            pending_open_ids: HashSet::new(),
+            global_replies: ReplyQueue::default(),
         }
     }
 
@@ -5241,7 +5721,7 @@ mod tests {
             let buffer = incoming_packet(compressed_debug_payload(200 * 1024));
             let mut pkt: IncomingSshPacket = session.maybe_decompress(&buffer).unwrap();
 
-            super::super::super::reply(&mut session, &mut handler, &mut pkt)
+            super::super::super::reply(&mut session, Some(&mut handler), &mut pkt)
                 .await
                 .unwrap();
 
@@ -7130,7 +7610,7 @@ mod tests {
         // KEXINIT should begin_rekey (or at least clear pending_reads without hang).
         let mut handler = TestHandler;
         // begin_rekey needs keys in config — may err; we only assert no infinite park and gate path.
-        let result = session.replay_pending_reads(&mut handler).await;
+        let result = session.replay_pending_reads(Some(&mut handler)).await;
         // pending_reads drained either way (helper takes them first).
         assert!(
             session.pending_reads.is_empty(),
@@ -7175,7 +7655,7 @@ mod tests {
         let mut handler = TestHandler;
         // Replay re-enters reply(); parked KEXINIT may begin a new rekey — that is
         // correct second-round behaviour, not a hang / double-park.
-        let _ = session.replay_pending_reads(&mut handler).await;
+        let _ = session.replay_pending_reads(Some(&mut handler)).await;
         assert!(
             session.pending_reads.is_empty(),
             "replay must drain parked packets exactly once"
@@ -7412,7 +7892,7 @@ mod tests {
         pkt.push(crate::msg::CHANNEL_CLOSE);
         pkt.extend_from_slice(&id.0.to_be_bytes());
         session
-            .server_read_authenticated(&mut handler, crate::msg::CHANNEL_CLOSE, &mut &pkt[1..])
+            .server_read_authenticated(Some(&mut handler), crate::msg::CHANNEL_CLOSE, &mut &pkt[1..])
             .await
             .unwrap();
 
@@ -7519,7 +7999,10 @@ mod tests {
         session.inbound.entry(id).or_default().pending_bytes = undelivered as usize;
 
         let mut handler = TestHandler;
-        session.maybe_grant_after_delivery(id, &mut handler).unwrap();
+        session
+            .maybe_grant_after_delivery(id, Some(&mut handler))
+            .await
+            .unwrap();
 
         // The advertised window may cover only what the application actually consumed.
         let enc = session.common.encrypted.as_ref().unwrap();
@@ -7562,7 +8045,10 @@ mod tests {
         session.inbound.entry(id).or_default().pending_bytes = scheme_c;
 
         let mut handler = TestHandler;
-        session.maybe_grant_after_delivery(id, &mut handler).unwrap();
+        session
+            .maybe_grant_after_delivery(id, Some(&mut handler))
+            .await
+            .unwrap();
 
         let want = target as usize - scheme_c - lane_hold;
         assert_eq!(
@@ -7594,7 +8080,10 @@ mod tests {
             .consume_recv_window(id, target as usize);
 
         let mut handler = TestHandler;
-        session.maybe_grant_after_delivery(id, &mut handler).unwrap();
+        session
+            .maybe_grant_after_delivery(id, Some(&mut handler))
+            .await
+            .unwrap();
 
         assert_eq!(
             session
@@ -7717,9 +8206,8 @@ mod tests {
         assert_eq!(session.inbound_needs_reserve, vec![id]);
     }
 
-    /// A queued payload item must NOT trigger its `Handler` callback until it is actually delivered
-    /// into the application buffer (the RC2 ordering fix). The fast path fires inline; the queued
-    /// path fires from `pump_inbound`, after `permit.send`.
+    /// S4b: Delivered DATA no longer calls `Handler::data`. The queued path still
+    /// delivers into the application buffer after `permit.send`; the callback stays 0.
     #[tokio::test]
     async fn queued_handler_callback_is_deferred_until_delivery() {
         struct Rec(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
@@ -7754,16 +8242,19 @@ mod tests {
         // The queued item's handler callback must not have fired yet.
         assert!(seen.lock().unwrap().is_empty());
 
-        // Free a slot and pump: now "b" is delivered AND its callback fires (in that order).
+        // Free a slot and pump: "b" is delivered to the app buffer; Handler::data is not called.
         assert!(matches!(rx.recv().await, Some(ChannelMsg::Data { .. })));
         let generation = session.inbound.get(&id).unwrap().generation;
         let permit = tx.clone().reserve_owned().await.unwrap();
         session
-            .pump_inbound(id, generation, Ok(permit), &mut handler)
+            .pump_inbound(id, generation, Ok(permit), Some(&mut handler))
             .await
             .unwrap();
 
-        assert_eq!(seen.lock().unwrap().as_slice(), &[b"b".to_vec()]);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "S4b: Delivered DATA must not call Handler::data"
+        );
         match rx.recv().await {
             Some(ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), b"b"),
             other => panic!("expected delivered Data(b), got {other:?}"),
@@ -7850,7 +8341,7 @@ mod tests {
         let mut pkt = vec![crate::msg::CHANNEL_CLOSE];
         pkt.extend_from_slice(&id.0.to_be_bytes());
         session
-            .server_read_authenticated(&mut handler, crate::msg::CHANNEL_CLOSE, &mut &pkt[1..])
+            .server_read_authenticated(Some(&mut handler), crate::msg::CHANNEL_CLOSE, &mut &pkt[1..])
             .await
             .unwrap();
 
@@ -7874,7 +8365,7 @@ mod tests {
         pkt.extend_from_slice(&32768u32.to_be_bytes()); // maximum_packet_size
         session
             .server_read_authenticated(
-                &mut handler,
+                Some(&mut handler),
                 crate::msg::CHANNEL_OPEN_CONFIRMATION,
                 &mut &pkt[1..],
             )
@@ -7994,7 +8485,7 @@ mod tests {
         drop(rx);
         let generation = session.inbound.get(&id).unwrap().generation;
         session
-            .pump_inbound(id, generation, Err(()), &mut handler)
+            .pump_inbound(id, generation, Err(()), Some(&mut handler))
             .await
             .unwrap();
 
@@ -8027,7 +8518,7 @@ mod tests {
         let generation = session.inbound.get(&id).unwrap().generation;
         let mut handler = TestHandler;
         session
-            .pump_inbound(id, generation, Err(()), &mut handler)
+            .pump_inbound(id, generation, Err(()), Some(&mut handler))
             .await
             .unwrap();
 

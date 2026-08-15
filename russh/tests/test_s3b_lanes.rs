@@ -98,6 +98,11 @@ impl Handler for RecHandler {
                     ChannelMsg::Data { .. } => {
                         rec.push("data");
                         rec.data_seen.store(true, Ordering::SeqCst);
+                        // Delivered DATA no longer calls Handler::data (S4b).
+                        // App-buffer arrival is the Q2 observation.
+                        if !rec.pty_seen.load(Ordering::SeqCst) {
+                            rec.data_before_pty.store(true, Ordering::SeqCst);
+                        }
                     }
                     ChannelMsg::Eof => rec.push("eof"),
                     ChannelMsg::Close => rec.push("close"),
@@ -226,7 +231,7 @@ async fn q2_request_does_not_overtake_data() -> Result<(), anyhow::Error> {
     ch.data_bytes(&b"wake"[..]).await?;
     wait_for("Q2 pty", Duration::from_secs(3), || rec.pty_seen.load(Ordering::SeqCst)).await?;
     assert!(
-        rec.data_before_pty.load(Ordering::SeqCst),
+        observe.data_before_request(),
         "Q2 HARD: same-lane FIFO, DATA before pty-req"
     );
     Ok(())

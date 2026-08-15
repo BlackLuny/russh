@@ -686,6 +686,7 @@ impl Encrypted {
             .sum()
     }
 
+    #[cfg(feature = "_test_hooks")]
     pub(crate) fn queued_reply_count(&self) -> usize {
         self.channels.values().map(|c| c.queued_reply_count()).sum()
     }

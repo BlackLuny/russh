@@ -626,7 +626,8 @@ async fn s2e_tombstone_unsealed_fifo() -> Result<(), anyhow::Error> {
         pkt,
     );
     cfg.dequeue_hold = Some(hold.clone());
-    let _srv = spawn_s2e(addr, cfg, S2eMode::DualPark);
+    let execs = Arc::new(AtomicU32::new(0));
+    let _srv = spawn_s2e_counted(addr, cfg, S2eMode::DualPark, execs.clone());
     wait_listening(addr).await;
 
     let mut client_cfg = default_client_config();
@@ -648,20 +649,26 @@ async fn s2e_tombstone_unsealed_fifo() -> Result<(), anyhow::Error> {
     .await?;
 
     hold.store(true, Ordering::SeqCst);
+    // Victim is A by construction. After S4b, fire-and-forget execs are
+    // posted in lane-pump order, so sending both at once can park B's
+    // 256KiB in Writer first and leave A's apply in pending_data (hold
+    // never frees mpsc). Sequence A until it owns the unsealed FIFO,
+    // then let B apply so isolation is still two live dumps.
+    let recip_a = a.id().number();
     a.exec(true, "park").await?;
-    b.exec(true, "park").await?;
-    wait_for("unsealed FIFO has victim DATA", Duration::from_secs(5), || {
-        discard.queued_unsealed().iter().any(|(_, m)| *m == MSG_DATA)
+    wait_for("unsealed FIFO has victim A DATA", Duration::from_secs(5), || {
+        discard.queued_unsealed_data(recip_a) >= 1 && execs.load(Ordering::SeqCst) >= 1
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e} queued={:?}", discard.queued_unsealed()))?;
 
+    b.exec(true, "park").await?;
+    wait_for("other exec DualPark apply returned", Duration::from_secs(5), || {
+        execs.load(Ordering::SeqCst) >= 2
+    })
+    .await?;
+
     let queued = discard.queued_unsealed();
-    let recip_a = queued
-        .iter()
-        .find(|(_, m)| *m == MSG_DATA)
-        .map(|(r, _)| *r)
-        .expect("queued DATA");
     let queued_a = discard.queued_unsealed_data(recip_a);
     assert!(
         queued_a >= 1,
@@ -937,14 +944,37 @@ fn spawn_s2e(
     spawn_s2e_with(addr, config, mode, Arc::new(AtomicBool::new(false)))
 }
 
+fn spawn_s2e_counted(
+    addr: SocketAddr,
+    config: russh::server::Config,
+    mode: S2eMode,
+    execs: Arc<AtomicU32>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_s2e_inner(addr, config, mode, Arc::new(AtomicBool::new(false)), execs)
+}
+
 fn spawn_s2e_with(
     addr: SocketAddr,
     config: russh::server::Config,
     mode: S2eMode,
     dump_done: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_s2e_inner(addr, config, mode, dump_done, Arc::new(AtomicU32::new(0)))
+}
+
+fn spawn_s2e_inner(
+    addr: SocketAddr,
+    config: russh::server::Config,
+    mode: S2eMode,
+    dump_done: Arc<AtomicBool>,
+    execs: Arc<AtomicU32>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sh = S2eSh { mode, dump_done };
+        let mut sh = S2eSh {
+            mode,
+            dump_done,
+            execs,
+        };
         if let Err(e) = sh.run_on_address(Arc::new(config), addr).await {
             eprintln!("s2e server exited: {e:?}");
         }
@@ -954,6 +984,7 @@ fn spawn_s2e_with(
 struct S2eSh {
     mode: S2eMode,
     dump_done: Arc<AtomicBool>,
+    execs: Arc<AtomicU32>,
 }
 
 impl Server for S2eSh {
@@ -963,6 +994,7 @@ impl Server for S2eSh {
             mode: self.mode,
             seq: Arc::new(AtomicU32::new(0)),
             dump_done: self.dump_done.clone(),
+            execs: self.execs.clone(),
         }
     }
 }
@@ -971,6 +1003,7 @@ struct S2eH {
     mode: S2eMode,
     seq: Arc<AtomicU32>,
     dump_done: Arc<AtomicBool>,
+    execs: Arc<AtomicU32>,
 }
 
 impl Handler for S2eH {
@@ -1030,6 +1063,7 @@ impl Handler for S2eH {
             S2eMode::FloodForever | S2eMode::DualFlood | S2eMode::DualPark => {
                 session.data(channel, Bytes::from(vec![b'p'; 256 * 1024]))?;
                 self.dump_done.store(true, Ordering::SeqCst);
+                self.execs.fetch_add(1, Ordering::SeqCst);
             }
             S2eMode::LocalCloseOnExec => {
                 session.data(channel, Bytes::from(vec![b'p'; 256 * 1024]))?;
