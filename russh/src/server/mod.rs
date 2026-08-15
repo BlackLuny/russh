@@ -61,7 +61,7 @@ mod session_facade;
 pub(crate) mod executor;
 pub use self::session::*;
 #[cfg(feature = "_test_hooks")]
-pub use self::executor::{HandleObserveSlot, HandlerObserveSlot};
+pub use self::executor::{HandleObserveSlot, HandlerObserveSlot, SlotObserveSlot};
 mod encrypted;
 pub mod supervisor;
 pub mod writer;
@@ -295,6 +295,13 @@ pub struct Config {
     /// queue, one per channel). Exceeding it is protocol abuse and
     /// tears the connection down. Default 4096.
     pub max_pending_want_replies: usize,
+    /// Hard cap on `opening + active + closing` channels (S4c).
+    /// Default 128. zfc can raise this.
+    pub max_channels: usize,
+    /// How long a peer CHANNEL_OPEN may stay in `opening` before
+    /// Session emits OPEN_FAILURE, releases the slot, and invalidates
+    /// the handle generation. Default 30s.
+    pub open_decision_deadline: std::time::Duration,
     /// Test-only: Handle event-queue occupancy / parked sender (H9).
     #[cfg(feature = "_test_hooks")]
     pub handle_observe: Option<std::sync::Arc<executor::HandleObserveSlot>>,
@@ -310,6 +317,13 @@ pub struct Config {
     /// Test-only: Session does not recv ctrl (w7 used to pin the loop in Handler::data).
     #[cfg(feature = "_test_hooks")]
     pub hold_session_ctrl: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: channel slot occupancy / expire / full-reject (L1–L5).
+    #[cfg(feature = "_test_hooks")]
+    pub slot_observe: Option<std::sync::Arc<executor::SlotObserveSlot>>,
+    /// Test-only L4 invert: flush CONFIRMATION before register_lane
+    /// (S3c #13 inverted). L4 must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_open_confirm_before_lane: bool,
 }
 
 impl Default for Config {
@@ -433,6 +447,8 @@ impl Default for Config {
             handler_callback_timeout: crate::server::executor::DEFAULT_HANDLER_TIMEOUT,
             max_in_flight_handler_queue: crate::server::executor::DEFAULT_HANDLER_QUEUE,
             max_pending_want_replies: crate::server::executor::DEFAULT_MAX_PENDING_WANT_REPLIES,
+            max_channels: crate::server::executor::DEFAULT_MAX_CHANNELS,
+            open_decision_deadline: crate::server::executor::DEFAULT_OPEN_DECISION_DEADLINE,
             #[cfg(feature = "_test_hooks")]
             handle_observe: None,
             #[cfg(feature = "_test_hooks")]
@@ -443,6 +459,10 @@ impl Default for Config {
             invert_skip_facade_drain: false,
             #[cfg(feature = "_test_hooks")]
             hold_session_ctrl: None,
+            #[cfg(feature = "_test_hooks")]
+            slot_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_open_confirm_before_lane: false,
         }
     }
 }
@@ -474,6 +494,8 @@ impl Debug for Config {
             .field("handler_callback_timeout", &self.handler_callback_timeout)
             .field("max_in_flight_handler_queue", &self.max_in_flight_handler_queue)
             .field("max_pending_want_replies", &self.max_pending_want_replies)
+            .field("max_channels", &self.max_channels)
+            .field("open_decision_deadline", &self.open_decision_deadline)
             .finish()
     }
 }
@@ -1459,6 +1481,8 @@ where
         result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         pending_open_ids: std::collections::HashSet::new(),
         global_replies: crate::ReplyQueue::default(),
+        openings: std::collections::HashMap::new(),
+        channel_gens: std::collections::HashMap::new(),
     };
 
     session.begin_rekey()?;

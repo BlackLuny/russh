@@ -196,6 +196,11 @@ pub enum Error {
     #[error("Too many pending want-reply obligations")]
     ReplyObligationOverflow,
 
+    /// CHANNEL_OPEN accept/reject arrived after the decision deadline
+    /// or against a superseded generation (S4c). No second wire reply.
+    #[error("Channel open decision expired")]
+    ChannelOpenExpired,
+
     /// Missing authentication method.
     #[error("No authentication method")]
     NoAuthMethod,
@@ -957,6 +962,52 @@ pub(crate) fn future_or_pending<R, F: Future<Output = R>, T>(
     }
 }
 
+/// Shared claim for one peer-initiated CHANNEL_OPEN (S4c).
+///
+/// Session and the reply handle both hold an `Arc`. `accept`/`reject`/`Drop`
+/// CAS from pending → claimed; the deadline CAS pending → expired. The loser
+/// does not write a second wire reply. Client openings leave this `None`.
+#[derive(Debug)]
+pub(crate) struct OpeningLease {
+    pub generation: u64,
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl OpeningLease {
+    pub(crate) const PENDING: u8 = 0;
+    pub(crate) const CLAIMED: u8 = 1;
+    pub(crate) const EXPIRED: u8 = 2;
+
+    pub(crate) fn new(generation: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            generation,
+            state: std::sync::atomic::AtomicU8::new(Self::PENDING),
+        })
+    }
+
+    pub(crate) fn try_claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::PENDING,
+                Self::CLAIMED,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn try_expire(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::PENDING,
+                Self::EXPIRED,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
 /// Pending channel-open state, passed through the reply handle to the session loop.
 #[derive(Debug)]
 #[doc(hidden)]
@@ -967,6 +1018,10 @@ pub struct PendingChannelOpen {
     pub(crate) packet_size: u32,
     pub(crate) channel_ref: channels::ChannelRef,
     pub(crate) channel_params: ChannelParams,
+    /// Slot generation at reserve time. Client leaves this `0`.
+    pub(crate) generation: u64,
+    /// Server slot claim. `None` on the client (no slot/deadline).
+    pub(crate) lease: Option<std::sync::Arc<OpeningLease>>,
 }
 
 /// A handle passed to channel-open callbacks that the handler uses to
@@ -1003,31 +1058,48 @@ impl<M: Send> ChannelOpenHandleInner<M> {
         }
     }
 
-    fn try_send_reply(&mut self, result: Result<(), ChannelOpenFailure>) {
-        if let Some(pending) = self.inner.take() {
-            let _ = self.sender.send((self.make_msg)(pending, result));
+    fn try_send_reply(
+        &mut self,
+        result: Result<(), ChannelOpenFailure>,
+    ) -> Result<(), crate::Error> {
+        let Some(pending) = self.inner.take() else {
+            return Ok(());
+        };
+        if let Some(ref lease) = pending.lease {
+            if !lease.try_claim() {
+                return Err(crate::Error::ChannelOpenExpired);
+            }
         }
+        let _ = self.sender.send((self.make_msg)(pending, result));
+        Ok(())
     }
 
     /// Accept the channel open request.
     ///
     /// Never blocks (the reply queue is unbounded), so it is safe to call from
     /// inside a handler callback running on the session loop.
-    pub async fn accept(mut self) {
-        self.try_send_reply(Ok(()));
+    ///
+    /// Returns [`Error::ChannelOpenExpired`] if the opening already timed out
+    /// or a previous disposition claimed the slot. No second wire reply is sent.
+    pub async fn accept(mut self) -> Result<(), crate::Error> {
+        self.try_send_reply(Ok(()))
     }
 
     /// Reject the channel open request with a reason.
     ///
     /// Never blocks (the reply queue is unbounded), so it is safe to call from
     /// inside a handler callback running on the session loop.
-    pub async fn reject(mut self, reason: ChannelOpenFailure) {
-        self.try_send_reply(Err(reason));
+    ///
+    /// Returns [`Error::ChannelOpenExpired`] if the opening already timed out
+    /// or a previous disposition claimed the slot. No second wire reply is sent.
+    pub async fn reject(mut self, reason: ChannelOpenFailure) -> Result<(), crate::Error> {
+        self.try_send_reply(Err(reason))
     }
 }
 
 impl<M: Send> Drop for ChannelOpenHandleInner<M> {
     fn drop(&mut self) {
-        self.try_send_reply(Err(ChannelOpenFailure::AdministrativelyProhibited));
+        // Expired / already-claimed openings must not emit a second FAILURE.
+        let _ = self.try_send_reply(Err(ChannelOpenFailure::AdministrativelyProhibited));
     }
 }

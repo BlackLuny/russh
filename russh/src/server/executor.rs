@@ -43,6 +43,12 @@ pub const DEFAULT_MAX_PENDING_WANT_REPLIES: usize = 4096;
 /// Default `Config::handler_callback_timeout`.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default `Config::max_channels` (opening + active + closing).
+pub const DEFAULT_MAX_CHANNELS: usize = 128;
+
+/// Default `Config::open_decision_deadline`.
+pub const DEFAULT_OPEN_DECISION_DEADLINE: Duration = Duration::from_secs(30);
+
 // ── test hooks ──────────────────────────────────────────────────────────────
 
 /// Handle event-queue occupancy / parked-sender observation (H9 / S4a P2-2).
@@ -96,6 +102,7 @@ pub struct HandlerObserveSlot {
     pub invoke_dropped: AtomicU64,
     pub timeouts: AtomicU64,
     pub executor_exited: AtomicBool,
+    pub open_calls: AtomicU64,
 }
 
 #[cfg(feature = "_test_hooks")]
@@ -118,11 +125,84 @@ impl HandlerObserveSlot {
     pub fn executor_exited(&self) -> bool {
         self.executor_exited.load(Ordering::SeqCst)
     }
+    pub fn open_calls(&self) -> u64 {
+        self.open_calls.load(Ordering::SeqCst)
+    }
     pub(crate) fn mark_exited(&self) {
         self.executor_exited.store(true, Ordering::SeqCst);
     }
     pub(crate) fn note_timeout_harvest(&self) {
         self.timeouts.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn note_open_call(&self) {
+        self.open_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Channel slot occupancy / late-disposition counters (L1–L5).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct SlotObserveSlot {
+    opening: AtomicUsize,
+    active: AtomicUsize,
+    closing: AtomicUsize,
+    used: AtomicUsize,
+    max_used: AtomicUsize,
+    max_opening: AtomicUsize,
+    expired: AtomicU64,
+    rejected_full: AtomicU64,
+    confirm_before_lane: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl SlotObserveSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn opening(&self) -> usize {
+        self.opening.load(Ordering::SeqCst)
+    }
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+    pub fn closing(&self) -> usize {
+        self.closing.load(Ordering::SeqCst)
+    }
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::SeqCst)
+    }
+    pub fn max_used(&self) -> usize {
+        self.max_used.load(Ordering::SeqCst)
+    }
+    pub fn max_opening(&self) -> usize {
+        self.max_opening.load(Ordering::SeqCst)
+    }
+    pub fn expired(&self) -> u64 {
+        self.expired.load(Ordering::SeqCst)
+    }
+    pub fn rejected_full(&self) -> u64 {
+        self.rejected_full.load(Ordering::SeqCst)
+    }
+    pub fn confirm_before_lane(&self) -> u64 {
+        self.confirm_before_lane.load(Ordering::SeqCst)
+    }
+    pub(crate) fn observe(&self, opening: usize, active: usize, closing: usize) {
+        self.opening.store(opening, Ordering::SeqCst);
+        self.active.store(active, Ordering::SeqCst);
+        self.closing.store(closing, Ordering::SeqCst);
+        let used = opening.saturating_add(active).saturating_add(closing);
+        self.used.store(used, Ordering::SeqCst);
+        self.max_used.fetch_max(used, Ordering::SeqCst);
+        self.max_opening.fetch_max(opening, Ordering::SeqCst);
+    }
+    pub(crate) fn note_expired(&self) {
+        self.expired.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn note_rejected_full(&self) {
+        self.rejected_full.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn note_confirm_before_lane(&self) {
+        self.confirm_before_lane.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -988,6 +1068,8 @@ impl Session {
             result_notify: Arc::new(tokio::sync::Notify::new()),
             pending_open_ids: std::collections::HashSet::new(),
             global_replies: crate::ReplyQueue::default(),
+            openings: HashMap::new(),
+            channel_gens: HashMap::new(),
         }
     }
 
@@ -1101,7 +1183,9 @@ impl Session {
     /// Finalize pending accept/reject first so accept-then-data keeps
     /// CONFIRMATION ahead of DATA (S3c #13).
     pub(crate) fn apply_facade_cmd(&mut self, cmd: FacadeCmd) {
-        let _ = self.drain_open_replies();
+        if !self.invert_open_confirm_before_lane() {
+            let _ = self.drain_open_replies();
+        }
         match cmd {
             FacadeCmd::Data {
                 channel,
@@ -1849,6 +1933,7 @@ impl Session {
         channel: Channel<Msg>,
         reply: ChannelOpenHandle,
     ) -> Result<(), H::Error> {
+        self.note_open_handler();
         if self.executor.is_some() {
             let id = channel.id();
             self.try_post_open(id, Invoke::ChannelOpenSession { channel, reply })?;
@@ -1868,6 +1953,7 @@ impl Session {
         originator_port: u32,
         reply: ChannelOpenHandle,
     ) -> Result<(), H::Error> {
+        self.note_open_handler();
         if self.executor.is_some() {
             let id = channel.id();
             self.try_post_open(
@@ -1899,6 +1985,7 @@ impl Session {
         orig_port: u32,
         reply: ChannelOpenHandle,
     ) -> Result<(), H::Error> {
+        self.note_open_handler();
         if self.executor.is_some() {
             let id = channel.id();
             self.try_post_open(
@@ -1932,6 +2019,7 @@ impl Session {
         orig_port: u32,
         reply: ChannelOpenHandle,
     ) -> Result<(), H::Error> {
+        self.note_open_handler();
         if self.executor.is_some() {
             let id = channel.id();
             self.try_post_open(
@@ -1964,6 +2052,7 @@ impl Session {
         socket_path: &str,
         reply: ChannelOpenHandle,
     ) -> Result<(), H::Error> {
+        self.note_open_handler();
         if self.executor.is_some() {
             let id = channel.id();
             self.try_post_open(

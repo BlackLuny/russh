@@ -190,7 +190,7 @@ impl russh::server::Handler for Server {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let mut rx = self.rx.take().unwrap();
-        reply.accept().await;
+        reply.accept().await?;
         tokio::spawn(async move {
             while let Ok(_) = rx.changed().await {
                 match channel.wait().await {
@@ -260,7 +260,7 @@ impl russh::server::Handler for HandleBackpressureServer {
         let channel_id = channel.id();
         let handle = session.handle();
         let progress_tx = self.progress_tx.clone();
-        reply.accept().await;
+        reply.accept().await?;
         tokio::spawn(async move {
             for index in 0..HANDLE_DATA_COUNT {
                 if handle.data(channel_id, vec![0; WINDOW_SIZE]).await.is_err() {

@@ -762,6 +762,8 @@ impl Session {
                     packet_size: self.common.config.maximum_packet_size,
                     channel_ref,
                     channel_params,
+                    generation: 0,
+                    lease: None,
                 };
                 let reply = ChannelOpenHandle::new(
                     self.open_reply_tx.clone(),

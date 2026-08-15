@@ -126,6 +126,19 @@ pub struct Session {
     pub(crate) pending_open_ids: HashSet<ChannelId>,
     /// RFC 4254 §4 want-reply FIFO (global).
     pub(crate) global_replies: ReplyQueue,
+    /// Peer CHANNEL_OPENs reserved but not yet accepted/rejected/expired.
+    pub(crate) openings: HashMap<ChannelId, OpeningSlot>,
+    /// Last generation issued per channel id (ABA guard).
+    pub(crate) channel_gens: HashMap<ChannelId, u64>,
+}
+
+/// One reserved peer-initiated CHANNEL_OPEN (S4c).
+#[derive(Debug)]
+pub(crate) struct OpeningSlot {
+    pub generation: u64,
+    pub deadline: tokio::time::Instant,
+    pub recipient_channel: u32,
+    pub lease: std::sync::Arc<crate::OpeningLease>,
 }
 
 /// Completion actions when **both** outbound InstallAck and peer-Done are satisfied.
@@ -877,6 +890,239 @@ impl Session {
     /// Always `Ok(())` — no global inbound budget in this slice.
     pub(crate) fn reserve_global_inbound_credit(_n: u32) -> Result<(), ()> {
         Ok(())
+    }
+
+    fn max_channels(&self) -> usize {
+        self.common.config.max_channels.max(1)
+    }
+
+    /// `opening + active + closing`. Opening = reserved peer-opens not
+    /// yet in `enc.channels`. Active+closing live in `enc.channels`
+    /// (local-initiated unconfirmed opens included).
+    pub(crate) fn slot_used(&self) -> usize {
+        self.openings.len().saturating_add(
+            self.common
+                .encrypted
+                .as_ref()
+                .map(|enc| enc.channels.len())
+                .unwrap_or(0),
+        )
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    fn slot_snapshot(&self) -> (usize, usize, usize) {
+        let pending = self.openings.len();
+        let mut opening = pending;
+        let mut active = 0;
+        let mut closing = 0;
+        if let Some(enc) = self.common.encrypted.as_ref() {
+            for ch in enc.channels.values() {
+                if ch.lane == crate::ChannelLaneState::Closing
+                    || ch.pending_close
+                    || ch.outbound_closed
+                {
+                    closing += 1;
+                } else if !ch.confirmed {
+                    opening += 1;
+                } else {
+                    active += 1;
+                }
+            }
+        }
+        (opening, active, closing)
+    }
+
+    pub(crate) fn publish_slots(&self) {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.slot_observe {
+            let (o, a, c) = self.slot_snapshot();
+            s.observe(o, a, c);
+        }
+    }
+
+    pub(crate) fn note_open_handler(&self) {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref o) = self.common.config.handler_observe {
+            o.note_open_call();
+        }
+    }
+
+    pub(crate) fn invert_open_confirm_before_lane(&self) -> bool {
+        #[cfg(feature = "_test_hooks")]
+        {
+            self.common.config.invert_open_confirm_before_lane
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        {
+            false
+        }
+    }
+
+    fn next_opening_deadline(&self) -> Option<tokio::time::Instant> {
+        self.openings.values().map(|s| s.deadline).min()
+    }
+
+    /// Allocate a sender channel id that is free in both `enc.channels`
+    /// and the reserved opening table.
+    fn alloc_sender_channel(&mut self) -> ChannelId {
+        loop {
+            let id = self
+                .common
+                .encrypted
+                .as_mut()
+                .expect("encrypted")
+                .new_channel_id();
+            if !self.openings.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn next_open_gen(&mut self, id: ChannelId) -> u64 {
+        let e = self.channel_gens.entry(id).or_insert(0);
+        *e = e.wrapping_add(1);
+        if *e == 0 {
+            *e = 1;
+        }
+        *e
+    }
+
+    /// Reserve an opening slot after CHANNEL_OPEN parse, before Handler.
+    /// `None` = full (caller writes OPEN_FAILURE, no handle).
+    pub(crate) fn try_reserve_opening(
+        &mut self,
+        recipient_channel: u32,
+    ) -> Option<(ChannelId, std::sync::Arc<crate::OpeningLease>)> {
+        if self.slot_used() >= self.max_channels() {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref s) = self.common.config.slot_observe {
+                s.note_rejected_full();
+            }
+            self.publish_slots();
+            return None;
+        }
+        let id = self.alloc_sender_channel();
+        let generation = self.next_open_gen(id);
+        let lease = crate::OpeningLease::new(generation);
+        let deadline =
+            tokio::time::Instant::now() + self.common.config.open_decision_deadline;
+        self.openings.insert(
+            id,
+            OpeningSlot {
+                generation,
+                deadline,
+                recipient_channel,
+                lease: lease.clone(),
+            },
+        );
+        self.publish_slots();
+        Some((id, lease))
+    }
+
+    fn write_open_failure(
+        &mut self,
+        recipient_channel: u32,
+        reason: ChannelOpenFailure,
+    ) -> Result<(), Error> {
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                msg::CHANNEL_OPEN_FAILURE.encode(&mut enc.write)?;
+                recipient_channel.encode(&mut enc.write)?;
+                reason.code().encode(&mut enc.write)?;
+                reason.description().encode(&mut enc.write)?;
+                "en".encode(&mut enc.write)?;
+            });
+        }
+        self.record_outbound_from_write();
+        Ok(())
+    }
+
+    /// S3c #14: clear any lane without StopDiscard, then FAILURE.
+    fn fail_opening(
+        &mut self,
+        id: ChannelId,
+        reason: ChannelOpenFailure,
+        expired: bool,
+    ) -> Result<(), Error> {
+        let Some(slot) = self.openings.remove(&id) else {
+            return Ok(());
+        };
+        if expired {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref s) = self.common.config.slot_observe {
+                s.note_expired();
+            }
+            let e = self.channel_gens.entry(id).or_insert(slot.generation);
+            *e = e.wrapping_add(1);
+        }
+        self.pending_open_ids.remove(&id);
+        self.teardown_inbound_channel(id);
+        if let Some(r) = &self.reader {
+            r.close_lane(id, r.lane_gen(id).unwrap_or(0));
+        }
+        self.write_open_failure(slot.recipient_channel, reason)?;
+        self.publish_slots();
+        Ok(())
+    }
+
+    pub(crate) fn expire_due_openings(&mut self) -> Result<bool, Error> {
+        let now = tokio::time::Instant::now();
+        let due: Vec<ChannelId> = self
+            .openings
+            .iter()
+            .filter(|(_, s)| now >= s.deadline)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut wrote = false;
+        for id in due {
+            let Some(slot) = self.openings.get(&id) else {
+                continue;
+            };
+            if !slot.lease.try_expire() {
+                continue;
+            }
+            self.fail_opening(
+                id,
+                ChannelOpenFailure::AdministrativelyProhibited,
+                true,
+            )?;
+            wrote = true;
+        }
+        Ok(wrote)
+    }
+
+    fn local_open_full(&self) -> bool {
+        self.slot_used() >= self.max_channels()
+    }
+
+    fn notify_local_open_failure(&self, channel_ref: &ChannelRef) {
+        let _ = channel_ref.try_send(ChannelMsg::OpenFailure(
+            ChannelOpenFailure::ResourceShortage,
+        ));
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref s) = self.common.config.slot_observe {
+            s.note_rejected_full();
+        }
+    }
+
+    fn complete_local_open(
+        &mut self,
+        channel_ref: ChannelRef,
+        result: Result<ChannelId, Error>,
+    ) -> Result<(), Error> {
+        match result {
+            Ok(id) => {
+                self.channels.insert(id, channel_ref);
+                self.register_inbound_lane(id, false);
+                self.publish_slots();
+                Ok(())
+            }
+            Err(Error::ChannelOpenFailure(_)) => {
+                self.notify_local_open_failure(&channel_ref);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn register_inbound_lane(&self, id: ChannelId, confirmed: bool) {
@@ -1758,6 +2004,7 @@ impl Session {
             // is never a parked `pending_close` left to lose here.
             enc.channels.remove(&id);
         }
+        self.publish_slots();
     }
 
     /// Tear down a channel's inbound queue when its application receiver was dropped mid-flight.
@@ -1869,14 +2116,12 @@ impl Session {
                 debug!("window adjusted to {new_size:?} for channel {id:?}");
             }
             Msg::ChannelOpenAgent { channel_ref } => {
-                let id = self.channel_open_agent()?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                let r = self.channel_open_agent();
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::ChannelOpenSession { channel_ref } => {
-                let id = self.channel_open_session()?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                let r = self.channel_open_session();
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::ChannelOpenDirectTcpIp {
                 host_to_connect,
@@ -1885,22 +2130,20 @@ impl Session {
                 originator_port,
                 channel_ref,
             } => {
-                let id = self.channel_open_direct_tcpip(
+                let r = self.channel_open_direct_tcpip(
                     &host_to_connect,
                     port_to_connect,
                     &originator_address,
                     originator_port,
-                )?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                );
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::ChannelOpenDirectStreamLocal {
                 socket_path,
                 channel_ref,
             } => {
-                let id = self.channel_open_direct_streamlocal(&socket_path)?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                let r = self.channel_open_direct_streamlocal(&socket_path);
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::ChannelOpenForwardedTcpIp {
                 connected_address,
@@ -1909,31 +2152,28 @@ impl Session {
                 originator_port,
                 channel_ref,
             } => {
-                let id = self.channel_open_forwarded_tcpip(
+                let r = self.channel_open_forwarded_tcpip(
                     &connected_address,
                     connected_port,
                     &originator_address,
                     originator_port,
-                )?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                );
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::ChannelOpenForwardedStreamLocal {
                 server_socket_path,
                 channel_ref,
             } => {
-                let id = self.channel_open_forwarded_streamlocal(&server_socket_path)?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                let r = self.channel_open_forwarded_streamlocal(&server_socket_path);
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::ChannelOpenX11 {
                 originator_address,
                 originator_port,
                 channel_ref,
             } => {
-                let id = self.channel_open_x11(&originator_address, originator_port)?;
-                self.channels.insert(id, channel_ref);
-                self.register_inbound_lane(id, false);
+                let r = self.channel_open_x11(&originator_address, originator_port);
+                self.complete_local_open(channel_ref, r)?;
             }
             Msg::TcpIpForward {
                 address,
@@ -2326,6 +2566,23 @@ impl Session {
                 self.common.disconnected = true;
                 continue;
             }
+            match self.expire_due_openings() {
+                Ok(true) => {
+                    if let Err(e) = self.flush() {
+                        debug!("flush expired openings: {e:?}");
+                        record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                        self.common.disconnected = true;
+                        continue;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    debug!("expire openings: {e:?}");
+                    record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                    self.common.disconnected = true;
+                    continue;
+                }
+            }
             self.drain_facade_cmds();
             match self.try_harvest_result() {
                 Ok(_) => {}
@@ -2542,11 +2799,16 @@ impl Session {
             } else {
                 std::time::Duration::from_secs(3600)
             };
+            let open_deadline_sleep = self
+                .next_opening_deadline()
+                .map(|t| t.saturating_duration_since(tokio::time::Instant::now()))
+                .unwrap_or(std::time::Duration::from_secs(3600));
             let supervisor_sleep = wd_sleep
                 .min(min_drain_sleep)
                 .min(rekey_sleep)
                 .min(hs_sleep)
                 .min(need_submit_sleep)
+                .min(open_deadline_sleep)
                 .max(std::time::Duration::from_millis(1));
 
             // F2: InstallAck hold release is a first-class select competitor.
@@ -4452,7 +4714,7 @@ impl Session {
     }
 
     /// Parse newly staged `enc.write` packets into the S2c order log.
-    fn record_outbound_from_write(&mut self) {
+    pub(crate) fn record_outbound_from_write(&mut self) {
         #[cfg(feature = "_test_hooks")]
         if let (Some(log), Some(enc)) = (
             self.common.config.outbound_order.as_ref(),
@@ -4488,6 +4750,7 @@ impl Session {
                 };
                 match msg {
                     crate::msg::CHANNEL_OPEN_CONFIRMATION
+                    | crate::msg::CHANNEL_OPEN_FAILURE
                     | crate::msg::CHANNEL_WINDOW_ADJUST
                     | crate::msg::CHANNEL_DATA
                     | crate::msg::CHANNEL_EXTENDED_DATA
@@ -4719,45 +4982,68 @@ impl Session {
         pending: PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
     ) -> Result<(), Error> {
+        let id = pending.sender_channel;
+        let Some(slot) = self.openings.get(&id) else {
+            // Already expired / finalized. No second reply, no new slot.
+            return Ok(());
+        };
+        if slot.generation != pending.generation {
+            return Ok(());
+        }
+        let _slot = self.openings.remove(&id);
+
+        if let Err(reason) = result {
+            // Opening never had a lane (S3c #13 registers on accept).
+            // Still tear down first (S3c #14), then FAILURE.
+            self.teardown_inbound_channel(id);
+            if let Some(r) = &self.reader {
+                r.close_lane(id, r.lane_gen(id).unwrap_or(0));
+            }
+            self.write_open_failure(pending.recipient_channel, reason)?;
+            let e = self.channel_gens.entry(id).or_insert(pending.generation);
+            *e = e.wrapping_add(1);
+            self.publish_slots();
+            return Ok(());
+        }
+
         let mut opened = None;
         if let Some(ref mut enc) = self.common.encrypted {
-            match result {
-                Ok(()) => {
-                    let id = pending.sender_channel;
-                    let mut params = pending.channel_params;
-                    params.enqueue_ctrl(crate::ChannelCtrlItem::OpenConfirmation {
-                        recipient_channel: pending.recipient_channel,
-                        sender_channel: pending.sender_channel.0,
-                        window_size: pending.window_size,
-                        packet_size: pending.packet_size,
-                    });
-                    enc.channels.insert(id, params);
-                    self.channels
-                        .insert(pending.sender_channel, pending.channel_ref);
-                    opened = Some(id);
-                }
-                Err(reason) => {
-                    push_packet!(enc.write, {
-                        msg::CHANNEL_OPEN_FAILURE.encode(&mut enc.write)?;
-                        pending.recipient_channel.encode(&mut enc.write)?;
-                        reason.code().encode(&mut enc.write)?;
-                        reason.description().encode(&mut enc.write)?;
-                        "en".encode(&mut enc.write)?;
-                    });
-                }
-            }
+            let mut params = pending.channel_params;
+            params.enqueue_ctrl(crate::ChannelCtrlItem::OpenConfirmation {
+                recipient_channel: pending.recipient_channel,
+                sender_channel: pending.sender_channel.0,
+                window_size: pending.window_size,
+                packet_size: pending.packet_size,
+            });
+            enc.channels.insert(id, params);
+            self.channels
+                .insert(pending.sender_channel, pending.channel_ref);
+            opened = Some(id);
         }
         if let Some(id) = opened {
             // Lane must exist before CHANNEL_OPEN_CONFIRMATION is
             // encoded into enc.write (and can leave on the wire). The
             // peer only learns this id from that packet.
-            self.register_inbound_lane(id, true);
-            if let Some(ref mut enc) = self.common.encrypted {
-                // Head fence: emit now (unbounded, no window, no HWM).
-                enc.flush_pending(id)?;
+            let invert = self.invert_open_confirm_before_lane();
+            if invert {
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref s) = self.common.config.slot_observe {
+                    s.note_confirm_before_lane();
+                }
+                if let Some(ref mut enc) = self.common.encrypted {
+                    enc.flush_pending(id)?;
+                }
+                self.record_outbound_from_write();
+                self.register_inbound_lane(id, true);
+            } else {
+                self.register_inbound_lane(id, true);
+                if let Some(ref mut enc) = self.common.encrypted {
+                    enc.flush_pending(id)?;
+                }
+                self.record_outbound_from_write();
             }
-            self.record_outbound_from_write();
         }
+        self.publish_slots();
         Ok(())
     }
 
@@ -5340,6 +5626,11 @@ impl Session {
     where
         F: FnOnce(&mut Vec<u8>) -> Result<(), Error>,
     {
+        if self.local_open_full() {
+            return Err(Error::ChannelOpenFailure(
+                ChannelOpenFailure::ResourceShortage,
+            ));
+        }
         // Build body first so we can enforce HWM reservation on variable fields.
         let mut body = Vec::new();
         body.push(msg::CHANNEL_OPEN);
@@ -5679,6 +5970,8 @@ mod tests {
             result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             pending_open_ids: HashSet::new(),
             global_replies: ReplyQueue::default(),
+            openings: HashMap::new(),
+            channel_gens: HashMap::new(),
         }
     }
 

@@ -616,6 +616,8 @@ mod tests {
             result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             pending_open_ids: std::collections::HashSet::new(),
             global_replies: crate::ReplyQueue::default(),
+            openings: std::collections::HashMap::new(),
+            channel_gens: std::collections::HashMap::new(),
         }
     }
 
@@ -1889,6 +1891,7 @@ impl Session {
                         o.note_lane_close(channel_num.number());
                     }
                 }
+                self.publish_slots();
 
                 Ok(())
             }
@@ -1973,11 +1976,46 @@ impl Session {
     ) -> Result<(), H::Error> {
         let msg = OpenChannelMessage::parse(r)?;
 
-        let sender_channel = if let Some(ref mut enc) = self.common.encrypted {
-            enc.new_channel_id()
-        } else {
-            unreachable!()
+        // Unsupported types fail immediately: no slot, no handle, no handler.
+        let supported = matches!(
+            msg.typ,
+            ChannelType::Session
+                | ChannelType::X11 { .. }
+                | ChannelType::DirectTcpip(_)
+                | ChannelType::ForwardedTcpIp(_)
+                | ChannelType::DirectStreamLocal(_)
+        );
+        if !supported {
+            if let Some(ref mut enc) = self.common.encrypted {
+                match &msg.typ {
+                    ChannelType::Unknown { typ } => {
+                        debug!("unknown channel type: {typ}");
+                        msg.unknown_type(&mut enc.write)?;
+                    }
+                    _ => {
+                        msg.fail(
+                            &mut enc.write,
+                            msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                            b"Unsupported channel type",
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let Some((sender_channel, lease)) = self.try_reserve_opening(msg.recipient_channel) else {
+            if let Some(ref mut enc) = self.common.encrypted {
+                msg.fail(
+                    &mut enc.write,
+                    msg::SSH_OPEN_RESOURCE_SHORTAGE,
+                    b"Too many channels",
+                )?;
+            }
+            self.record_outbound_from_write();
+            return Ok(());
         };
+        let generation = lease.generation;
         let channel_params = ChannelParams::new(
             msg.recipient_channel,
             sender_channel,
@@ -2003,6 +2041,8 @@ impl Session {
             packet_size: self.common.config.maximum_packet_size,
             channel_ref,
             channel_params,
+            generation,
+            lease: Some(lease),
         };
         let reply = ChannelOpenHandle::new(
             self.open_reply_tx.clone(),
@@ -2055,33 +2095,7 @@ impl Session {
                 self.dispatch_open_direct_streamlocal(handler, channel, &d.socket_path, reply)
                     .await
             }
-            ChannelType::ForwardedStreamLocal(_) => {
-                if let Some(ref mut enc) = self.common.encrypted {
-                    msg.fail(
-                        &mut enc.write,
-                        msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
-                        b"Unsupported channel type",
-                    )?;
-                }
-                Ok(())
-            }
-            ChannelType::AgentForward => {
-                if let Some(ref mut enc) = self.common.encrypted {
-                    msg.fail(
-                        &mut enc.write,
-                        msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
-                        b"Unsupported channel type",
-                    )?;
-                }
-                Ok(())
-            }
-            ChannelType::Unknown { typ } => {
-                debug!("unknown channel type: {typ}");
-                if let Some(ref mut enc) = self.common.encrypted {
-                    msg.unknown_type(&mut enc.write)?;
-                }
-                Ok(())
-            }
+            _ => Ok(()),
         }
     }
 }

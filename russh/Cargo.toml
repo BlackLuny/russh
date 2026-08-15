@@ -163,3 +163,7 @@ required-features = ["_test_hooks"]
 [[test]]
 name = "test_s4b_executor"
 required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s4c_slots"
+required-features = ["_test_hooks"]
