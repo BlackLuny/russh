@@ -1070,6 +1070,8 @@ impl Session {
             global_replies: crate::ReplyQueue::default(),
             openings: HashMap::new(),
             channel_gens: HashMap::new(),
+            conn_budget: None,
+            channel_global_held: HashMap::new(),
         }
     }
 

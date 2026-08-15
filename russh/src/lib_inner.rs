@@ -201,6 +201,11 @@ pub enum Error {
     #[error("Channel open decision expired")]
     ChannelOpenExpired,
 
+    /// Process-level `max_connections` reached (S4d). No `Session` was
+    /// created; the socket is dropped.
+    #[error("Maximum number of connections reached")]
+    MaxConnections,
+
     /// Missing authentication method.
     #[error("No authentication method")]
     NoAuthMethod,

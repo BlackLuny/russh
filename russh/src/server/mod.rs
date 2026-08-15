@@ -59,9 +59,16 @@ mod kex;
 mod session;
 mod session_facade;
 pub(crate) mod executor;
+pub(crate) mod global_budget;
 pub use self::session::*;
+pub use self::global_budget::{
+    GlobalBudget, DEFAULT_GLOBAL_BYTE_BUDGET, DEFAULT_MAX_CONNECTIONS, OUTBOUND_CAP_ESTIMATE,
+    WRITER_KEX_BUDGET,
+};
 #[cfg(feature = "_test_hooks")]
 pub use self::executor::{HandleObserveSlot, HandlerObserveSlot, SlotObserveSlot};
+#[cfg(feature = "_test_hooks")]
+pub use self::global_budget::AdmitSplitGate;
 mod encrypted;
 pub mod supervisor;
 pub mod writer;
@@ -302,6 +309,40 @@ pub struct Config {
     /// Session emits OPEN_FAILURE, releases the slot, and invalidates
     /// the handle generation. Default 30s.
     pub open_decision_deadline: std::time::Duration,
+    /// Process-level byte ceiling (S4d). Three categories share one
+    /// ledger: inbound grant credit, opening reservation
+    /// (`window_size + OUTBOUND_CAP_ESTIMATE`), and per-connection
+    /// fixed protocol (`inbound_ctrl_budget + WRITER_KEX_BUDGET`).
+    /// Default is a conservative 4 TiB counter — not an allocation —
+    /// sized so a fully loaded default connection still fits in its
+    /// floor. Set an explicit value to enforce a host cap.
+    pub global_byte_budget: u64,
+    /// Process-level connection cap (S4d). Enforced by CAS at
+    /// `run_stream` entry; the default (4096) is large enough that
+    /// existing single-connection tests are unaffected.
+    pub max_connections: usize,
+    /// Optional override for the per-connection exclusive floor.
+    /// `None` (default) uses `global_byte_budget / max_connections`.
+    /// The effective floor is `min(declared_need, this, budget/max)`.
+    /// Excess above floor may be taken by other connections; unused
+    /// connection slots keep their floor reserved so a large
+    /// connection cannot starve a later one.
+    pub per_connection_floor: Option<u64>,
+    /// Shared process ledger. `None` → created from the three fields
+    /// above on first `run_stream` / `run_on_socket`. Tests that share
+    /// one ledger across configs set this to `Some`.
+    pub global_budget: Option<std::sync::Arc<global_budget::GlobalBudget>>,
+    /// Lazy init when `global_budget` is None. Public so `Config { .. }`
+    /// updates from other crates keep compiling; do not write this field.
+    pub budget_cell: std::sync::OnceLock<std::sync::Arc<global_budget::GlobalBudget>>,
+    /// Test-only G4 invert: expand Reader cap before reserving global
+    /// credit (same two production operations, swapped). G4 must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_global_before_expand: bool,
+    /// Test-only G7 invert: `grant_expand_then_adjust` rereads the
+    /// window and recomputes Δ (S4d r1 P1-1). G7 must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_recompute_grant_delta: bool,
     /// Test-only: Handle event-queue occupancy / parked sender (H9).
     #[cfg(feature = "_test_hooks")]
     pub handle_observe: Option<std::sync::Arc<executor::HandleObserveSlot>>,
@@ -449,6 +490,15 @@ impl Default for Config {
             max_pending_want_replies: crate::server::executor::DEFAULT_MAX_PENDING_WANT_REPLIES,
             max_channels: crate::server::executor::DEFAULT_MAX_CHANNELS,
             open_decision_deadline: crate::server::executor::DEFAULT_OPEN_DECISION_DEADLINE,
+            global_byte_budget: crate::server::global_budget::DEFAULT_GLOBAL_BYTE_BUDGET,
+            max_connections: crate::server::global_budget::DEFAULT_MAX_CONNECTIONS,
+            per_connection_floor: None,
+            global_budget: None,
+            budget_cell: std::sync::OnceLock::new(),
+            #[cfg(feature = "_test_hooks")]
+            invert_global_before_expand: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_recompute_grant_delta: false,
             #[cfg(feature = "_test_hooks")]
             handle_observe: None,
             #[cfg(feature = "_test_hooks")]
@@ -464,6 +514,26 @@ impl Default for Config {
             #[cfg(feature = "_test_hooks")]
             invert_open_confirm_before_lane: false,
         }
+    }
+}
+
+impl Config {
+    /// Process-level ledger shared by every `run_stream` on this config.
+    /// Prefers `global_budget` if set; otherwise lazily builds one from
+    /// `global_byte_budget` / `max_connections` / `per_connection_floor`.
+    pub fn shared_budget(&self) -> std::sync::Arc<global_budget::GlobalBudget> {
+        if let Some(b) = &self.global_budget {
+            return b.clone();
+        }
+        self.budget_cell
+            .get_or_init(|| {
+                std::sync::Arc::new(global_budget::GlobalBudget::new(
+                    self.global_byte_budget,
+                    self.max_connections,
+                    self.per_connection_floor,
+                ))
+            })
+            .clone()
     }
 }
 
@@ -496,6 +566,9 @@ impl Debug for Config {
             .field("max_pending_want_replies", &self.max_pending_want_replies)
             .field("max_channels", &self.max_channels)
             .field("open_decision_deadline", &self.open_decision_deadline)
+            .field("global_byte_budget", &self.global_byte_budget)
+            .field("max_connections", &self.max_connections)
+            .field("per_connection_floor", &self.per_connection_floor)
             .finish()
     }
 }
@@ -1407,6 +1480,18 @@ where
     let handshake_deadline_at =
         tokio::time::Instant::now() + config.handshake_deadline;
 
+    // S4d: CAS the process ledger before any Session exists. Full →
+    // drop the socket (no banner, no half-init). DISCONNECT is not
+    // useful before the SSH id exchange.
+    let budget = config.shared_budget();
+    let conn_budget = match budget.try_acquire(&config) {
+        Ok(acc) => Some(acc),
+        Err(_) => {
+            log::debug!("max_connections / global budget: drop socket, no Session");
+            return Err(crate::Error::MaxConnections.into());
+        }
+    };
+
     // Writing SSH id (inside handshake budget).
     let mut write_buffer = SSHBuffer::new();
     write_buffer.send_ssh_id(&config.as_ref().server_id);
@@ -1483,6 +1568,8 @@ where
         global_replies: crate::ReplyQueue::default(),
         openings: std::collections::HashMap::new(),
         channel_gens: std::collections::HashMap::new(),
+        conn_budget,
+        channel_global_held: HashMap::new(),
     };
 
     session.begin_rekey()?;

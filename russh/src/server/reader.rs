@@ -569,6 +569,13 @@ impl ReaderHandle {
         self.lanes.lock().ok().and_then(|g| g.is_confirmed(id))
     }
 
+    #[cfg(any(test, feature = "_test_hooks"))]
+    pub fn debug_consume_window(&self, id: ChannelId, len: usize) {
+        if let Ok(mut g) = self.lanes.lock() {
+            g.consume_window(id, len);
+        }
+    }
+
     /// Single inbound-window ledger. Session must not independently `-=`.
     pub fn sender_window(&self, id: ChannelId) -> Option<u32> {
         self.lanes.lock().ok().and_then(|g| g.window_remaining(id))

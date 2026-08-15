@@ -618,6 +618,8 @@ mod tests {
             global_replies: crate::ReplyQueue::default(),
             openings: std::collections::HashMap::new(),
             channel_gens: std::collections::HashMap::new(),
+            conn_budget: None,
+            channel_global_held: std::collections::HashMap::new(),
         }
     }
 
@@ -1891,6 +1893,7 @@ impl Session {
                         o.note_lane_close(channel_num.number());
                     }
                 }
+                self.release_channel_global(channel_num);
                 self.publish_slots();
 
                 Ok(())

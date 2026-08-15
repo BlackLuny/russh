@@ -144,9 +144,10 @@ impl Handler for RecHandler {
         while self.rec.data_hold.load(Ordering::SeqCst) {
             sleep(Duration::from_millis(5)).await;
         }
-        self.rec
-            .bytes
-            .fetch_add(data.len() as u64, Ordering::SeqCst);
+        // Record snapshots BEFORE bumping `bytes`: tests gate on
+        // `bytes >= n` and then read these. Since S4b each getter is a
+        // facade oneshot roundtrip (ms-scale under load), so storing
+        // `bytes` first opens a stale-read race (seen as last_window==0).
         self.rec
             .last_window
             .store(session.window_size(&id), Ordering::SeqCst);
@@ -156,6 +157,9 @@ impl Handler for RecHandler {
         self.rec
             .last_sender
             .store(session.sender_window_size(id) as u32, Ordering::SeqCst);
+        self.rec
+            .bytes
+            .fetch_add(data.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 

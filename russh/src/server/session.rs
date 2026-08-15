@@ -130,6 +130,13 @@ pub struct Session {
     pub(crate) openings: HashMap<ChannelId, OpeningSlot>,
     /// Last generation issued per channel id (ABA guard).
     pub(crate) channel_gens: HashMap<ChannelId, u64>,
+    /// This connection's slice of the process-level ledger (S4d).
+    /// `None` on object-test sessions that never went through `run_stream`.
+    pub(crate) conn_budget: Option<crate::server::global_budget::ConnAccount>,
+    /// Per-channel bytes reserved from `conn_budget` (opening estimate
+    /// + subsequent grant Δ). Refunded exactly once at the S4c release
+    /// point for that channel.
+    pub(crate) channel_global_held: HashMap<ChannelId, u64>,
 }
 
 /// One reserved peer-initiated CHANNEL_OPEN (S4c).
@@ -139,6 +146,8 @@ pub(crate) struct OpeningSlot {
     pub deadline: tokio::time::Instant,
     pub recipient_channel: u32,
     pub lease: std::sync::Arc<crate::OpeningLease>,
+    /// `window_size + OUTBOUND_CAP_ESTIMATE` reserved at slot occupy.
+    pub reserved: u64,
 }
 
 /// Completion actions when **both** outbound InstallAck and peer-Done are satisfied.
@@ -886,10 +895,67 @@ impl Handle {
 }
 
 impl Session {
-    /// S4 replaces the body. S3c only calls it on the grant path.
-    /// Always `Ok(())` — no global inbound budget in this slice.
-    pub(crate) fn reserve_global_inbound_credit(_n: u32) -> Result<(), ()> {
-        Ok(())
+    /// Reserve `n` bytes of inbound grant credit from the process
+    /// ledger (S4d). Failure is synchronous: the caller must skip
+    /// expand and ADJUST. Object-test sessions with no account succeed.
+    pub(crate) fn reserve_global_inbound_credit(&self, n: u32) -> Result<(), ()> {
+        self.reserve_global_bytes(n as u64)
+    }
+
+    fn reserve_global_bytes(&self, n: u64) -> Result<(), ()> {
+        let Some(acc) = self.conn_budget.as_ref() else {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref o) = self.common.config.window_observe {
+                o.note_global_reserve();
+                o.note_reserved_delta(n.min(u32::MAX as u64) as u32);
+            }
+            return Ok(());
+        };
+        let r = acc.try_reserve(n);
+        if r.is_ok() {
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref o) = self.common.config.window_observe {
+                o.note_global_reserve();
+                o.note_reserved_delta(n.min(u32::MAX as u64) as u32);
+            }
+        }
+        r
+    }
+
+    fn release_global_inbound_credit(&self, n: u64) {
+        if let Some(acc) = self.conn_budget.as_ref() {
+            acc.release(n);
+        }
+    }
+
+    fn add_channel_held(&mut self, id: ChannelId, n: u64) {
+        if n == 0 {
+            return;
+        }
+        *self.channel_global_held.entry(id).or_insert(0) += n;
+    }
+
+    /// Refund this channel's global reservation. Exactly-once: the map
+    /// entry is taken. Hung on S4c release points only.
+    pub(crate) fn release_channel_global(&mut self, id: ChannelId) {
+        if let Some(n) = self.channel_global_held.remove(&id) {
+            self.release_global_inbound_credit(n);
+        }
+    }
+
+    fn opening_budget_need(&self) -> u64 {
+        crate::server::global_budget::opening_estimate(&self.common.config)
+    }
+
+    fn invert_global_before_expand(&self) -> bool {
+        #[cfg(feature = "_test_hooks")]
+        {
+            self.common.config.invert_global_before_expand
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        {
+            false
+        }
     }
 
     fn max_channels(&self) -> usize {
@@ -1001,6 +1067,12 @@ impl Session {
             self.publish_slots();
             return None;
         }
+        let need = self.opening_budget_need();
+        if self.reserve_global_bytes(need).is_err() {
+            log::debug!("global opening reserve failed; OPEN_FAILURE");
+            self.publish_slots();
+            return None;
+        }
         let id = self.alloc_sender_channel();
         let generation = self.next_open_gen(id);
         let lease = crate::OpeningLease::new(generation);
@@ -1013,8 +1085,10 @@ impl Session {
                 deadline,
                 recipient_channel,
                 lease: lease.clone(),
+                reserved: need,
             },
         );
+        self.add_channel_held(id, need);
         self.publish_slots();
         Some((id, lease))
     }
@@ -1060,6 +1134,8 @@ impl Session {
         if let Some(r) = &self.reader {
             r.close_lane(id, r.lane_gen(id).unwrap_or(0));
         }
+        self.channel_global_held.remove(&id);
+        self.release_global_inbound_credit(slot.reserved);
         self.write_open_failure(slot.recipient_channel, reason)?;
         self.publish_slots();
         Ok(())
@@ -1674,8 +1750,65 @@ impl Session {
             }
             return Ok(());
         }
-        let _ = Self::reserve_global_inbound_credit(target.saturating_sub(undelivered));
-        let granted = self.grant_expand_then_adjust(id, target, undelivered)?;
+        let delta = self.planned_grant_delta(id, target, undelivered);
+        if self.invert_global_before_expand() {
+            // G4 invert: same two production operations, swapped.
+            let granted = self.grant_expand_then_adjust(id, target, undelivered, delta)?;
+            if granted && delta > 0 {
+                if self.reserve_global_inbound_credit(delta).is_err() {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(acc) = self.conn_budget.as_ref() {
+                        acc.budget().note_expand_before_global();
+                    }
+                } else {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(acc) = self.conn_budget.as_ref() {
+                        acc.budget().note_expand_before_global();
+                    }
+                    self.add_channel_held(id, delta as u64);
+                }
+            }
+            if granted {
+                self.deferred_window_grants.remove(&id);
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref s) = self.common.config.deferred_grant {
+                    s.note_emitted();
+                }
+                let w = self
+                    .dispatch_adjust_window(handler, id, self.target_window_size)
+                    .await;
+                if w > 0 {
+                    self.target_window_size = w;
+                }
+                let _ = self.flush();
+            } else {
+                self.deferred_window_grants.remove(&id);
+            }
+            return Ok(());
+        }
+        // Production order: global reserve, then expand, then ADJUST.
+        if delta > 0 && self.reserve_global_inbound_credit(delta).is_err() {
+            log::debug!("global inbound credit exhausted; skip grant");
+            #[cfg(feature = "_test_hooks")]
+            if let Some(acc) = self.conn_budget.as_ref() {
+                acc.budget().note_grant_reserve_fail();
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "_test_hooks")]
+        if delta > 0 {
+            if let Some(acc) = self.conn_budget.as_ref() {
+                acc.budget().note_global_before_expand();
+            }
+        }
+        let granted = self.grant_expand_then_adjust(id, target, undelivered, delta)?;
+        if granted {
+            if delta > 0 {
+                self.add_channel_held(id, delta as u64);
+            }
+        } else if delta > 0 {
+            self.release_global_inbound_credit(delta as u64);
+        }
         if granted {
             self.deferred_window_grants.remove(&id);
             #[cfg(feature = "_test_hooks")]
@@ -1699,15 +1832,7 @@ impl Session {
         Ok(())
     }
 
-    /// Hard grant order: expand Reader cap first, then seal ADJUST.
-    /// Expand fail (gone / wrong gen) → no ADJUST + count. Never awaits Reader.
-    fn grant_expand_then_adjust(
-        &mut self,
-        id: ChannelId,
-        target: u32,
-        undelivered: u32,
-    ) -> Result<bool, crate::Error> {
-        use crate::server::inbound_lane::ExpandCap;
+    fn planned_grant_delta(&self, id: ChannelId, target: u32, undelivered: u32) -> u32 {
         let ceiling = target.saturating_sub(undelivered);
         let remaining = if let Some(r) = self.reader.as_ref() {
             r.sender_window(id).unwrap_or(0)
@@ -1719,9 +1844,38 @@ impl Session {
                 .unwrap_or(0)
         };
         if remaining >= ceiling / 2 {
-            return Ok(false);
+            return 0;
         }
-        let delta = ceiling.saturating_sub(remaining);
+        ceiling.saturating_sub(remaining)
+    }
+
+    /// Hard grant order: expand Reader cap first, then seal ADJUST.
+    /// `delta` is computed once by the caller (`planned_grant_delta`)
+    /// and must not be recomputed from a later window snapshot
+    /// (S4d r1 P1-1). Expand fail → no ADJUST + count. Never awaits Reader.
+    fn grant_expand_then_adjust(
+        &mut self,
+        id: ChannelId,
+        target: u32,
+        undelivered: u32,
+        mut delta: u32,
+    ) -> Result<bool, crate::Error> {
+        use crate::server::inbound_lane::ExpandCap;
+        let ceiling = target.saturating_sub(undelivered);
+        let invert_recompute = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common.config.invert_recompute_grant_delta
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                false
+            }
+        };
+        if invert_recompute {
+            // G7 invert: same two production reads, second snapshot.
+            delta = self.planned_grant_delta(id, target, undelivered);
+        }
         if delta == 0 {
             return Ok(false);
         }
@@ -1765,7 +1919,10 @@ impl Session {
         #[cfg(feature = "_test_hooks")]
         if let Some(ref o) = self.common.config.window_observe {
             match result {
-                ExpandCap::Expanded => o.note_expand_ok(),
+                ExpandCap::Expanded => {
+                    o.note_expand_ok();
+                    o.note_expand_delta(delta);
+                }
                 ExpandCap::NoLane | ExpandCap::GenMismatch => o.note_expand_fail(),
             }
         }
@@ -1786,6 +1943,7 @@ impl Session {
             #[cfg(feature = "_test_hooks")]
             if let Some(ref o) = self.common.config.window_observe {
                 o.note_adjust_emitted();
+                o.note_adjust_delta(delta);
             }
         }
         Ok(emitted)
@@ -2004,6 +2162,7 @@ impl Session {
             // is never a parked `pending_close` left to lose here.
             enc.channels.remove(&id);
         }
+        self.release_channel_global(id);
         self.publish_slots();
     }
 
@@ -4990,7 +5149,7 @@ impl Session {
         if slot.generation != pending.generation {
             return Ok(());
         }
-        let _slot = self.openings.remove(&id);
+        let reserved = self.openings.remove(&id).expect("opening present").reserved;
 
         if let Err(reason) = result {
             // Opening never had a lane (S3c #13 registers on accept).
@@ -4999,6 +5158,8 @@ impl Session {
             if let Some(r) = &self.reader {
                 r.close_lane(id, r.lane_gen(id).unwrap_or(0));
             }
+            self.channel_global_held.remove(&id);
+            self.release_global_inbound_credit(reserved);
             self.write_open_failure(pending.recipient_channel, reason)?;
             let e = self.channel_gens.entry(id).or_insert(pending.generation);
             *e = e.wrapping_add(1);
@@ -5650,19 +5811,29 @@ impl Session {
             return Err(Error::SendError);
         }
 
-        let result = if let Some(ref mut enc) = self.common.encrypted {
-            if !matches!(
+        let authenticated = self.common.encrypted.as_ref().is_some_and(|enc| {
+            matches!(
                 enc.state,
                 EncryptedState::Authenticated | EncryptedState::InitCompression
-            ) {
-                return Err(Error::Inconsistent);
-            }
+            )
+        });
+        if !authenticated {
+            return Err(Error::Inconsistent);
+        }
 
+        let opening_need = self.opening_budget_need();
+        if self.reserve_global_bytes(opening_need).is_err() {
+            return Err(Error::ChannelOpenFailure(
+                ChannelOpenFailure::ResourceShortage,
+            ));
+        }
+
+        let sender_channel = {
+            let enc = self.common.encrypted.as_mut().expect("encrypted");
             let sender_channel = enc.new_channel(
                 self.common.config.window_size,
                 self.common.config.maximum_packet_size,
             );
-            // Patch channel id into body (4-byte BE after type + kind string).
             {
                 use byteorder::{BigEndian, ByteOrder};
                 let cid = u32::from(sender_channel);
@@ -5672,14 +5843,13 @@ impl Session {
                 enc.write.extend_from_slice(&body);
             });
             sender_channel
-        } else {
-            return Err(Error::Inconsistent);
         };
+        self.add_channel_held(sender_channel, opening_need);
         // CHANNEL_OPEN is only buffered in enc.write. The caller
         // (`dispatch_msg` ChannelOpen*) registers the inbound lane in
         // the same turn: no await and no Writer submit between this
         // write and `register_inbound_lane`.
-        Ok(result)
+        Ok(sender_channel)
     }
 
     /// Requests that the client forward connections to the given host and port.
@@ -5972,6 +6142,8 @@ mod tests {
             global_replies: ReplyQueue::default(),
             openings: HashMap::new(),
             channel_gens: HashMap::new(),
+            conn_budget: None,
+            channel_global_held: HashMap::new(),
         }
     }
 
@@ -8387,6 +8559,86 @@ mod tests {
                 .sender_window_size(id),
             target as usize
         );
+    }
+
+    /// G7: reserved Δ == expand/ADJUST Δ. After planning, consume the
+    /// remaining window so a second snapshot would double the grant.
+    #[cfg(feature = "_test_hooks")]
+    fn g7_round(recompute: bool) -> Result<(), &'static str> {
+        use crate::server::inbound_lane::LaneTable;
+        use crate::server::reader::ReaderHandle;
+        use crate::server::WindowObserveSlot;
+
+        let mut cfg = crate::server::Config::default();
+        let wobs = WindowObserveSlot::new();
+        cfg.window_observe = Some(wobs.clone());
+        cfg.invert_recompute_grant_delta = recompute;
+        let mut session = authenticated_session_with(cfg);
+        let target = 256u32;
+        session.target_window_size = target;
+        let id = insert_encrypted_channel(&mut session, target);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
+
+        let r1 = target / 2 - 1;
+        let lanes = std::sync::Arc::new(std::sync::Mutex::new(LaneTable::new(8, 32)));
+        {
+            let mut g = lanes.lock().unwrap();
+            g.open(id, 1, target, 32, true);
+            g.consume_window(id, (target - r1) as usize);
+            assert_eq!(g.window_remaining(id), Some(r1));
+        }
+        session.reader = Some(ReaderHandle::test_stub(lanes.clone()));
+
+        let delta = session.planned_grant_delta(id, target, 0);
+        if delta == 0 {
+            return Err("no_grant");
+        }
+        if session.reserve_global_inbound_credit(delta).is_err() {
+            return Err("reserve");
+        }
+        lanes.lock().unwrap().consume_window(id, r1 as usize);
+        assert_eq!(
+            lanes.lock().unwrap().window_remaining(id),
+            Some(0)
+        );
+
+        let granted = session
+            .grant_expand_then_adjust(id, target, 0, delta)
+            .map_err(|_| "grant")?;
+        if !granted {
+            return Err("not_granted");
+        }
+        let reserved = wobs.last_reserved_delta();
+        let expand = wobs.last_expand_delta();
+        let adjust = wobs.last_adjust_delta();
+        if expand != reserved {
+            return Err("delta_mismatch");
+        }
+        if adjust != reserved {
+            return Err("adjust_mismatch");
+        }
+        if expand != delta {
+            return Err("delta_mismatch");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[test]
+    fn g7_reserved_equals_granted() {
+        g7_round(false).unwrap_or_else(|e| panic!("G7 HARD: production identity failed: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[test]
+    fn g7_recompute_delta_is_red() {
+        match g7_round(true) {
+            Err("delta_mismatch") | Err("adjust_mismatch") => {}
+            other => panic!(
+                "G7 HARD: invert must fail with enumerated class \
+                 (delta_mismatch|adjust_mismatch), got {other:?}"
+            ),
+        }
     }
 
     /// A producer parked in `Handle::data` whose channel is torn down (peer close / inbound

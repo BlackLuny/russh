@@ -588,6 +588,12 @@ pub struct WindowObserveSlot {
     cap_expanded_seq: AtomicU64,
     /// Monotonic ticket taken when ADJUST is written into `enc.write`.
     adjust_emitted_seq: AtomicU64,
+    /// Monotonic ticket taken when global inbound credit is reserved
+    /// on the grant path (S4d G4). Same `seq` space as expand/ADJUST.
+    global_reserve_seq: AtomicU64,
+    last_reserved_delta: AtomicU32,
+    last_expand_delta: AtomicU32,
+    last_adjust_delta: AtomicU32,
     seq: AtomicU64,
 }
 
@@ -659,10 +665,35 @@ impl WindowObserveSlot {
         let n = self.seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         self.adjust_emitted_seq.store(n, Ordering::SeqCst);
     }
+    pub fn note_global_reserve(&self) {
+        let n = self.seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        self.global_reserve_seq.store(n, Ordering::SeqCst);
+    }
     pub fn cap_expanded_seq(&self) -> u64 {
         self.cap_expanded_seq.load(Ordering::SeqCst)
     }
     pub fn adjust_emitted_seq(&self) -> u64 {
         self.adjust_emitted_seq.load(Ordering::SeqCst)
+    }
+    pub fn global_reserve_seq(&self) -> u64 {
+        self.global_reserve_seq.load(Ordering::SeqCst)
+    }
+    pub fn note_reserved_delta(&self, n: u32) {
+        self.last_reserved_delta.store(n, Ordering::SeqCst);
+    }
+    pub fn note_expand_delta(&self, n: u32) {
+        self.last_expand_delta.store(n, Ordering::SeqCst);
+    }
+    pub fn note_adjust_delta(&self, n: u32) {
+        self.last_adjust_delta.store(n, Ordering::SeqCst);
+    }
+    pub fn last_reserved_delta(&self) -> u32 {
+        self.last_reserved_delta.load(Ordering::SeqCst)
+    }
+    pub fn last_expand_delta(&self) -> u32 {
+        self.last_expand_delta.load(Ordering::SeqCst)
+    }
+    pub fn last_adjust_delta(&self) -> u32 {
+        self.last_adjust_delta.load(Ordering::SeqCst)
     }
 }
