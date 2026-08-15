@@ -182,8 +182,8 @@ impl Server {
             window_size: 64 * 1024,
             maximum_packet_size: 32 * 1024,
             channel_buffer_size: 4,
-            limits: russh::Limits {
-                rekey_write_limit: REKEY_WRITE_LIMIT,
+            limits: russh::RekeyPolicy {
+                max_bytes: REKEY_WRITE_LIMIT as u64,
                 ..Default::default()
             },
             ..Default::default()

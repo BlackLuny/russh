@@ -102,7 +102,7 @@ pub struct WriterHooks {
     pub packets_override: Option<Arc<AtomicU64>>,
     /// Share this cipher-bytes atomic with Session (S6a W6 inject).
     #[cfg(feature = "_test_hooks")]
-    pub cipher_bytes_override: Option<Arc<AtomicUsize>>,
+    pub cipher_bytes_override: Option<Arc<AtomicU64>>,
     /// I6/W3: live observation of outbound epoch packet count / seqn.
     #[cfg(feature = "_test_hooks")]
     pub observe: Option<Arc<WriterObserveSlot>>,
@@ -298,7 +298,7 @@ pub struct WriterHandle {
     /// Submitted-but-not-on-socket bytes (queue + out_q + current).
     pending_bytes: Arc<AtomicUsize>,
     /// PacketWriter.buffer().bytes for rekey volume limits.
-    cipher_bytes: Arc<AtomicUsize>,
+    cipher_bytes: Arc<AtomicU64>,
     /// I5 outbound packet count this key-epoch (Session-readable).
     packets_this_epoch: Arc<AtomicU64>,
     capacity: Arc<Notify>,
@@ -621,7 +621,7 @@ impl WriterHandle {
     }
 
     /// Volume counter for rekey write limit (PacketWriter.buffer().bytes).
-    pub fn cipher_bytes(&self) -> usize {
+    pub fn cipher_bytes(&self) -> u64 {
         self.cipher_bytes.load(Ordering::Acquire)
     }
 
@@ -732,9 +732,9 @@ where
     let cipher_bytes = hooks
         .cipher_bytes_override
         .clone()
-        .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
     #[cfg(not(feature = "_test_hooks"))]
-    let cipher_bytes = Arc::new(AtomicUsize::new(0));
+    let cipher_bytes = Arc::new(AtomicU64::new(0));
     let cipher_bytes_w = cipher_bytes.clone();
     #[cfg(feature = "_test_hooks")]
     let packets_this_epoch = hooks
@@ -796,7 +796,7 @@ where
                 #[cfg(feature = "_test_hooks")]
                 drain_segs.push_back((pre_len, false));
             }
-            cipher_bytes_w.store(packet_writer.buffer().bytes, Ordering::Release);
+            cipher_bytes_w.store(packet_writer.buffer().bytes as u64, Ordering::Release);
         }
 
         loop {
@@ -1097,7 +1097,7 @@ fn seal_one_payload(
     packet_writer: &mut PacketWriter,
     out_q: &mut VecDeque<Bytes>,
     pending_bytes: &AtomicUsize,
-    cipher_bytes: &AtomicUsize,
+    cipher_bytes: &AtomicU64,
     packets_this_epoch: &AtomicU64,
     p: Bytes,
     hooks: &WriterHooks,
@@ -1205,7 +1205,7 @@ fn seal_one_payload(
         #[cfg(feature = "_test_hooks")]
         drain_segs.push_back((wire_len, as_kex));
     }
-    cipher_bytes.store(packet_writer.buffer().bytes, Ordering::Release);
+    cipher_bytes.store(packet_writer.buffer().bytes as u64, Ordering::Release);
     packets_this_epoch.fetch_add(1, Ordering::AcqRel);
     #[cfg(feature = "_test_hooks")]
     if let Some(ref o) = hooks.observe {
@@ -1216,7 +1216,7 @@ fn seal_one_payload(
 
 fn install_epoch(
     packet_writer: &mut PacketWriter,
-    cipher_bytes: &AtomicUsize,
+    cipher_bytes: &AtomicU64,
     packets_this_epoch: &AtomicU64,
     cipher: Box<dyn SealingKey + Send>,
     outbound_compression: Compression,
@@ -1278,7 +1278,7 @@ fn handle_writer_cmd(
     packet_writer: &mut PacketWriter,
     out_q: &mut VecDeque<Bytes>,
     pending_bytes: &AtomicUsize,
-    cipher_bytes: &AtomicUsize,
+    cipher_bytes: &AtomicU64,
     packets_this_epoch: &AtomicU64,
     evt_tx: &mpsc::UnboundedSender<WriterEvent>,
     shutting_down: &mut bool,

@@ -298,10 +298,9 @@ async fn test_kex_done_on_rekey() {
         p
     };
     // Set rekey limits very low to trigger rekey quickly
-    client_config.limits = Limits {
-        rekey_write_limit: 1024, // Rekey after 1KB of data
-        rekey_read_limit: 1024,
-        rekey_time_limit: std::time::Duration::from_secs(1),
+    client_config.limits = RekeyPolicy {
+        max_bytes: 1024, // Rekey after 1KB of data
+        ..Default::default()
     };
     let client_config = Arc::new(client_config);
 
@@ -332,7 +331,7 @@ async fn test_kex_done_on_rekey() {
     // Open a channel and send enough data to trigger rekey
     let mut channel = session.channel_open_session().await.unwrap();
 
-    // Send data to trigger rekey (more than rekey_write_limit)
+    // Send data to trigger rekey (more than max_bytes)
     let large_data = vec![0u8; 2048];
     channel.data(&large_data[..]).await.unwrap();
 

@@ -9,7 +9,7 @@
 
 mod harness;
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ struct S6aSetup {
     i6: Arc<RekeyI6>,
     out_pkts: Arc<AtomicU64>,
     in_pkts: Arc<AtomicU64>,
-    out_bytes: Arc<AtomicUsize>,
+    out_bytes: Arc<AtomicU64>,
     in_bytes: Arc<AtomicU64>,
     writer_obs: Arc<WriterObserveSlot>,
     reader_obs: Arc<ReaderObserveSlot>,
@@ -85,8 +85,7 @@ struct S6aOpts {
     flood: bool,
     flood_start: Option<Arc<FloodStartGate>>,
     nonstrict: bool,
-    write_limit: usize,
-    read_limit: usize,
+    max_bytes: u64,
     ack_hold: Option<Arc<InstallAckHoldGate>>,
 }
 
@@ -99,8 +98,7 @@ impl Default for S6aOpts {
             flood: false,
             flood_start: None,
             nonstrict: false,
-            write_limit: usize::MAX / 4,
-            read_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             ack_hold: None,
         }
     }
@@ -111,7 +109,7 @@ async fn connect_s6a(opts: S6aOpts) -> Result<S6aSetup, anyhow::Error> {
     let i6 = RekeyI6::new();
     let out_pkts = Arc::new(AtomicU64::new(0));
     let in_pkts = Arc::new(AtomicU64::new(0));
-    let out_bytes = Arc::new(AtomicUsize::new(0));
+    let out_bytes = Arc::new(AtomicU64::new(0));
     let in_bytes = Arc::new(AtomicU64::new(0));
     let writer_obs = WriterObserveSlot::new();
     let reader_obs = ReaderObserveSlot::new();
@@ -126,9 +124,7 @@ async fn connect_s6a(opts: S6aOpts) -> Result<S6aSetup, anyhow::Error> {
                 ServerMode::Idle
             },
             flood_start: opts.flood_start,
-            rekey_write_limit: opts.write_limit,
-            rekey_read_limit: opts.read_limit,
-            rekey_time_limit: Duration::from_secs(3600),
+            max_bytes: opts.max_bytes,
             kex_install_observe: Some(observe.clone()),
             rekey_i6: Some(i6.clone()),
             rekey_out_packets: Some(out_pkts.clone()),
@@ -431,7 +427,7 @@ async fn w6_outbound_bytes_trigger() -> Result<(), anyhow::Error> {
     let setup = connect_s6a(S6aOpts {
         flood: true,
         flood_start: Some(gate.clone()),
-        write_limit: 64,
+        max_bytes: 64,
         ..S6aOpts::default()
     })
     .await?;
@@ -444,12 +440,12 @@ async fn w6_outbound_bytes_trigger() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// W6 inbound: seed read bytes near rekey_read_limit (P8-1).
+/// W6 inbound: seed read bytes near `max_bytes` (P8-1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6_inbound_bytes_trigger() -> Result<(), anyhow::Error> {
     let _ = env_logger::builder().is_test(false).try_init();
     let setup = connect_s6a(S6aOpts {
-        read_limit: 64,
+        max_bytes: 64,
         ..S6aOpts::default()
     })
     .await?;
@@ -468,7 +464,7 @@ async fn w6_bytes_still_fire_when_packets_skipped() -> Result<(), anyhow::Error>
     let _ = env_logger::builder().is_test(false).try_init();
     let setup = connect_s6a(S6aOpts {
         invert_skip_pkts: true,
-        read_limit: 32,
+        max_bytes: 32,
         ..S6aOpts::default()
     })
     .await?;

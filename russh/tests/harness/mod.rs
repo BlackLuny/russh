@@ -7,7 +7,7 @@
 //!
 //! Primary knobs are env-overridable (same style as `test_inbound_window_stall.rs`):
 //! - `S0_OBSERVE_SECS` (default 10): how long to watch for disconnect / progress
-//! - `S0_REKEY_WRITE_LIMIT` (default 256 KiB): server volume rekey trigger
+//! - `S0_REKEY_WRITE_LIMIT` (default 256 KiB): server volume rekey `max_bytes`
 //! - `S0_WINDOW` / `S0_PACKET` (defaults 64 KiB / 32 KiB)
 //!
 //! Run S0 with the test hook feature:
@@ -59,8 +59,8 @@ pub fn observe_secs() -> u64 {
     env_u64("S0_OBSERVE_SECS", 10)
 }
 
-pub fn rekey_write_limit() -> usize {
-    env_usize("S0_REKEY_WRITE_LIMIT", 256 * 1024)
+pub fn rekey_max_bytes() -> u64 {
+    env_u64("S0_REKEY_WRITE_LIMIT", 256 * 1024)
 }
 
 pub fn window_size() -> u32 {
@@ -719,9 +719,7 @@ pub struct FloodServerConfig {
     pub window_size: u32,
     pub maximum_packet_size: u32,
     pub channel_buffer_size: usize,
-    pub rekey_write_limit: usize,
-    pub rekey_read_limit: usize,
-    pub rekey_time_limit: Duration,
+    pub max_bytes: u64,
     pub inactivity_timeout: Option<Duration>,
     pub keepalive_interval: Option<Duration>,
     pub keepalive_max: usize,
@@ -835,7 +833,7 @@ pub struct FloodServerConfig {
     #[cfg(feature = "_test_hooks")]
     pub rekey_out_packets: Option<Arc<AtomicU64>>,
     #[cfg(feature = "_test_hooks")]
-    pub rekey_out_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    pub rekey_out_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
     #[cfg(feature = "_test_hooks")]
     pub rekey_in_packets: Option<Arc<AtomicU64>>,
     #[cfg(feature = "_test_hooks")]
@@ -860,9 +858,7 @@ impl Default for FloodServerConfig {
             window_size: window_size(),
             maximum_packet_size: packet_size(),
             channel_buffer_size: 4,
-            rekey_write_limit: rekey_write_limit(),
-            rekey_read_limit: usize::MAX / 4,
-            rekey_time_limit: Duration::from_secs(3600),
+            max_bytes: rekey_max_bytes(),
             // Keep defaults high enough that timers don't steal the show unless a
             // test shortens them deliberately (talk-no-read).
             inactivity_timeout: Some(Duration::from_secs(600)),
@@ -989,10 +985,9 @@ impl FloodServer {
                 window_size: self.cfg.window_size,
                 maximum_packet_size: self.cfg.maximum_packet_size,
                 channel_buffer_size: self.cfg.channel_buffer_size,
-                limits: russh::Limits {
-                    rekey_write_limit: self.cfg.rekey_write_limit,
-                    rekey_read_limit: self.cfg.rekey_read_limit,
-                    rekey_time_limit: self.cfg.rekey_time_limit,
+                limits: russh::RekeyPolicy {
+                    max_packets: russh::RekeyPolicy::DEFAULT_MAX_PACKETS,
+                    max_bytes: self.cfg.max_bytes,
                 },
                 inactivity_timeout: self.cfg.inactivity_timeout,
                 keepalive_interval: self.cfg.keepalive_interval,

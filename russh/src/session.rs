@@ -30,7 +30,7 @@ use crate::kex::dh::groups::DhGroup;
 use crate::kex::{KexAlgorithm, KexAlgorithmImplementor};
 use crate::sshbuffer::PacketWriter;
 use crate::{
-    ChannelId, ChannelParams, CryptoVec, Disconnect, Limits, auth, cipher, mac, msg, negotiation,
+    ChannelId, ChannelParams, CryptoVec, Disconnect, RekeyPolicy, auth, cipher, mac, msg, negotiation,
 };
 
 #[derive(Debug)]
@@ -51,7 +51,6 @@ pub(crate) struct Encrypted {
     // holds only protocol framing and ciphertext.
     pub write: Vec<u8>,
     pub write_cursor: usize,
-    pub last_rekey: russh_util::time::Instant,
     pub server_compression: crate::compression::Compression,
     pub client_compression: crate::compression::Compression,
     pub decompress: crate::compression::Decompress,
@@ -209,7 +208,6 @@ impl<C> CommonSession<C> {
             last_channel_id: Wrapping(1),
             write: Vec::new(),
             write_cursor: 0,
-            last_rekey: russh_util::time::Instant::now(),
             server_compression: newkeys.names.server_compression,
             client_compression: newkeys.names.client_compression,
             decompress: crate::compression::Decompress::None,
@@ -319,7 +317,6 @@ pub fn newkeys_rewrites_compression_enums(
             last_channel_id: Wrapping(1),
             write: Vec::new(),
             write_cursor: 0,
-            last_rekey: russh_util::time::Instant::now(),
             server_compression: old_server.clone(),
             client_compression: old_client.clone(),
             decompress: crate::compression::Decompress::None,
@@ -1125,7 +1122,7 @@ impl Encrypted {
 
     pub fn flush(
         &mut self,
-        limits: &Limits,
+        limits: &RekeyPolicy,
         writer: &mut PacketWriter,
     ) -> Result<bool, crate::Error> {
         // If there are pending packets (and we've not started to rekey), flush them.
@@ -1152,20 +1149,13 @@ impl Encrypted {
             return Ok(false);
         }
 
-        // Volume/time-based rekey initiation (shared by client and server). The zfc fork had
-        // this disabled as a workaround while inbound delivery still blocked the session loop:
-        // a rekey firing mid-bulk-transfer could park the loop in a per-channel
-        // `chan.send().await` with the receiver arm gated for the whole exchange, wedging the
-        // session permanently (reproduced at the default 1 GiB `rekey_write_limit`). Both
-        // loops now deliver inbound data without blocking (server: lane-gated; client: Scheme C), so
-        // the loop always keeps reading the socket and a re-exchange always completes;
-        // `tests/test_rekey_under_load.rs` holds the line. Deployments that still want no
-        // volume/time rekey can set `Limits` to effectively-infinite thresholds.
-        let now = russh_util::time::Instant::now();
-        let dur = now.duration_since(self.last_rekey);
+        // Volume-based rekey initiation (shared by client and server).
+        // Packet counting lives on the server Reader/Writer atomics;
+        // this single-loop path (client, and server object tests without
+        // a Writer) only sees outbound `SSHBuffer.bytes`. No time trigger
+        // (S6b / Q3).
         Ok(replace(&mut self.rekey_wanted, false)
-            || writer.buffer().bytes >= limits.rekey_write_limit
-            || dur >= limits.rekey_time_limit)
+            || (writer.buffer().bytes as u64) >= limits.max_bytes)
     }
 
     pub fn new_channel_id(&mut self) -> ChannelId {
@@ -1270,7 +1260,7 @@ mod tests {
     use crate::compression::{Compression, Decompress};
     use crate::kex::{KEXES, NONE};
     use crate::sshbuffer::PacketWriter;
-    use crate::{ChannelId, ChannelParams, CryptoVec, Limits, mac, msg};
+    use crate::{ChannelId, ChannelParams, CryptoVec, RekeyPolicy, mac, msg};
 
     fn test_encrypted() -> Encrypted {
         Encrypted {
@@ -1285,7 +1275,6 @@ mod tests {
             last_channel_id: Wrapping(0),
             write: Vec::new(),
             write_cursor: 0,
-            last_rekey: russh_util::time::Instant::now(),
             server_compression: Compression::None,
             client_compression: Compression::None,
             decompress: Decompress::None,
@@ -1853,7 +1842,7 @@ mod tests {
         let mut staged_writer = PacketWriter::clear();
         staged.flush_pending(channel_id).unwrap();
         staged
-            .flush(&Limits::default(), &mut staged_writer)
+            .flush(&RekeyPolicy::default(), &mut staged_writer)
             .unwrap();
 
         let mut direct_writer = PacketWriter::clear();
@@ -1886,7 +1875,7 @@ mod tests {
         let mut staged_writer = PacketWriter::clear();
         staged.flush_pending(channel_id).unwrap();
         staged
-            .flush(&Limits::default(), &mut staged_writer)
+            .flush(&RekeyPolicy::default(), &mut staged_writer)
             .unwrap();
 
         let mut direct_writer = PacketWriter::clear();
@@ -1958,7 +1947,7 @@ mod tests {
         encrypted
             .flush_pending_with_writer(&mut writer, channel_id)
             .unwrap();
-        encrypted.flush(&Limits::default(), &mut writer).unwrap();
+        encrypted.flush(&RekeyPolicy::default(), &mut writer).unwrap();
 
         assert_eq!(
             clear_packet_types(&writer.buffer().buffer),
@@ -1983,7 +1972,7 @@ mod tests {
         let mut staged_writer = PacketWriter::clear();
         staged.data(channel_id, payload.clone(), false).unwrap();
         staged
-            .flush(&Limits::default(), &mut staged_writer)
+            .flush(&RekeyPolicy::default(), &mut staged_writer)
             .unwrap();
 
         let mut direct_writer = PacketWriter::clear();
@@ -2020,7 +2009,7 @@ mod tests {
             .extended_data(channel_id, 1, payload.clone(), false)
             .unwrap();
         staged
-            .flush(&Limits::default(), &mut staged_writer)
+            .flush(&RekeyPolicy::default(), &mut staged_writer)
             .unwrap();
 
         let mut direct_writer = PacketWriter::clear();
@@ -2059,7 +2048,7 @@ mod tests {
             vec![msg::REQUEST_SUCCESS, msg::CHANNEL_DATA]
         );
 
-        encrypted.flush(&Limits::default(), &mut writer).unwrap();
+        encrypted.flush(&RekeyPolicy::default(), &mut writer).unwrap();
         assert_eq!(
             clear_packet_types(&writer.buffer().buffer),
             vec![msg::REQUEST_SUCCESS, msg::CHANNEL_DATA]

@@ -82,7 +82,7 @@ async fn s0_incident_repro_rekey_stall_client_initiated() -> Result<(), anyhow::
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             first_channel_mode: ServerMode::FloodForever,
             inactivity_timeout: Some(Duration::from_secs(600)),
             keepalive_interval: None,
@@ -147,7 +147,7 @@ async fn s0_incident_repro_rekey_stall_negative_no_rekey() -> Result<(), anyhow:
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             first_channel_mode: ServerMode::FloodForever,
             inactivity_timeout: Some(Duration::from_secs(600)),
             write_progress_deadline: Duration::from_secs(30),
@@ -209,7 +209,7 @@ async fn s0_talk_no_read() -> Result<(), anyhow::Error> {
             inactivity_timeout: Some(Duration::from_secs(600)),
             keepalive_interval: Some(Duration::from_secs(1)),
             keepalive_max: 100,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             flood_start: Some(flood_gate.clone()),
             write_progress_deadline: WD,
             write_min_drain: None, // activity layer alone
@@ -277,7 +277,7 @@ async fn s0_zero_window_legit() -> Result<(), anyhow::Error> {
             first_channel_mode: ServerMode::FloodForever,
             secondary_mode: ServerMode::Idle,
             inactivity_timeout: Some(Duration::from_secs(600)),
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             // Short watchdog — must NOT fire on pure peer-window=0.
             write_progress_deadline: WD,
             write_min_drain: Some((4 * 1024, WD)),
@@ -344,7 +344,7 @@ async fn s0_write_stall_during_rekey() -> Result<(), anyhow::Error> {
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             first_channel_mode: ServerMode::FloodForever,
             inactivity_timeout: Some(Duration::from_secs(600)),
             flood_start: Some(flood_gate.clone()),
@@ -434,7 +434,7 @@ async fn s1_trickle_read_min_drain_on() -> Result<(), anyhow::Error> {
             window_size: down_window,
             maximum_packet_size: pkt,
             first_channel_mode: ServerMode::FloodForever,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             inactivity_timeout: Some(Duration::from_secs(600)),
             write_progress_deadline: activity_dl,
             write_min_drain: Some((4 * 1024, min_drain_window)),
@@ -485,7 +485,7 @@ async fn s1_trickle_read_min_drain_off() -> Result<(), anyhow::Error> {
             window_size: down_window,
             maximum_packet_size: pkt,
             first_channel_mode: ServerMode::FloodForever,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             inactivity_timeout: Some(Duration::from_secs(600)),
             write_progress_deadline: activity_dl,
             write_min_drain: None, // only difference vs ON
@@ -541,7 +541,7 @@ async fn s1_rekey_stall_other_connection_unaffected() -> Result<(), anyhow::Erro
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             first_channel_mode: ServerMode::FloodForever,
             write_progress_deadline: Duration::from_secs(30),
             write_min_drain: None,
@@ -562,7 +562,7 @@ async fn s1_rekey_stall_other_connection_unaffected() -> Result<(), anyhow::Erro
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             first_channel_mode: ServerMode::FloodForever,
             write_progress_deadline: Duration::from_secs(30),
             write_min_drain: None,
@@ -705,7 +705,7 @@ async fn s2a_healthy_continuous_read_grows_past_hwm() -> Result<(), anyhow::Erro
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             first_channel_mode: ServerMode::FloodForever,
             write_progress_deadline: Duration::from_secs(30),
             write_min_drain: None,
@@ -792,7 +792,7 @@ async fn s2b1_small_packets_survive_item_queue_cap() -> Result<(), anyhow::Error
         FloodServerConfig {
             window_size: down_window,
             maximum_packet_size: pkt,
-            rekey_write_limit: usize::MAX / 4,
+            max_bytes: u64::MAX / 4,
             // FloodForever uses 16KiB chunks; server will fragment to max_packet.
             first_channel_mode: ServerMode::FloodForever,
             write_progress_deadline: Duration::from_secs(30),

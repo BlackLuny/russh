@@ -108,8 +108,9 @@ pub struct Config {
     pub auth_rejection_time_initial: Option<std::time::Duration>,
     /// The server's keys. The first key pair in the client's preference order will be chosen.
     pub keys: Vec<PrivateKey>,
-    /// The bytes and time limits before key re-exchange.
-    pub limits: Limits,
+    /// Per-epoch rekey hard limits (packets / bytes). No time trigger;
+    /// the in-flight completion deadline is `rekey_deadline`.
+    pub limits: RekeyPolicy,
     /// The initial size of a channel (used for flow control).
     pub window_size: u32,
     /// The maximal size of a single packet.
@@ -402,7 +403,7 @@ pub struct Config {
     pub pin_outbound_before_credit: bool,
     /// I6 rekey counters (always compiled; inject a shared Arc from tests).
     pub rekey_i6: std::sync::Arc<session::RekeyI6>,
-    /// S6a: override I5 packet threshold (`1<<31` when `None`).
+    /// S6a: override I5 packet threshold (`limits.max_packets` when `None`).
     #[cfg(feature = "_test_hooks")]
     pub rekey_max_packets_override: Option<u64>,
     /// S6a: share Writer packets atomic (wrap-near inject).
@@ -410,7 +411,7 @@ pub struct Config {
     pub rekey_out_packets: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// S6a: share Writer `cipher_bytes` atomic (W6 inject).
     #[cfg(feature = "_test_hooks")]
-    pub rekey_out_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    pub rekey_out_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// S6a: share Reader packets atomic.
     #[cfg(feature = "_test_hooks")]
     pub rekey_in_packets: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
@@ -465,7 +466,7 @@ impl Default for Config {
             inbound_min_packet_size: crate::server::inbound_lane::INBOUND_LANE_MIN_PACKET as u32,
             strict_window_enforcement: false,
             max_pending_outbound_bytes: 8 * 2_000_000,
-            limits: Limits::default(),
+            limits: RekeyPolicy::default(),
             preferred: Default::default(),
             max_auth_attempts: 10,
             inactivity_timeout: Some(std::time::Duration::from_secs(600)),

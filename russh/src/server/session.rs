@@ -56,9 +56,6 @@ use crate::server::writer::{stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
 use crate::{ChannelOpenFailure, ReplyQueue, ReplyVerdict, map_err, msg};
 
-/// I5 first trigger: packets per direction per key-epoch.
-pub(crate) const REKEY_MAX_PACKETS: u64 = 1 << 31;
-
 /// I6: rekey trigger / merge / idle-drop counters. Always compiled
 /// (not `_test_hooks`-gated). Reason detail goes to `tracing`/`log`.
 #[derive(Debug, Default)]
@@ -4901,7 +4898,6 @@ impl Session {
                 enc.key = newkeys.key;
                 enc.client_mac = newkeys.names.client_mac;
                 enc.server_mac = newkeys.names.server_mac;
-                enc.last_rekey = russh_util::time::Instant::now();
                 enc.client_compression = newkeys.names.client_compression.clone();
                 enc.server_compression = newkeys.names.server_compression.clone();
                 debug_assert!(
@@ -5068,26 +5064,22 @@ impl Session {
         if let Some(n) = self.common.config.rekey_max_packets_override {
             return n;
         }
-        REKEY_MAX_PACKETS
+        self.common.config.as_ref().limits.max_packets
     }
 
-    /// Four-direction I5 predicate (out/in × packets/bytes) plus existing
-    /// time / rekey_wanted. Packet threshold is `REKEY_MAX_PACKETS` (or a
-    /// `_test_hooks` override). Bytes read `Limits.rekey_write_limit` /
-    /// `rekey_read_limit` (P8-1).
+    /// Four-direction I5 predicate (out/in × packets/bytes) plus
+    /// `rekey_wanted`. Packet threshold is `limits.max_packets` (or a
+    /// `_test_hooks` override). Bytes use the single `limits.max_bytes`
+    /// in both directions. No time trigger (S6b / Q3).
     fn i5_volume_due(&mut self) -> bool {
-        let (wanted, time_due) = {
+        let wanted = {
             let Some(enc) = self.common.encrypted.as_mut() else {
                 return false;
             };
             if enc.kex.skip_exchange() {
                 return false;
             }
-            let wanted = std::mem::replace(&mut enc.rekey_wanted, false);
-            let now = russh_util::time::Instant::now();
-            let time_due = now.duration_since(enc.last_rekey)
-                >= self.common.config.as_ref().limits.rekey_time_limit;
-            (wanted, time_due)
+            std::mem::replace(&mut enc.rekey_wanted, false)
         };
         let limits = &self.common.config.as_ref().limits;
 
@@ -5119,7 +5111,7 @@ impl Session {
             } else {
                 w.packets_this_epoch()
             };
-            (pkts, w.cipher_bytes() as u64)
+            (pkts, w.cipher_bytes())
         } else {
             (0, 0)
         };
@@ -5165,8 +5157,8 @@ impl Session {
 
         let out_pkt_due = !skip_pkts && out_pkts >= max_pkts;
         let in_pkt_due = !skip_pkts && in_pkts >= max_pkts;
-        let out_byte_due = out_bytes >= limits.rekey_write_limit as u64;
-        let in_byte_due = in_bytes >= limits.rekey_read_limit as u64;
+        let out_byte_due = out_bytes >= limits.max_bytes;
+        let in_byte_due = in_bytes >= limits.max_bytes;
         let out_due = out_pkt_due || out_byte_due;
         let in_due = in_pkt_due || in_byte_due;
         if out_due && in_due {
@@ -5175,11 +5167,11 @@ impl Session {
         if out_pkt_due || in_pkt_due || out_byte_due || in_byte_due {
             debug!(
                 "i5 rekey due out_pkts={out_pkts}/{max_pkts} in_pkts={in_pkts}/{max_pkts} \
-                 out_bytes={out_bytes}/{} in_bytes={in_bytes}/{} time={time_due} wanted={wanted}",
-                limits.rekey_write_limit, limits.rekey_read_limit
+                 out_bytes={out_bytes}/{max_bytes} in_bytes={in_bytes}/{max_bytes} wanted={wanted}",
+                max_bytes = limits.max_bytes
             );
         }
-        wanted || out_due || in_due || time_due
+        wanted || out_due || in_due
     }
 
     fn apply_i5_rekey(&mut self, due: bool) -> Result<(), crate::Error> {
@@ -6606,7 +6598,6 @@ mod tests {
                     last_channel_id: Wrapping(0),
                     write: Vec::new(),
                     write_cursor: 0,
-                    last_rekey: russh_util::time::Instant::now(),
                     server_compression: Compression::None,
                     client_compression: Compression::None,
                     decompress: Decompress::None,

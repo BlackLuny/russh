@@ -49,7 +49,6 @@ use futures::stream::FuturesUnordered;
 use futures::task::{Context, Poll};
 use kex::ClientKex;
 use log::{debug, error, trace, warn};
-use russh_util::time::Instant;
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -75,7 +74,7 @@ use crate::session::{CommonSession, EncryptedState, GlobalRequestResponse, NewKe
 use crate::ssh_read::SshRead;
 use crate::sshbuffer::{IncomingSshPacket, PacketWriter, SSHBuffer, SshId};
 use crate::{
-    ChannelId, ChannelOpenFailure, Disconnect, Error, Limits, MethodSet, Sig, auth, map_err, msg,
+    ChannelId, ChannelOpenFailure, Disconnect, Error, MethodSet, RekeyPolicy, Sig, auth, map_err, msg,
     negotiation,
 };
 
@@ -2132,7 +2131,6 @@ async fn reply<H: Handler>(
                             common.newkeys(newkeys);
                             common.packet_writer.buffer().bytes = 0;
                             if let Some(enc) = common.encrypted.as_mut() {
-                                enc.last_rekey = Instant::now();
                                 enc.flush_all_pending_with_writer(&mut common.packet_writer)?;
                             }
                         }
@@ -2252,7 +2250,6 @@ mod tests {
                     last_channel_id: Wrapping(0),
                     write: Vec::new(),
                     write_cursor: 0,
-                    last_rekey: russh_util::time::Instant::now(),
                     server_compression: Compression::None,
                     client_compression: Compression::None,
                     decompress: Decompress::None,
@@ -2300,7 +2297,6 @@ mod tests {
                     last_channel_id: Wrapping(0),
                     write: Vec::new(),
                     write_cursor: 0,
-                    last_rekey: russh_util::time::Instant::now(),
                     server_compression: Compression::None,
                     client_compression: Compression::None,
                     decompress: Decompress::Zlib(flate2::Decompress::new(true)),
@@ -2546,8 +2542,8 @@ impl Default for GexParams {
 pub struct Config {
     /// The client ID string sent at the beginning of the protocol.
     pub client_id: SshId,
-    /// The bytes and time limits before key re-exchange.
-    pub limits: Limits,
+    /// Per-epoch rekey hard limits (packets / bytes). No time trigger.
+    pub limits: RekeyPolicy,
     /// The initial size of a channel (used for flow control).
     pub window_size: u32,
     /// The maximal size of a single packet.
@@ -2607,7 +2603,7 @@ impl Default for Config {
                 "_",
                 env!("CARGO_PKG_VERSION")
             ))),
-            limits: Limits::default(),
+            limits: RekeyPolicy::default(),
             window_size: 2097152,
             maximum_packet_size: 32768,
             channel_buffer_size: 100,

@@ -288,37 +288,80 @@ pub(crate) fn strict_kex_violation(message_type: u8, sequence_number: usize) -> 
 #[error("Could not reach the event loop")]
 pub struct SendError {}
 
-/// The number of bytes read/written, and the number of seconds before a key
-/// re-exchange is requested.
-#[derive(Debug, Clone)]
-pub struct Limits {
-    pub rekey_write_limit: usize,
-    pub rekey_read_limit: usize,
-    pub rekey_time_limit: std::time::Duration,
+/// Per-epoch rekey hard limits (I5).
+///
+/// Default is 2^31 packets and 1 TiB in **either** direction (one
+/// `max_bytes` for inbound and outbound). There is no time-based
+/// trigger; the in-flight completion deadline remains
+/// `Config.rekey_deadline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RekeyPolicy {
+    /// Packets (every seqn-consuming packet) per direction per epoch.
+    pub max_packets: u64,
+    /// Plaintext payload bytes per direction per epoch.
+    pub max_bytes: u64,
 }
 
-impl Limits {
-    /// Create a new `Limits`, checking that the given bounds cannot lead to
-    /// nonce reuse.
-    pub fn new(write_limit: usize, read_limit: usize, time_limit: std::time::Duration) -> Limits {
-        assert!(write_limit <= 1 << 30 && read_limit <= 1 << 30);
-        Limits {
-            rekey_write_limit: write_limit,
-            rekey_read_limit: read_limit,
-            rekey_time_limit: time_limit,
+impl RekeyPolicy {
+    /// I5 first trigger: 2^31 packets.
+    pub const DEFAULT_MAX_PACKETS: u64 = 1 << 31;
+    /// I5 second trigger: 1 TiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 1 << 40;
+
+    /// Construct a policy. No panic path — 1 TiB (and above) is legal.
+    pub fn new(max_packets: u64, max_bytes: u64) -> Self {
+        Self {
+            max_packets,
+            max_bytes,
         }
     }
 }
 
-impl Default for Limits {
+impl Default for RekeyPolicy {
     fn default() -> Self {
-        // Following the recommendations of
-        // https://tools.ietf.org/html/rfc4253#section-9
-        Limits {
-            rekey_write_limit: 1 << 30, // 1 Gb
-            rekey_read_limit: 1 << 30,  // 1 Gb
-            rekey_time_limit: std::time::Duration::from_secs(3600),
+        Self {
+            max_packets: Self::DEFAULT_MAX_PACKETS,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
         }
+    }
+}
+
+#[cfg(test)]
+mod rekey_policy_api_tests {
+    use super::RekeyPolicy;
+
+    /// P1: `server::Config.limits` is `RekeyPolicy`; Default matches I5.
+    #[test]
+    fn p1_config_limits_is_rekey_policy() {
+        let server = crate::server::Config::default();
+        let _: RekeyPolicy = server.limits;
+        assert_eq!(server.limits.max_packets, RekeyPolicy::DEFAULT_MAX_PACKETS);
+        assert_eq!(server.limits.max_bytes, RekeyPolicy::DEFAULT_MAX_BYTES);
+        let client = crate::client::Config::default();
+        let _: RekeyPolicy = client.limits;
+        assert_eq!(client.limits.max_packets, RekeyPolicy::DEFAULT_MAX_PACKETS);
+        assert_eq!(client.limits.max_bytes, RekeyPolicy::DEFAULT_MAX_BYTES);
+    }
+
+    /// P2: 1 TiB constructs; `new` has no 1 GiB assert.
+    #[test]
+    fn p2_one_tib_constructs_without_panic() {
+        let p = RekeyPolicy {
+            max_packets: 1,
+            max_bytes: 1 << 40,
+        };
+        assert_eq!(p.max_bytes, 1 << 40);
+        let p = RekeyPolicy::new(1 << 31, 1 << 40);
+        assert_eq!(p.max_bytes, 1 << 40);
+        assert_eq!(p.max_packets, 1 << 31);
+    }
+
+    /// P5: zfc-style `Config { ..Default::default() }` compiles.
+    #[test]
+    fn p5_zfc_style_default_config_compiles() {
+        let _cfg = crate::server::Config {
+            ..Default::default()
+        };
     }
 }
 

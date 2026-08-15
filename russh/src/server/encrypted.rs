@@ -649,7 +649,6 @@ mod tests {
             last_channel_id: Wrapping(0),
             write: Vec::new(),
             write_cursor: 0,
-            last_rekey: russh_util::time::Instant::now(),
             server_compression: Compression::None,
             client_compression: Compression::None,
             decompress: Decompress::None,
