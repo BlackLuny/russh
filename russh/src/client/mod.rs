@@ -64,7 +64,8 @@ use pending_inbound::{
     BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
 };
 use crate::channels::{
-    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
+    Channel, ChannelAcked, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf,
+    WindowSizeRef,
 };
 use crate::cipher::{self, OpeningKey, clear};
 use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
@@ -264,6 +265,17 @@ pub enum Msg {
 impl From<(ChannelId, ChannelMsg)> for Msg {
     fn from((id, msg): (ChannelId, ChannelMsg)) -> Self {
         Msg::Channel(id, msg)
+    }
+}
+
+impl ChannelAcked for Msg {
+    fn try_data_acked(
+        _id: ChannelId,
+        _ext: Option<u32>,
+        _data: bytes::Bytes,
+        _ack: oneshot::Sender<()>,
+    ) -> Option<Self> {
+        None
     }
 }
 
@@ -644,6 +656,8 @@ impl<H: Handler> Handle<H> {
                             sender: self.sender.clone(),
                             max_packet_size,
                             window_size: window_size_ref,
+                            live: None,
+                            use_acked: false,
                         },
                         read_half: ChannelReadHalf { receiver },
                     });

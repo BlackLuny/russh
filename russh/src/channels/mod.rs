@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -6,6 +7,51 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, Notify};
 
 use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
+
+/// Server-only live set: channel ids that still accept outbound DATA.
+/// Client write paths do not use this (`WindowSizeRef` stays the client gate).
+#[derive(Debug, Default)]
+pub(crate) struct OutboundLiveSet {
+    ids: std::sync::Mutex<HashSet<ChannelId>>,
+}
+
+impl OutboundLiveSet {
+    pub(crate) fn insert(&self, id: ChannelId) {
+        self.ids.lock().expect("live set").insert(id);
+    }
+
+    pub(crate) fn remove(&self, id: ChannelId) {
+        self.ids.lock().expect("live set").remove(&id);
+    }
+
+    pub(crate) fn contains(&self, id: ChannelId) -> bool {
+        self.ids.lock().expect("live set").contains(&id)
+    }
+}
+
+/// Optional acked-data constructor. Server `Msg` returns `ChannelDataAcked`
+/// so `Channel::data` takes the Session-authority permit path. Client and
+/// unit-test senders return `None` and keep the `WindowSizeRef` mirror.
+#[doc(hidden)]
+pub trait ChannelAcked: Sized {
+    fn try_data_acked(
+        id: ChannelId,
+        ext: Option<u32>,
+        data: Bytes,
+        ack: tokio::sync::oneshot::Sender<()>,
+    ) -> Option<Self>;
+}
+
+impl ChannelAcked for (ChannelId, ChannelMsg) {
+    fn try_data_acked(
+        _id: ChannelId,
+        _ext: Option<u32>,
+        _data: Bytes,
+        _ack: tokio::sync::oneshot::Sender<()>,
+    ) -> Option<Self> {
+        None
+    }
+}
 
 pub mod io;
 
@@ -116,6 +162,11 @@ pub enum ChannelMsg {
     OpenFailure(ChannelOpenFailure),
 }
 
+/// Peer-window **mirror** used by the **client** write path
+/// (`ChannelTx` / `reserve_writable_chunk`). Server write paths do not
+/// deduct here — Session `recipient_window_size` is the sole outbound
+/// window ledger (S5b). Kept in this module so the shared `Channel`
+/// type still compiles; do not add server deductors.
 #[derive(Clone, Debug)]
 pub(crate) struct WindowSizeRef {
     value: Arc<Mutex<u32>>,
@@ -138,6 +189,13 @@ impl WindowSizeRef {
 
     pub(crate) fn subscribe(&self) -> Arc<Notify> {
         Arc::clone(&self.notifier)
+    }
+
+    /// Wake writers waiting on this channel's window (server acked path).
+    /// Must be `notify_one` (stores a permit) — `notify_waiters` is lost
+    /// if `notified()` has not been polled yet.
+    pub(crate) fn wake(&self) {
+        self.notifier.notify_one();
     }
 }
 
@@ -181,6 +239,11 @@ pub struct ChannelWriteHalf<Send: From<(ChannelId, ChannelMsg)>> {
     pub(crate) sender: Sender<Send>,
     pub(crate) max_packet_size: u32,
     pub(crate) window_size: WindowSizeRef,
+    /// Server: live-set for sync-dead precheck. Client: `None`.
+    pub(crate) live: Option<Arc<OutboundLiveSet>>,
+    /// Server production: send DATA via `ChannelDataAcked` (authority
+    /// window). Client / invert / unit tests: `false` → WindowSizeRef.
+    pub(crate) use_acked: bool,
 }
 
 impl<S: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for ChannelWriteHalf<S> {
@@ -191,10 +254,22 @@ impl<S: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for ChannelWriteHalf<S> {
     }
 }
 
-impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<S> {
+impl<S: From<(ChannelId, ChannelMsg)> + ChannelAcked + Send + Sync + 'static>
+    ChannelWriteHalf<S>
+{
+    fn known_dead(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| !l.contains(self.id))
+    }
+
     /// Returns the min between the maximum packet size and the
     /// remaining window size in the channel.
     pub async fn writable_packet_size(&self) -> usize {
+        if self.use_acked {
+            if self.known_dead() {
+                return 0;
+            }
+            return self.max_packet_size as usize;
+        }
         self.max_packet_size
             .min(*self.window_size.value.lock().await) as usize
     }
@@ -400,6 +475,31 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
         if data.is_empty() {
             return Ok(());
         }
+        if self.known_dead() {
+            return Err(Error::WrongChannel);
+        }
+
+        if self.use_acked {
+            if self.max_packet_size == 0 {
+                return Err(Error::Inconsistent);
+            }
+            let mut offset = 0;
+            while offset < data.len() {
+                if self.known_dead() {
+                    return Err(Error::WrongChannel);
+                }
+                let end = (offset + self.max_packet_size as usize).min(data.len());
+                let chunk = data.slice(offset..end);
+                let (ack, acked) = tokio::sync::oneshot::channel();
+                let Some(msg) = S::try_data_acked(self.id, ext, chunk, ack) else {
+                    return Err(Error::Inconsistent);
+                };
+                self.sender.send(msg).await.map_err(|_| Error::SendError)?;
+                acked.await.map_err(|_| Error::SendError)?;
+                offset = end;
+            }
+            return Ok(());
+        }
 
         let mut offset = 0;
         while offset < data.len() {
@@ -453,6 +553,8 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> ChannelWriteHalf<
             self.window_size.subscribe(),
             self.max_packet_size,
             ext,
+            self.use_acked,
+            self.live.clone(),
         )
     }
 }
@@ -473,13 +575,55 @@ impl<T: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for Channel<T> {
     }
 }
 
-impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+impl<S: From<(ChannelId, ChannelMsg)> + ChannelAcked + Send + Sync + 'static> Channel<S> {
     pub(crate) fn new(
         id: ChannelId,
         sender: Sender<S>,
         max_packet_size: u32,
         window_size: u32,
         channel_buffer_size: usize,
+    ) -> (Self, ChannelRef) {
+        Self::new_with_window_mode(
+            id,
+            sender,
+            max_packet_size,
+            window_size,
+            channel_buffer_size,
+            None,
+            false,
+        )
+    }
+
+    /// Server channel: acked DATA (Session window authority) + live-set
+    /// sync precheck. Client keeps [`Channel::new`].
+    pub(crate) fn new_server(
+        id: ChannelId,
+        sender: Sender<S>,
+        max_packet_size: u32,
+        window_size: u32,
+        channel_buffer_size: usize,
+        live: Arc<OutboundLiveSet>,
+        use_acked: bool,
+    ) -> (Self, ChannelRef) {
+        Self::new_with_window_mode(
+            id,
+            sender,
+            max_packet_size,
+            window_size,
+            channel_buffer_size,
+            Some(live),
+            use_acked,
+        )
+    }
+
+    fn new_with_window_mode(
+        id: ChannelId,
+        sender: Sender<S>,
+        max_packet_size: u32,
+        window_size: u32,
+        channel_buffer_size: usize,
+        live: Option<Arc<OutboundLiveSet>>,
+        use_acked: bool,
     ) -> (Self, ChannelRef) {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer_size);
         let window_size = WindowSizeRef::new(window_size);
@@ -489,6 +633,8 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
             sender,
             max_packet_size,
             window_size: window_size.clone(),
+            live,
+            use_acked,
         };
 
         (
@@ -692,6 +838,8 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
                 self.write_half.window_size.subscribe(),
                 self.write_half.max_packet_size,
                 None,
+                self.write_half.use_acked,
+                self.write_half.live.clone(),
             ),
             io::ChannelRx::new(io::ChannelCloseOnDrop(self), None),
         )
@@ -742,6 +890,8 @@ mod tests {
                 sender,
                 max_packet_size,
                 window_size,
+                live: None,
+                use_acked: false,
             },
             receiver,
         )

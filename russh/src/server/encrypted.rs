@@ -557,6 +557,17 @@ mod tests {
         let handle = Handle {
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            live: std::sync::Arc::new(crate::channels::OutboundLiveSet::default()),
+            use_acked_window: {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    !config.invert_channel_window_mirror
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    true
+                }
+            },
             #[cfg(feature = "_test_hooks")]
             observe: config.handle_observe.clone(),
         };
@@ -1338,10 +1349,8 @@ impl Session {
                     }
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
-                    // Use try_send to avoid blocking the session loop when channel buffer is full.
-                    // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+                    // Informational only. Server Channel write path uses
+                    // ChannelDataAcked + Session recipient_window_size (S5b).
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 debug!("handler.window_adjusted {channel_num:?}");
@@ -1374,6 +1383,7 @@ impl Session {
                 }
 
                 if let Some(channel) = self.channels.get(&local_id) {
+                    self.sender.live.insert(local_id);
                     channel
                         .send(ChannelMsg::Open {
                             id: local_id,
@@ -1995,13 +2005,19 @@ impl Session {
             true,
         );
 
-        let (channel, channel_ref) = Channel::new(
+        let (channel, channel_ref) = Channel::new_server(
             sender_channel,
             self.sender.sender.clone(),
             channel_params.recipient_maximum_packet_size,
             channel_params.recipient_window_size,
             self.common.config.channel_buffer_size,
+            self.sender.live.clone(),
+            self.sender.use_acked_window,
         );
+        // Handler may `data()` immediately after `accept()` queues the
+        // reply (S4b: accept does not wait for finalize). Mark live now;
+        // reject / expire removes it.
+        self.sender.live.insert(sender_channel);
 
         let pending = PendingChannelOpen {
             recipient_channel: msg.recipient_channel,

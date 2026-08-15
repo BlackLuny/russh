@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use channels::WindowSizeRef;
+use channels::{ChannelAcked, OutboundLiveSet, WindowSizeRef};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use kex::ServerKex;
@@ -345,6 +345,7 @@ impl PendingOutbound {
     }
 
     /// Shared weight ledger for the full-pipeline sampler (R4).
+    #[cfg(feature = "_test_hooks")]
     pub fn bytes_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         self.bytes.clone()
     }
@@ -485,15 +486,10 @@ pub enum Msg {
         language_tag: String,
     },
     Channel(ChannelId, ChannelMsg),
-    /// Channel payload from [`Handle::data`] / [`Handle::extended_data`], carrying a completion
-    /// signal that the session fires once the bytes have actually been written into the peer's
-    /// receive window (rather than parked in `pending_data`).
-    ///
-    /// This is what backpressures those two APIs. `Channel::data` / `Channel::make_writer`
-    /// reserve window *before* enqueueing and so need no such signal; `Handle` has no per-channel
-    /// window state, so without this it would enqueue without bound. Upstream instead throttled
-    /// it by refusing to dispatch any application message while any channel had pending data,
-    /// which backpressures every channel because one is blocked — see `enforce_outbound_cap`.
+    /// Channel payload from [`Handle::data`] / [`Handle::extended_data`] and
+    /// the server `Channel::data` / `make_writer` authority path (S5b).
+    /// Completes once the bytes are in the peer window (not `pending_data`).
+    /// Completing = 入账权威账本; park is only backlog throttle.
     ChannelDataAcked {
         id: ChannelId,
         ext: Option<u32>,
@@ -509,6 +505,17 @@ pub enum Msg {
 impl From<(ChannelId, ChannelMsg)> for Msg {
     fn from((id, msg): (ChannelId, ChannelMsg)) -> Self {
         Msg::Channel(id, msg)
+    }
+}
+
+impl ChannelAcked for Msg {
+    fn try_data_acked(
+        id: ChannelId,
+        ext: Option<u32>,
+        data: Bytes,
+        ack: oneshot::Sender<()>,
+    ) -> Option<Self> {
+        Some(Msg::ChannelDataAcked { id, ext, data, ack })
     }
 }
 
@@ -528,6 +535,11 @@ pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
 pub struct Handle {
     pub(crate) sender: Sender<Msg>,
     pub(crate) channel_buffer_size: usize,
+    /// Channels that still accept DATA (not in table / StopDiscard /
+    /// `outbound_closed` are absent). Shared with `ChannelWriteHalf`.
+    pub(crate) live: std::sync::Arc<OutboundLiveSet>,
+    /// Server production: Channel::data uses ChannelDataAcked.
+    pub(crate) use_acked_window: bool,
     #[cfg(feature = "_test_hooks")]
     pub(crate) observe: Option<std::sync::Arc<crate::server::executor::HandleObserveSlot>>,
 }
@@ -570,6 +582,9 @@ impl Handle {
         ext: Option<u32>,
         data: bytes::Bytes,
     ) -> Result<(), bytes::Bytes> {
+        if !self.live.contains(id) {
+            return Err(data);
+        }
         let (ack, acked) = oneshot::channel();
         #[cfg(feature = "_test_hooks")]
         let parked = {
@@ -879,6 +894,8 @@ impl Handle {
                             sender: self.sender.clone(),
                             max_packet_size,
                             window_size: window_size_ref,
+                            live: Some(self.live.clone()),
+                            use_acked: self.use_acked_window,
                         },
                         read_half: ChannelReadHalf { receiver },
                     });
@@ -2128,8 +2145,8 @@ impl Session {
     }
 
     /// Inbound ADJUST applied from the aggregation-board drain. Authority
-    /// stays Session `recipient_window_size` + WindowSizeRef — the board
-    /// is in-flight staging, not a third window book.
+    /// is Session `recipient_window_size` only (S5b). The board is
+    /// in-flight staging, not a third window book.
     async fn apply_peer_window_credit<H: Handler + Send>(
         &mut self,
         id: ChannelId,
@@ -2167,7 +2184,8 @@ impl Session {
             }
         }
         if let Some(chan) = self.channels.get(&id) {
-            chan.window_size().update(new_size).await;
+            // Informational only. Server Channel::data no longer deducts
+            // WindowSizeRef (S5b); Session recipient_window_size is the ledger.
             let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
         }
         self.dispatch_window_adjusted(handler, id, new_size).await
@@ -2245,10 +2263,38 @@ impl Session {
             .collect();
         for id in drained {
             if let Some(acks) = self.outbound_acks.remove(&id) {
+                let n = acks.len();
                 for ack in acks {
                     let _ = ack.send(());
                 }
+                // One wake per resolved ack (N ChannelTx need N
+                // notify_one permits). Issued as a batch of `n`.
+                self.wake_parked_writers(id, n);
             }
+        }
+    }
+
+    /// Wake parked `ChannelTx` writers on `id`.
+    ///
+    /// Invariant: any path that resolves or drops parked acks, or removes
+    /// the channel object, must wake at least as many times as there are
+    /// parked writers on this channel (ack count is the upper bound) and
+    /// must do so *before* `channels.remove`. Extra `notify_one` permits
+    /// coalesce; a later ChannelTx poll may consume a stale permit and
+    /// then re-park if backlog is still pending — that is tolerated.
+    fn wake_parked_writers(&self, id: ChannelId, n: usize) {
+        let Some(chan) = self.channels.get(&id) else {
+            return;
+        };
+        let times = n.max(1);
+        #[cfg(feature = "_test_hooks")]
+        let times = if self.common.config.invert_single_writer_wake {
+            1
+        } else {
+            times
+        };
+        for _ in 0..times {
+            chan.window_size().wake();
         }
     }
 
@@ -2268,26 +2314,6 @@ impl Session {
         Ok(())
     }
 
-    /// Outbound mirror of the inbound `Overflow` path: bound how much un-transmitted data a
-    /// single channel may accumulate while its peer's receive window is exhausted, and close that
-    /// one channel if it runs away.
-    ///
-    /// This replaces upstream's session-wide `has_any_pending_data()` gate. That gate bounded the
-    /// backlog by refusing to dispatch *any* application message while *any* channel had pending
-    /// data, which is correct on memory but converts one stalled peer into a session-wide
-    /// outbound stall. Capping per channel keeps the isolation property the inbound path already
-    /// has: a runaway channel is dropped, everyone else keeps flowing.
-    ///
-    /// Producers that reserve window before enqueueing (`Channel::data` / `make_writer`) cannot
-    /// exceed their window and so never reach the cap; it is `Handle::data` and
-    /// `Handle::extended_data`, which enqueue unconditionally, that this contains.
-    /// Tear a channel down on the wire, discarding everything still queued for it, and fail any
-    /// producers parked on that backlog.
-    ///
-    /// Keeping these two together is the point: the bytes are being thrown away, so the parked
-    /// `Handle::data` callers must resolve to `Err`. Inferring that later from "is the channel
-    /// gone?" cannot work — a channel is also removed after an *orderly* flush, where the bytes
-    /// really were delivered.
     /// True while the protocol channel can still emit ADJUST / SUCCESS /
     /// FAILURE / REQUEST. False after StopDiscard or after CLOSE has
     /// been framed (`outbound_closed`).
@@ -2328,7 +2354,32 @@ impl Session {
         #[cfg(not(feature = "_test_hooks"))]
         let _ = stats;
         // Dropping the senders resolves each producer's await to Err.
-        self.outbound_acks.remove(&id);
+        // Invert keeps the acks so a later release can falsely Ok them.
+        let skip_drop = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common.config.invert_skip_discard_ack_drop
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                false
+            }
+        };
+        let n_acks = self
+            .outbound_acks
+            .get(&id)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        if !skip_drop {
+            self.outbound_acks.remove(&id);
+        }
+        // Remove from live *before* waking so a woken ChannelTx observes
+        // dead and returns BrokenPipe instead of falsely Ok-ing discarded
+        // bytes. The Notify lives on the Channel object (not the live
+        // set), so it is still reachable here. Count = removed acks
+        // (floor 1).
+        self.sender.live.remove(id);
+        self.wake_parked_writers(id, n_acks);
         if self.deferred_window_grants.remove(&id) {
             #[cfg(feature = "_test_hooks")]
             if let Some(ref s) = self.common.config.stop_discard {
@@ -2341,6 +2392,12 @@ impl Session {
         Ok(())
     }
 
+    /// Bound un-transmitted outbound bytes on one channel while the
+    /// peer window is exhausted. S5b: `Channel::data` / `make_writer`
+    /// no longer pre-reserve window — they enqueue via
+    /// `ChannelDataAcked` and can pile `pending_data` the same way
+    /// `Handle::data` does. This cap therefore applies to every
+    /// outbound producer. Exceeding it StopDiscards that one channel.
     pub(crate) fn enforce_outbound_cap(&mut self, id: ChannelId) -> Result<(), crate::Error> {
         let cap = self.common.config.max_pending_outbound_bytes;
         let Some(enc) = self.common.encrypted.as_mut() else {
@@ -2365,10 +2422,25 @@ impl Session {
         if let Some(r) = &self.reader {
             r.close_lane(id, r.lane_gen(id).unwrap_or(0));
         }
+        // Wake *before* `channels.remove` — afterwards the Notify is gone
+        // and parked ChannelTx stay Pending forever (P1-B).
+        let n_acks = self
+            .outbound_acks
+            .get(&id)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        #[cfg(feature = "_test_hooks")]
+        let skip_wake = self.common.config.invert_skip_teardown_wake;
+        #[cfg(not(feature = "_test_hooks"))]
+        let skip_wake = false;
+        if !skip_wake {
+            self.wake_parked_writers(id, n_acks);
+        }
         self.channels.remove(&id);
         // Dropping any parked `Handle::data` producers wakes them with an error, which is the
         // correct signal now that the channel is gone.
         self.outbound_acks.remove(&id);
+        self.sender.live.remove(id);
         self.deferred_window_grants.remove(&id);
         if let Some(enc) = self.common.encrypted.as_mut() {
             // Safe to drop unconditionally: every path that reaches `finalize_close` has already
@@ -2457,6 +2529,9 @@ impl Session {
                 } else {
                     // Fully absorbed by the peer's window.
                     let _ = ack.send(());
+                    if let Some(chan) = self.channels.get(&id) {
+                        chan.window_size().wake();
+                    }
                 }
             }
             Msg::Channel(id, ChannelMsg::Eof) => {
@@ -5384,6 +5459,7 @@ impl Session {
         if let Err(reason) = result {
             // Opening never had a lane (S3c #13 registers on accept).
             // Still tear down first (S3c #14), then FAILURE.
+            self.sender.live.remove(id);
             self.teardown_inbound_channel(id);
             if let Some(r) = &self.reader {
                 r.close_lane(id, r.lane_gen(id).unwrap_or(0));
@@ -5409,6 +5485,7 @@ impl Session {
             enc.channels.insert(id, params);
             self.channels
                 .insert(pending.sender_channel, pending.channel_ref);
+            self.sender.live.insert(id);
             opened = Some(id);
         }
         if let Some(id) = opened {
@@ -6293,6 +6370,17 @@ mod tests {
         let handle = Handle {
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            live: std::sync::Arc::new(OutboundLiveSet::default()),
+            use_acked_window: {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    !config.invert_channel_window_mirror
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    true
+                }
+            },
             #[cfg(feature = "_test_hooks")]
             observe: config.handle_observe.clone(),
         };
@@ -8558,6 +8646,7 @@ mod tests {
                 initial_window_size: peer_window,
                 maximum_packet_size: 32768,
             });
+        session.sender.live.insert(id);
     }
 
     /// Server-initiated close: `Encrypted::close` removes the protocol entry immediately, so
@@ -9030,6 +9119,189 @@ mod tests {
                 }
             }
             Err(oneshot::error::TryRecvError::Closed) => Err("ack_closed"),
+        }
+    }
+
+    /// Decision ①: known-dead `Handle::data` is sync Err and does not enqueue.
+    #[tokio::test]
+    async fn handle_data_unknown_channel_is_sync_err() {
+        let session = authenticated_session();
+        let handle = session.handle();
+        let err = handle
+            .data(ChannelId(99), Bytes::from_static(b"x"))
+            .await
+            .expect_err("unknown id must not enqueue");
+        assert_eq!(err.as_ref(), b"x");
+    }
+
+    /// Handler-facing `Session::data` stays a no-op Ok on a missing
+    /// channel (Encrypted::data silent drop). `?` in a callback must
+    /// not tear the session. Sync-Err is Handle::data / Channel::data.
+    #[test]
+    fn data_apply_dead_channel_is_ok() {
+        let mut session = authenticated_session();
+        session
+            .data_apply(ChannelId(99), Bytes::from_static(b"x"))
+            .expect("Handler data() on a gone channel must not fail the callback");
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn discard_and_release_are_exclusive() {
+        discard_release_round(false)
+            .await
+            .unwrap_or_else(|e| panic!("exactly-once HARD: production must Err: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn discard_skip_drop_then_release_is_red() {
+        match discard_release_round(true).await {
+            Err("discarded_reported_ok") => {}
+            other => panic!(
+                "exactly-once HARD: invert must fail with discarded_reported_ok, got {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    async fn discard_release_round(skip_drop: bool) -> Result<(), &'static str> {
+        let mut cfg = crate::server::Config::default();
+        cfg.invert_skip_discard_ack_drop = skip_drop;
+        let mut session = authenticated_session_with(cfg);
+        let id = insert_encrypted_channel(&mut session, 0);
+        confirm_test_channel(&mut session, id, 0);
+        session
+            .data(id, Bytes::from_static(&[0u8; 16]))
+            .map_err(|_| "data")?;
+        let (ack, acked) = oneshot::channel();
+        session.outbound_acks.entry(id).or_default().push_back(ack);
+        session
+            .discard_channel_outbound(id)
+            .map_err(|_| "discard")?;
+        session.release_outbound_acks();
+        match acked.await {
+            Err(_) if !skip_drop => Ok(()),
+            Ok(()) if skip_drop => Err("discarded_reported_ok"),
+            Ok(()) => Err("discarded_ok_without_invert"),
+            Err(_) => Err("still_err_under_invert"),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum WakeKind {
+        Release,
+        Discard,
+        Finalize,
+    }
+
+    fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        std::future::Future::poll(fut, &mut cx)
+    }
+
+    /// Two notify waiters + two parked acks. Production must Ready both.
+    /// Invert single-wake → `second_writer_parked`. Invert skip-teardown
+    /// (finalize only) → `writer_still_parked`.
+    #[cfg(feature = "_test_hooks")]
+    async fn two_writer_wake_round(
+        kind: WakeKind,
+        invert_single: bool,
+        invert_skip_fin: bool,
+    ) -> Result<(), &'static str> {
+        let mut cfg = crate::server::Config::default();
+        cfg.invert_single_writer_wake = invert_single;
+        cfg.invert_skip_teardown_wake = invert_skip_fin;
+        let mut session = authenticated_session_with(cfg);
+        let id = insert_encrypted_channel(&mut session, 1024);
+        confirm_test_channel(&mut session, id, 1024);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 4);
+
+        let notify = session
+            .channels
+            .get(&id)
+            .ok_or("no_chan")?
+            .window_size()
+            .subscribe();
+        let mut w1 = std::pin::pin!(notify.notified());
+        let mut w2 = std::pin::pin!(notify.notified());
+        if !poll_once(w1.as_mut()).is_pending() {
+            return Err("w1_pre_ready");
+        }
+        if !poll_once(w2.as_mut()).is_pending() {
+            return Err("w2_pre_ready");
+        }
+
+        let (a1, _r1) = oneshot::channel();
+        let (a2, _r2) = oneshot::channel();
+        session.outbound_acks.entry(id).or_default().push_back(a1);
+        session.outbound_acks.entry(id).or_default().push_back(a2);
+
+        match kind {
+            WakeKind::Release => session.release_outbound_acks(),
+            WakeKind::Discard => session.discard_channel_outbound(id).map_err(|_| "discard")?,
+            WakeKind::Finalize => session.finalize_close(id),
+        }
+
+        let p1 = poll_once(w1.as_mut()).is_ready();
+        let p2 = poll_once(w2.as_mut()).is_ready();
+        match (p1, p2) {
+            (true, true) => {
+                if invert_single || invert_skip_fin {
+                    Err("both_woke_under_invert")
+                } else {
+                    Ok(())
+                }
+            }
+            (true, false) | (false, true) => Err("second_writer_parked"),
+            (false, false) => Err("writer_still_parked"),
+        }
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn two_writers_release_wakes_both() {
+        two_writer_wake_round(WakeKind::Release, false, false)
+            .await
+            .unwrap_or_else(|e| panic!("wake HARD: release must Ready both: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn two_writers_discard_wakes_both() {
+        two_writer_wake_round(WakeKind::Discard, false, false)
+            .await
+            .unwrap_or_else(|e| panic!("wake HARD: discard must Ready both: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn two_writers_finalize_wakes_both() {
+        two_writer_wake_round(WakeKind::Finalize, false, false)
+            .await
+            .unwrap_or_else(|e| panic!("wake HARD: finalize must Ready both: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn two_writers_single_wake_is_red() {
+        match two_writer_wake_round(WakeKind::Release, true, false).await {
+            Err("second_writer_parked") => {}
+            other => panic!(
+                "wake HARD: invert single-wake must second_writer_parked, got {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn finalize_skip_wake_is_red() {
+        match two_writer_wake_round(WakeKind::Finalize, false, true).await {
+            Err("writer_still_parked") => {}
+            other => panic!(
+                "wake HARD: invert skip-teardown-wake must writer_still_parked, got {other:?}"
+            ),
         }
     }
 

@@ -377,6 +377,22 @@ pub struct Config {
     /// `pin_outbound_before_credit`, Handle::data must stall.
     #[cfg(feature = "_test_hooks")]
     pub invert_skip_outbound_settle: bool,
+    /// S5b invert: server `Channel::data` uses the stale WindowSizeRef
+    /// mirror (Session no longer updates it). Window-0 then ADJUST stalls.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_channel_window_mirror: bool,
+    /// S5b invert: `discard_channel_outbound` leaves parked acks so a
+    /// later `release_outbound_acks` can Ok a discarded producer.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_discard_ack_drop: bool,
+    /// S5b-fix1 invert: wake at most once per channel (P1-A multi-writer
+    /// starvation). Second parked ChannelTx must stay Pending.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_single_writer_wake: bool,
+    /// S5b-fix1 invert: `finalize_close` skips wake (P1-B). Parked
+    /// notify writers stay Pending after the channel object is gone.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_teardown_wake: bool,
     /// Test-only ackstall pin: apply aggregation-board credit *after*
     /// the loop-top batch drain so a `ChannelDataAcked` is dispatched
     /// before WINDOW_ADJUST is applied (data-msg-before-ADJUST).
@@ -537,6 +553,14 @@ impl Default for Config {
             invert_skip_close_discard_on_park: false,
             #[cfg(feature = "_test_hooks")]
             invert_skip_outbound_settle: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_channel_window_mirror: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_discard_ack_drop: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_single_writer_wake: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_teardown_wake: false,
             #[cfg(feature = "_test_hooks")]
             pin_outbound_before_credit: false,
         }
@@ -1536,6 +1560,17 @@ where
     let handle = server::session::Handle {
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        live: std::sync::Arc::new(crate::channels::OutboundLiveSet::default()),
+        use_acked_window: {
+            #[cfg(feature = "_test_hooks")]
+            {
+                !config.invert_channel_window_mirror
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                true
+            }
+        },
         #[cfg(feature = "_test_hooks")]
         observe: config.handle_observe.clone(),
     };

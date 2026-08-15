@@ -17,6 +17,7 @@ use bytes::Bytes;
 
 use super::ChannelMsg;
 use crate::ChannelId;
+use crate::channels::{ChannelAcked, OutboundLiveSet};
 
 type BoxedThreadsafeFuture<T> = Pin<Box<dyn Sync + Send + std::future::Future<Output = T>>>;
 type OwnedPermitFuture<S> =
@@ -45,6 +46,7 @@ impl Future for WatchNotification {
 pub struct ChannelTx<S> {
     sender: mpsc::Sender<S>,
     send_fut: Option<OwnedPermitFuture<S>>,
+    acked_send_fut: Option<BoxedThreadsafeFuture<Result<usize, ()>>>,
     id: ChannelId,
     window_size_fut: Option<BoxedThreadsafeFuture<OwnedMutexGuard<u32>>>,
     window_size: Arc<Mutex<u32>>,
@@ -52,11 +54,15 @@ pub struct ChannelTx<S> {
     window_size_notication: WatchNotification,
     max_packet_size: u32,
     ext: Option<u32>,
+    use_acked: bool,
+    live: Option<Arc<OutboundLiveSet>>,
+    acked_waiting: bool,
+    acked_n: usize,
 }
 
 impl<S> ChannelTx<S>
 where
-    S: From<(ChannelId, ChannelMsg)> + 'static + Send,
+    S: From<(ChannelId, ChannelMsg)> + ChannelAcked + 'static + Send + Sync,
 {
     pub fn new(
         sender: mpsc::Sender<S>,
@@ -65,10 +71,13 @@ where
         window_size_notification: Arc<Notify>,
         max_packet_size: u32,
         ext: Option<u32>,
+        use_acked: bool,
+        live: Option<Arc<OutboundLiveSet>>,
     ) -> Self {
         Self {
             sender,
             send_fut: None,
+            acked_send_fut: None,
             id,
             notify: Arc::clone(&window_size_notification),
             window_size_notication: WatchNotification::new(window_size_notification),
@@ -76,7 +85,53 @@ where
             window_size_fut: None,
             max_packet_size,
             ext,
+            use_acked,
+            live,
+            acked_waiting: false,
+            acked_n: 0,
         }
+    }
+
+    fn known_dead(&self) -> bool {
+        self.live.as_ref().is_some_and(|l| !l.contains(self.id))
+    }
+
+    fn start_acked_send(&mut self, buf: &[u8]) -> Result<(), io::Error> {
+        if self.known_dead() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "channel closed",
+            ));
+        }
+        if self.max_packet_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero max packet size",
+            ));
+        }
+        let writable = (self.max_packet_size as usize).min(buf.len());
+        let data = Bytes::copy_from_slice(buf.get(..writable).unwrap_or(&[]));
+        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+        let Some(msg) = S::try_data_acked(self.id, self.ext, data, ack_tx) else {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "acked DATA not supported",
+            ));
+        };
+        use futures::TryFutureExt;
+        self.acked_n = writable;
+        self.window_size_notication = WatchNotification::new(Arc::clone(&self.notify));
+        self.acked_send_fut = Some(Box::pin(
+            self.sender
+                .clone()
+                .reserve_owned()
+                .map_ok(move |p| {
+                    p.send(msg);
+                    writable
+                })
+                .map_err(|_| ()),
+        ));
+        Ok(())
     }
 
     fn poll_writable(&mut self, cx: &mut Context<'_>, buf_len: usize) -> Poll<NonZeroUsize> {
@@ -152,7 +207,7 @@ where
 
 impl<S> AsyncWrite for ChannelTx<S>
 where
-    S: From<(ChannelId, ChannelMsg)> + 'static + Send,
+    S: From<(ChannelId, ChannelMsg)> + ChannelAcked + 'static + Send + Sync,
 {
     #[allow(clippy::too_many_lines)]
     fn poll_write(
@@ -165,6 +220,46 @@ where
                 io::ErrorKind::WriteZero,
                 "cannot send empty buffer",
             )));
+        }
+        if self.use_acked {
+            if self.acked_waiting {
+                // Stale `notify_one` permits (absorb/release with no
+                // waiter) may complete this poll early. That is tolerated:
+                // the next write re-enters acked_waiting and parks again
+                // if the backlog is still pending. Do not "fix" by
+                // clearing permits — extra wakes coalesce.
+                ready!(self.window_size_notication.poll_unpin(cx));
+                self.acked_waiting = false;
+                self.window_size_notication = WatchNotification::new(Arc::clone(&self.notify));
+                if self.known_dead() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "channel closed",
+                    )));
+                }
+                return Poll::Ready(Ok(self.acked_n));
+            }
+            if self.acked_send_fut.is_none() {
+                if let Err(e) = self.start_acked_send(buf) {
+                    return Poll::Ready(Err(e));
+                }
+            }
+            let fut = self.acked_send_fut.as_mut().expect("acked send");
+            let r = ready!(fut.as_mut().poll_unpin(cx));
+            self.acked_send_fut = None;
+            match r {
+                Ok(_) => {
+                    self.acked_waiting = true;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(()) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "channel closed",
+                    )));
+                }
+            }
         }
         let send_fut = if let Some(x) = self.send_fut.as_mut() {
             x
