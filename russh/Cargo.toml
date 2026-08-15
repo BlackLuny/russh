@@ -175,3 +175,7 @@ required-features = ["_test_hooks"]
 [[test]]
 name = "test_s7_perf"
 required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s7_sched"
+required-features = ["_test_hooks"]

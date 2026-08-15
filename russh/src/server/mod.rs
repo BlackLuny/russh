@@ -258,6 +258,12 @@ pub struct Config {
     /// Test-only: skip first-packet boost (on/off position contrast).
     #[cfg(feature = "_test_hooks")]
     pub disable_sched_boost: bool,
+    /// S7b invert: DATA drain serves only the lowest ready ChannelId.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_sched_greedy: bool,
+    /// S7b invert: DATA drain serves only `boost_pending` channels.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_sched_boost_starve: bool,
     /// Test-only: StopDiscard discarded-item / grant-clear counters.
     #[cfg(feature = "_test_hooks")]
     pub stop_discard: Option<std::sync::Arc<supervisor::StopDiscardSlot>>,
@@ -539,6 +545,10 @@ impl Default for Config {
             sched: None,
             #[cfg(feature = "_test_hooks")]
             disable_sched_boost: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_sched_greedy: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_sched_boost_starve: false,
             #[cfg(feature = "_test_hooks")]
             stop_discard: None,
             #[cfg(feature = "_test_hooks")]

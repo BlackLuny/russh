@@ -5832,6 +5832,14 @@ impl Session {
         for id in fence_ids {
             let _ = self.flush_pending_fences(id)?;
         }
+        #[cfg(feature = "_test_hooks")]
+        if self.common.config.invert_sched_greedy {
+            return self.invert_drain_lowest_only();
+        }
+        #[cfg(feature = "_test_hooks")]
+        if self.common.config.invert_sched_boost_starve {
+            return self.invert_drain_boost_only();
+        }
         loop {
             if self.blocks_outbound_intake() {
                 break;
@@ -5903,6 +5911,61 @@ impl Session {
                 self.note_sched_quantum();
             }
             if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Invert: lock onto the lowest Confirmed ChannelId and never serve
+    /// any other (even if the locked id is empty / not ready).
+    #[cfg(feature = "_test_hooks")]
+    fn invert_drain_lowest_only(&mut self) -> Result<(), Error> {
+        let Some(id) = self.lowest_confirmed_id() else {
+            return Ok(());
+        };
+        loop {
+            if self.blocks_outbound_intake() {
+                break;
+            }
+            if !self
+                .common
+                .encrypted
+                .as_ref()
+                .and_then(|enc| enc.channels.get(&id))
+                .is_some_and(|ch| ch.in_ready_set())
+            {
+                break;
+            }
+            if self.try_drain_channel_under_budget(id)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    fn lowest_confirmed_id(&self) -> Option<ChannelId> {
+        let enc = self.common.encrypted.as_ref()?;
+        enc.channels
+            .iter()
+            .filter(|(_, ch)| ch.lane == crate::ChannelLaneState::Confirmed)
+            .map(|(id, _)| *id)
+            .min()
+    }
+
+    /// Invert: serve only boost_pending channels (old bulk is skipped).
+    #[cfg(feature = "_test_hooks")]
+    fn invert_drain_boost_only(&mut self) -> Result<(), Error> {
+        loop {
+            if self.blocks_outbound_intake() {
+                break;
+            }
+            let ready = self.ready_set();
+            let Some(id) = self.boost_candidate(&ready) else {
+                break;
+            };
+            if self.try_drain_channel_under_budget(id)? == 0 {
                 break;
             }
         }
