@@ -848,6 +848,10 @@ pub struct FloodServerConfig {
     pub invert_skip_packet_rekey: bool,
     #[cfg(feature = "_test_hooks")]
     pub invert_skip_idle_gate: bool,
+    #[cfg(feature = "_test_hooks")]
+    pub compression_observe: Option<Arc<russh::server::CompressionObserveSlot>>,
+    #[cfg(feature = "_test_hooks")]
+    pub invert_keep_old_decompress: bool,
 }
 
 impl Default for FloodServerConfig {
@@ -951,6 +955,10 @@ impl Default for FloodServerConfig {
             invert_skip_packet_rekey: false,
             #[cfg(feature = "_test_hooks")]
             invert_skip_idle_gate: false,
+            #[cfg(feature = "_test_hooks")]
+            compression_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_keep_old_decompress: false,
         }
     }
 }
@@ -1081,6 +1089,10 @@ impl FloodServer {
                 invert_skip_packet_rekey: self.cfg.invert_skip_packet_rekey,
                 #[cfg(feature = "_test_hooks")]
                 invert_skip_idle_gate: self.cfg.invert_skip_idle_gate,
+                #[cfg(feature = "_test_hooks")]
+                compression_observe: self.cfg.compression_observe.clone(),
+                #[cfg(feature = "_test_hooks")]
+                invert_keep_old_decompress: self.cfg.invert_keep_old_decompress,
                 ..Default::default()
             });
             if let Err(e) = self.run_on_address(config, addr).await {

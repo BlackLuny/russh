@@ -150,6 +150,11 @@ pub struct ReaderHooks {
     /// Share this bytes atomic with Session (S6a W6 inject).
     #[cfg(feature = "_test_hooks")]
     pub bytes_override: Option<Arc<AtomicU64>>,
+    /// S6c invert: do not rebuild Decompress on epoch install.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_keep_old_decompress: bool,
+    #[cfg(feature = "_test_hooks")]
+    pub compression_observe: Option<Arc<crate::server::supervisor::CompressionObserveSlot>>,
     #[cfg(feature = "_test_hooks")]
     pub lane_observe: Option<Arc<crate::server::inbound_lane::LaneObserveSlot>>,
     /// After the next real DATA, push this many empty DATA items (Q3).
@@ -797,13 +802,36 @@ fn apply_epoch(
     bytes_this_epoch: &AtomicU64,
     epoch: InstallInboundEpoch,
     #[cfg(feature = "_test_hooks")] observe: &Option<Arc<ReaderObserveSlot>>,
+    #[cfg(feature = "_test_hooks")] invert_keep_old_decompress: bool,
+    #[cfg(feature = "_test_hooks")]
+    compression_observe: &Option<Arc<crate::server::supervisor::CompressionObserveSlot>>,
 ) -> u64 {
     let generation = epoch.generation;
     *cipher = epoch.cipher;
-    if epoch.activate_decompress {
-        epoch.compression.init_decompress(decompress);
-    } else {
-        *decompress = Decompress::None;
+    #[cfg(feature = "_test_hooks")]
+    // Invert only on rekey (gen>0). Initial kex (gen 0) must still
+    // install, otherwise a zlib-first handshake cannot authenticate.
+    let skip_rebuild = invert_keep_old_decompress && epoch.generation > 0;
+    #[cfg(not(feature = "_test_hooks"))]
+    let skip_rebuild = false;
+    if !skip_rebuild {
+        if epoch.activate_decompress {
+            #[cfg(all(feature = "_test_hooks", feature = "flate2"))]
+            let had_zlib = matches!(decompress, Decompress::Zlib(_));
+            epoch.compression.init_decompress(decompress);
+            #[cfg(all(feature = "_test_hooks", feature = "flate2"))]
+            if had_zlib {
+                if let Some(o) = compression_observe {
+                    o.mark_zlib_reset();
+                }
+            }
+        } else {
+            *decompress = Decompress::None;
+        }
+    }
+    #[cfg(feature = "_test_hooks")]
+    if let Some(o) = compression_observe {
+        o.set_inbound_activated(epoch.activate_decompress && !skip_rebuild);
     }
     if epoch.reset_seqn {
         buffer.seqn = Wrapping(0);
@@ -1533,6 +1561,10 @@ async fn reader_loop<R: AsyncRead + Unpin>(
                 epoch,
                 #[cfg(feature = "_test_hooks")]
                 &observe,
+                #[cfg(feature = "_test_hooks")]
+                hooks.invert_keep_old_decompress,
+                #[cfg(feature = "_test_hooks")]
+                &hooks.compression_observe,
             );
             let _ = evt_tx.send(ReaderEvent::InstallAckInbound { generation: installed_gen });
         }

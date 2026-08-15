@@ -142,7 +142,18 @@ impl<C> CommonSession<C> {
                 .set_cipher(newkeys.cipher.local_to_remote);
             self.strict_kex = self.strict_kex || newkeys.names.strict_kex();
 
-            // Reset compression state
+            // Write back newly negotiated algorithms first (P8-2). The
+            // previous body re-inited the *old* enums, so a rekey that
+            // picked a different compression kept compressing/decompressing
+            // with the previous algorithm.
+            #[cfg(feature = "_test_hooks")]
+            let skip_writeback = crate::negotiation::skip_newkeys_writeback();
+            #[cfg(not(feature = "_test_hooks"))]
+            let skip_writeback = false;
+            if !skip_writeback {
+                enc.client_compression = newkeys.names.client_compression;
+                enc.server_compression = newkeys.names.server_compression;
+            }
             enc.client_compression
                 .init_compress(self.packet_writer.compress());
             enc.server_compression.init_decompress(&mut enc.decompress);
@@ -276,6 +287,71 @@ impl<C> CommonSession<C> {
 
     pub(crate) fn reset_seqn(&mut self) {
         self.packet_writer.reset_seqn();
+    }
+}
+
+/// S6c C6: apply `CommonSession::newkeys` with a new compression pair and
+/// return the enums stored on `Encrypted` afterwards.
+#[cfg(feature = "_test_hooks")]
+pub fn newkeys_rewrites_compression_enums(
+    old_client: crate::compression::Compression,
+    old_server: crate::compression::Compression,
+    new_client: crate::compression::Compression,
+    new_server: crate::compression::Compression,
+) -> (crate::compression::Compression, crate::compression::Compression) {
+    use crate::kex::{KEXES, NONE};
+    let Some(kex_impl) = KEXES.get(&NONE) else {
+        return (old_client, old_server);
+    };
+    let mut common = CommonSession {
+        auth_user: String::new(),
+        remote_sshid: b"SSH-2.0-test".to_vec(),
+        config: (),
+        encrypted: Some(Encrypted {
+            state: EncryptedState::Authenticated,
+            exchange: Some(Exchange::new(b"c", b"s")),
+            kex: kex_impl.make(),
+            key: 0,
+            client_mac: crate::mac::NONE,
+            server_mac: crate::mac::NONE,
+            session_id: CryptoVec::new(),
+            channels: HashMap::new(),
+            last_channel_id: Wrapping(1),
+            write: Vec::new(),
+            write_cursor: 0,
+            last_rekey: russh_util::time::Instant::now(),
+            server_compression: old_server.clone(),
+            client_compression: old_client.clone(),
+            decompress: crate::compression::Decompress::None,
+            rekey_wanted: false,
+            received_extensions: Vec::new(),
+            extension_info_awaiters: HashMap::new(),
+        }),
+        auth_method: None,
+        auth_attempts: 0,
+        packet_writer: PacketWriter::clear(),
+        remote_to_local: Box::new(crate::cipher::clear::Key {}),
+        wants_reply: false,
+        disconnected: false,
+        buffer: Vec::new(),
+        strict_kex: false,
+        alive_timeouts: 0,
+        received_data: false,
+    };
+    common.newkeys(NewKeys {
+        exchange: Exchange::new(b"c", b"s"),
+        names: crate::negotiation::Names::with_compression(new_client, new_server),
+        kex: kex_impl.make(),
+        key: 0,
+        cipher: crate::cipher::CipherPair {
+            local_to_remote: Box::new(crate::cipher::clear::Key {}),
+            remote_to_local: Box::new(crate::cipher::clear::Key {}),
+        },
+        session_id: CryptoVec::new(),
+    });
+    match common.encrypted {
+        Some(enc) => (enc.client_compression, enc.server_compression),
+        None => (old_client, old_server),
     }
 }
 

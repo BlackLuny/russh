@@ -2785,6 +2785,8 @@ impl Session {
                     cipher_bytes_override: self.common.config.rekey_out_bytes.clone(),
                     observe: self.common.config.writer_observe.clone(),
                     invert_tombstone_counts: self.common.config.invert_tombstone_counts,
+                    invert_keep_old_decompress: self.common.config.invert_keep_old_decompress,
+                    compression_observe: self.common.config.compression_observe.clone(),
                 }
             }
             #[cfg(not(feature = "_test_hooks"))]
@@ -2820,6 +2822,8 @@ impl Session {
                     force_ctrl_full: self.common.config.force_ctrl_full.clone(),
                     packets_override: self.common.config.rekey_in_packets.clone(),
                     bytes_override: self.common.config.rekey_in_bytes.clone(),
+                    invert_keep_old_decompress: self.common.config.invert_keep_old_decompress,
+                    compression_observe: self.common.config.compression_observe.clone(),
                     lane_observe: self.common.config.lane_observe.clone(),
                     inject_zero_data: self.common.config.inject_zero_data.clone(),
                     inject_until_overflow: self.common.config.inject_until_overflow.clone(),
@@ -4900,6 +4904,24 @@ impl Session {
                 enc.last_rekey = russh_util::time::Instant::now();
                 enc.client_compression = newkeys.names.client_compression.clone();
                 enc.server_compression = newkeys.names.server_compression.clone();
+                debug_assert!(
+                    enc.client_compression == newkeys.names.client_compression
+                        && enc.server_compression == newkeys.names.server_compression,
+                    "commit_rekey_inbound must install Compression matching newkeys.names \
+                     (c2s={:?}/{:?} s2c={:?}/{:?})",
+                    enc.client_compression,
+                    newkeys.names.client_compression,
+                    enc.server_compression,
+                    newkeys.names.server_compression,
+                );
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref slot) = common.config.compression_observe {
+                    slot.set_enums(enc.client_compression.clone(), enc.server_compression.clone());
+                }
+                debug!(
+                    "commit_rekey_inbound compression c2s={:?} s2c={:?}",
+                    enc.client_compression, enc.server_compression
+                );
                 let post_auth = matches!(
                     enc.state,
                     EncryptedState::InitCompression | EncryptedState::Authenticated

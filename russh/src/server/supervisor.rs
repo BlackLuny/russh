@@ -279,6 +279,78 @@ impl KexInstallObserveSlot {
     }
 }
 
+/// S6c: negotiated compression enums + activate flags after epoch install.
+///
+/// Tags: 0 = none, 1 = zlib, 2 = zlib@openssh.com, 255 = unset.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug)]
+pub struct CompressionObserveSlot {
+    client: AtomicU8,
+    server: AtomicU8,
+    inbound_activated: std::sync::atomic::AtomicBool,
+    outbound_activated: std::sync::atomic::AtomicBool,
+    zlib_context_resets: AtomicU64,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl Default for CompressionObserveSlot {
+    fn default() -> Self {
+        Self {
+            client: AtomicU8::new(255),
+            server: AtomicU8::new(255),
+            inbound_activated: std::sync::atomic::AtomicBool::new(false),
+            outbound_activated: std::sync::atomic::AtomicBool::new(false),
+            zlib_context_resets: AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+impl CompressionObserveSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn set_enums(&self, client: crate::compression::Compression, server: crate::compression::Compression) {
+        self.client.store(compression_tag(client), Ordering::SeqCst);
+        self.server.store(compression_tag(server), Ordering::SeqCst);
+    }
+    pub fn client_tag(&self) -> u8 {
+        self.client.load(Ordering::SeqCst)
+    }
+    pub fn server_tag(&self) -> u8 {
+        self.server.load(Ordering::SeqCst)
+    }
+    pub fn set_inbound_activated(&self, v: bool) {
+        self.inbound_activated.store(v, Ordering::SeqCst);
+    }
+    pub fn inbound_activated(&self) -> bool {
+        self.inbound_activated.load(Ordering::SeqCst)
+    }
+    pub fn set_outbound_activated(&self, v: bool) {
+        self.outbound_activated.store(v, Ordering::SeqCst);
+    }
+    pub fn outbound_activated(&self) -> bool {
+        self.outbound_activated.load(Ordering::SeqCst)
+    }
+    pub fn mark_zlib_reset(&self) {
+        self.zlib_context_resets.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn zlib_context_resets(&self) -> u64 {
+        self.zlib_context_resets.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+pub(crate) fn compression_tag(c: crate::compression::Compression) -> u8 {
+    match c {
+        crate::compression::Compression::None => 0,
+        #[cfg(feature = "flate2")]
+        crate::compression::Compression::Zlib => 1,
+        #[cfg(feature = "flate2")]
+        crate::compression::Compression::ZlibOpenSSH => 2,
+    }
+}
+
 /// Test-only: R3 liveness chain counters — dequeue notify → real Session
 /// capacity select arm → pending KEX install advance (phase 1→2/3).
 #[cfg(feature = "_test_hooks")]

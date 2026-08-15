@@ -109,6 +109,11 @@ pub struct WriterHooks {
     /// Invert: increment packets even on tombstone drop (must-red).
     #[cfg(feature = "_test_hooks")]
     pub invert_tombstone_counts: bool,
+    /// S6c invert: do not rebuild Compress on epoch install.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_keep_old_decompress: bool,
+    #[cfg(feature = "_test_hooks")]
+    pub compression_observe: Option<Arc<crate::server::supervisor::CompressionObserveSlot>>,
 }
 
 /// Live Writer I5 observation (`_test_hooks`). Separate from the production
@@ -1219,13 +1224,36 @@ fn install_epoch(
     reset_seqn: bool,
     generation: u64,
     #[cfg(feature = "_test_hooks")] observe: &Option<Arc<WriterObserveSlot>>,
+    #[cfg(feature = "_test_hooks")] invert_keep_old_compress: bool,
+    #[cfg(feature = "_test_hooks")]
+    compression_observe: &Option<Arc<crate::server::supervisor::CompressionObserveSlot>>,
 ) {
     packet_writer.set_cipher(cipher);
-    if activate_compress {
-        outbound_compression.init_compress(packet_writer.compress());
-    } else {
-        // Keep Compress::None through USERAUTH (zlib@openssh.com deferred).
-        *packet_writer.compress() = crate::compression::Compress::None;
+    #[cfg(feature = "_test_hooks")]
+    // Invert only on rekey (gen>0). Initial kex (gen 0) must still
+    // install, otherwise a zlib-first handshake cannot authenticate.
+    let skip_rebuild = invert_keep_old_compress && generation > 0;
+    #[cfg(not(feature = "_test_hooks"))]
+    let skip_rebuild = false;
+    if !skip_rebuild {
+        if activate_compress {
+            #[cfg(all(feature = "_test_hooks", feature = "flate2"))]
+            let had_zlib = matches!(packet_writer.compress(), crate::compression::Compress::Zlib(_));
+            outbound_compression.init_compress(packet_writer.compress());
+            #[cfg(all(feature = "_test_hooks", feature = "flate2"))]
+            if had_zlib {
+                if let Some(o) = compression_observe {
+                    o.mark_zlib_reset();
+                }
+            }
+        } else {
+            // Keep Compress::None through USERAUTH (zlib@openssh.com deferred).
+            *packet_writer.compress() = crate::compression::Compress::None;
+        }
+    }
+    #[cfg(feature = "_test_hooks")]
+    if let Some(o) = compression_observe {
+        o.set_outbound_activated(activate_compress && !skip_rebuild);
     }
     if reset_seqn {
         packet_writer.reset_seqn();
@@ -1369,6 +1397,10 @@ fn handle_writer_cmd(
                 generation,
                 #[cfg(feature = "_test_hooks")]
                 &hooks.observe,
+                #[cfg(feature = "_test_hooks")]
+                hooks.invert_keep_old_decompress,
+                #[cfg(feature = "_test_hooks")]
+                &hooks.compression_observe,
             );
             let _ = ack.send(Ok(()));
             let _ = evt_tx.send(WriterEvent::InstallAckOutbound { generation });
@@ -1393,6 +1425,10 @@ fn handle_writer_cmd(
                 generation,
                 #[cfg(feature = "_test_hooks")]
                 &hooks.observe,
+                #[cfg(feature = "_test_hooks")]
+                hooks.invert_keep_old_decompress,
+                #[cfg(feature = "_test_hooks")]
+                &hooks.compression_observe,
             );
             let _ = ack.send(Ok(()));
             let _ = evt_tx.send(WriterEvent::InstallAckOutbound { generation });

@@ -32,6 +32,10 @@ mod ssh_read;
 mod sshbuffer;
 
 pub use negotiation::{Names, Preferred};
+#[cfg(feature = "_test_hooks")]
+pub use negotiation::{KexCompressionOverride, SkipNewkeysWriteback};
+#[cfg(feature = "_test_hooks")]
+pub use session::newkeys_rewrites_compression_enums;
 
 mod pty;
 

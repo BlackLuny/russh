@@ -79,9 +79,9 @@ pub use self::supervisor::{
 };
 #[cfg(feature = "_test_hooks")]
 pub use self::supervisor::{
-    CapacityChainSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate, InstallAckHoldGate,
-    KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot, OutboundOrderSlot,
-    ReplyQueueSlot, SchedSlot, StopDiscardSlot, WatchdogObserveSlot,
+    CapacityChainSlot, CompressionObserveSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate,
+    InstallAckHoldGate, KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot,
+    OutboundOrderSlot, ReplyQueueSlot, SchedSlot, StopDiscardSlot, WatchdogObserveSlot,
 };
 #[cfg(feature = "_test_hooks")]
 pub use self::reader::{MidPacketHold, ReadHoldGate, ReaderObserveSlot};
@@ -435,6 +435,12 @@ pub struct Config {
     /// S6a invert: tombstone drop increments outbound packet count.
     #[cfg(feature = "_test_hooks")]
     pub invert_tombstone_counts: bool,
+    /// S6c: negotiated compression enums + activate flags.
+    #[cfg(feature = "_test_hooks")]
+    pub compression_observe: Option<std::sync::Arc<supervisor::CompressionObserveSlot>>,
+    /// S6c invert: epoch install keeps the old Compress/Decompress (must-red).
+    #[cfg(feature = "_test_hooks")]
+    pub invert_keep_old_decompress: bool,
 }
 
 impl Default for Config {
@@ -623,6 +629,10 @@ impl Default for Config {
             invert_skip_pending_rekey_guard: false,
             #[cfg(feature = "_test_hooks")]
             invert_tombstone_counts: false,
+            #[cfg(feature = "_test_hooks")]
+            compression_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_keep_old_decompress: false,
         }
     }
 }
