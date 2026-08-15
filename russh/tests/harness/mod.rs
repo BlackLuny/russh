@@ -720,6 +720,7 @@ pub struct FloodServerConfig {
     pub maximum_packet_size: u32,
     pub channel_buffer_size: usize,
     pub rekey_write_limit: usize,
+    pub rekey_read_limit: usize,
     pub rekey_time_limit: Duration,
     pub inactivity_timeout: Option<Duration>,
     pub keepalive_interval: Option<Duration>,
@@ -827,6 +828,26 @@ pub struct FloodServerConfig {
     pub lane_pump_hold: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Optional Preferred override (N6 disable strict-kex).
     pub preferred: Option<russh::Preferred>,
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_i6: Option<Arc<russh::server::RekeyI6>>,
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_max_packets_override: Option<u64>,
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_out_packets: Option<Arc<AtomicU64>>,
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_out_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_in_packets: Option<Arc<AtomicU64>>,
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_in_bytes: Option<Arc<AtomicU64>>,
+    #[cfg(feature = "_test_hooks")]
+    pub writer_observe: Option<Arc<russh::server::WriterObserveSlot>>,
+    #[cfg(feature = "_test_hooks")]
+    pub invert_i5_observe_only: bool,
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_packet_rekey: bool,
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_idle_gate: bool,
 }
 
 impl Default for FloodServerConfig {
@@ -836,6 +857,7 @@ impl Default for FloodServerConfig {
             maximum_packet_size: packet_size(),
             channel_buffer_size: 4,
             rekey_write_limit: rekey_write_limit(),
+            rekey_read_limit: usize::MAX / 4,
             rekey_time_limit: Duration::from_secs(3600),
             // Keep defaults high enough that timers don't steal the show unless a
             // test shortens them deliberately (talk-no-read).
@@ -909,6 +931,26 @@ impl Default for FloodServerConfig {
             #[cfg(feature = "_test_hooks")]
             lane_pump_hold: None,
             preferred: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_i6: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_max_packets_override: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_out_packets: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_out_bytes: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_in_packets: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_in_bytes: None,
+            #[cfg(feature = "_test_hooks")]
+            writer_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_i5_observe_only: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_packet_rekey: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_idle_gate: false,
         }
     }
 }
@@ -941,8 +983,8 @@ impl FloodServer {
                 channel_buffer_size: self.cfg.channel_buffer_size,
                 limits: russh::Limits {
                     rekey_write_limit: self.cfg.rekey_write_limit,
+                    rekey_read_limit: self.cfg.rekey_read_limit,
                     rekey_time_limit: self.cfg.rekey_time_limit,
-                    ..Default::default()
                 },
                 inactivity_timeout: self.cfg.inactivity_timeout,
                 keepalive_interval: self.cfg.keepalive_interval,
@@ -1015,6 +1057,30 @@ impl FloodServer {
                     .preferred
                     .clone()
                     .unwrap_or_else(russh::Preferred::default),
+                #[cfg(feature = "_test_hooks")]
+                rekey_i6: self
+                    .cfg
+                    .rekey_i6
+                    .clone()
+                    .unwrap_or_else(russh::server::RekeyI6::new),
+                #[cfg(feature = "_test_hooks")]
+                rekey_max_packets_override: self.cfg.rekey_max_packets_override,
+                #[cfg(feature = "_test_hooks")]
+                rekey_out_packets: self.cfg.rekey_out_packets.clone(),
+                #[cfg(feature = "_test_hooks")]
+                rekey_out_bytes: self.cfg.rekey_out_bytes.clone(),
+                #[cfg(feature = "_test_hooks")]
+                rekey_in_packets: self.cfg.rekey_in_packets.clone(),
+                #[cfg(feature = "_test_hooks")]
+                rekey_in_bytes: self.cfg.rekey_in_bytes.clone(),
+                #[cfg(feature = "_test_hooks")]
+                writer_observe: self.cfg.writer_observe.clone(),
+                #[cfg(feature = "_test_hooks")]
+                invert_i5_observe_only: self.cfg.invert_i5_observe_only,
+                #[cfg(feature = "_test_hooks")]
+                invert_skip_packet_rekey: self.cfg.invert_skip_packet_rekey,
+                #[cfg(feature = "_test_hooks")]
+                invert_skip_idle_gate: self.cfg.invert_skip_idle_gate,
                 ..Default::default()
             });
             if let Err(e) = self.run_on_address(config, addr).await {

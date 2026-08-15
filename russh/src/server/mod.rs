@@ -86,6 +86,8 @@ pub use self::supervisor::{
 #[cfg(feature = "_test_hooks")]
 pub use self::reader::{MidPacketHold, ReadHoldGate, ReaderObserveSlot};
 #[cfg(feature = "_test_hooks")]
+pub use self::writer::WriterObserveSlot;
+#[cfg(feature = "_test_hooks")]
 pub use self::inbound_lane::LaneObserveSlot;
 #[cfg(feature = "_test_hooks")]
 pub use self::inbound_lane::WindowObserveSlot;
@@ -398,6 +400,41 @@ pub struct Config {
     /// before WINDOW_ADJUST is applied (data-msg-before-ADJUST).
     #[cfg(feature = "_test_hooks")]
     pub pin_outbound_before_credit: bool,
+    /// I6 rekey counters (always compiled; inject a shared Arc from tests).
+    pub rekey_i6: std::sync::Arc<session::RekeyI6>,
+    /// S6a: override I5 packet threshold (`1<<31` when `None`).
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_max_packets_override: Option<u64>,
+    /// S6a: share Writer packets atomic (wrap-near inject).
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_out_packets: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: share Writer `cipher_bytes` atomic (W6 inject).
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_out_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// S6a: share Reader packets atomic.
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_in_packets: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: share Reader bytes atomic.
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_in_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: Writer observe slot (seqn / packets), distinct from production atomics.
+    #[cfg(feature = "_test_hooks")]
+    pub writer_observe: Option<std::sync::Arc<writer::WriterObserveSlot>>,
+    /// S6a invert: flush reads observe slots instead of production atomics.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_i5_observe_only: bool,
+    /// S6a invert: flush ignores packet-count predicates.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_packet_rekey: bool,
+    /// S6a invert: flush `begin_rekey` even when `kex != Idle`.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_idle_gate: bool,
+    /// S6a invert: `begin_rekey` ignores an open pending install.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_pending_rekey_guard: bool,
+    /// S6a invert: tombstone drop increments outbound packet count.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_tombstone_counts: bool,
 }
 
 impl Default for Config {
@@ -563,6 +600,29 @@ impl Default for Config {
             invert_skip_teardown_wake: false,
             #[cfg(feature = "_test_hooks")]
             pin_outbound_before_credit: false,
+            rekey_i6: session::RekeyI6::new(),
+            #[cfg(feature = "_test_hooks")]
+            rekey_max_packets_override: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_out_packets: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_out_bytes: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_in_packets: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_in_bytes: None,
+            #[cfg(feature = "_test_hooks")]
+            writer_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_i5_observe_only: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_packet_rekey: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_idle_gate: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_pending_rekey_guard: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_tombstone_counts: false,
         }
     }
 }

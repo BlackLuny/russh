@@ -20,9 +20,9 @@
 use std::collections::HashSet;
 use std::num::Wrapping;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "_test_hooks")]
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use bytes::Bytes;
 use log::debug;
@@ -144,6 +144,12 @@ pub struct ReaderHooks {
     /// Next ctrl `try_push` fails (Q7).
     #[cfg(feature = "_test_hooks")]
     pub force_ctrl_full: Option<Arc<AtomicBool>>,
+    /// Share this packets atomic with Session (S6a wrap-near inject).
+    #[cfg(feature = "_test_hooks")]
+    pub packets_override: Option<Arc<AtomicU64>>,
+    /// Share this bytes atomic with Session (S6a W6 inject).
+    #[cfg(feature = "_test_hooks")]
+    pub bytes_override: Option<Arc<AtomicU64>>,
     #[cfg(feature = "_test_hooks")]
     pub lane_observe: Option<Arc<crate::server::inbound_lane::LaneObserveSlot>>,
     /// After the next real DATA, push this many empty DATA items (Q3).
@@ -179,6 +185,7 @@ pub struct ReaderObserveSlot {
     applies: AtomicU64,
     last_reset_seqn: AtomicBool,
     packets_this_epoch: AtomicU64,
+    bytes_this_epoch: AtomicU64,
     in_read_hold: AtomicBool,
     in_post_read_hold: AtomicBool,
     seqn: AtomicU32,
@@ -247,6 +254,12 @@ impl ReaderObserveSlot {
     }
     pub fn packets_this_epoch(&self) -> u64 {
         self.packets_this_epoch.load(Ordering::SeqCst)
+    }
+    pub fn set_bytes_this_epoch(&self, n: u64) {
+        self.bytes_this_epoch.store(n, Ordering::SeqCst);
+    }
+    pub fn bytes_this_epoch(&self) -> u64 {
+        self.bytes_this_epoch.load(Ordering::SeqCst)
     }
     pub fn set_in_read_hold(&self, v: bool) {
         self.in_read_hold.store(v, Ordering::SeqCst);
@@ -409,6 +422,10 @@ pub struct ReaderHandle {
     lanes: Arc<Mutex<LaneTable>>,
     ready: Arc<Notify>,
     ctrl_bytes: Arc<AtomicUsize>,
+    /// I5 inbound packet count this key-epoch (Session-readable).
+    packets_this_epoch: Arc<AtomicU64>,
+    /// I5 inbound plaintext-payload bytes this key-epoch (Session-readable).
+    bytes_this_epoch: Arc<AtomicU64>,
     #[cfg(feature = "_test_hooks")]
     observe: Option<Arc<ReaderObserveSlot>>,
 }
@@ -436,6 +453,16 @@ impl ReaderHandle {
             Err(mpsc::error::TrySendError::Full(e)) => Err(TryInstallInboundError::Full(e)),
             Err(mpsc::error::TrySendError::Closed(e)) => Err(TryInstallInboundError::Closed(e)),
         }
+    }
+
+    /// Packets opened on the current inbound epoch (I5).
+    pub fn packets_this_epoch(&self) -> u64 {
+        self.packets_this_epoch.load(Ordering::Acquire)
+    }
+
+    /// Opened plaintext-payload bytes on the current inbound epoch (I5).
+    pub fn bytes_this_epoch(&self) -> u64 {
+        self.bytes_this_epoch.load(Ordering::Acquire)
     }
 
     pub fn try_enable_decompress(
@@ -484,6 +511,8 @@ impl ReaderHandle {
             lanes,
             ready: Arc::new(Notify::new()),
             ctrl_bytes: Arc::new(AtomicUsize::new(0)),
+            packets_this_epoch: Arc::new(AtomicU64::new(0)),
+            bytes_this_epoch: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "_test_hooks")]
             observe: None,
         }
@@ -711,6 +740,20 @@ where
     }));
     let ready = Arc::new(Notify::new());
     let ctrl_bytes = Arc::new(AtomicUsize::new(0));
+    #[cfg(feature = "_test_hooks")]
+    let packets_this_epoch = hooks
+        .packets_override
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    #[cfg(not(feature = "_test_hooks"))]
+    let packets_this_epoch = Arc::new(AtomicU64::new(0));
+    #[cfg(feature = "_test_hooks")]
+    let bytes_this_epoch = hooks
+        .bytes_override
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    #[cfg(not(feature = "_test_hooks"))]
+    let bytes_this_epoch = Arc::new(AtomicU64::new(0));
 
     let handle = ReaderHandle {
         install_tx,
@@ -718,6 +761,8 @@ where
         lanes: lanes.clone(),
         ready: ready.clone(),
         ctrl_bytes: ctrl_bytes.clone(),
+        packets_this_epoch: packets_this_epoch.clone(),
+        bytes_this_epoch: bytes_this_epoch.clone(),
         #[cfg(feature = "_test_hooks")]
         observe: hooks.observe.clone(),
     };
@@ -737,6 +782,8 @@ where
         evt_tx,
         hooks,
         credit,
+        packets_this_epoch,
+        bytes_this_epoch,
     ));
 
     (handle, join, ctrl_rx, evt_rx)
@@ -746,7 +793,8 @@ fn apply_epoch(
     cipher: &mut Box<dyn OpeningKey + Send>,
     decompress: &mut Decompress,
     buffer: &mut SSHBuffer,
-    packets_this_epoch: &mut u64,
+    packets_this_epoch: &AtomicU64,
+    bytes_this_epoch: &AtomicU64,
     epoch: InstallInboundEpoch,
     #[cfg(feature = "_test_hooks")] observe: &Option<Arc<ReaderObserveSlot>>,
 ) -> u64 {
@@ -760,7 +808,9 @@ fn apply_epoch(
     if epoch.reset_seqn {
         buffer.seqn = Wrapping(0);
     }
-    *packets_this_epoch = 0;
+    // I5 count reset is independent of strict-kex wire seqn reset.
+    packets_this_epoch.store(0, Ordering::Release);
+    bytes_this_epoch.store(0, Ordering::Release);
     #[cfg(feature = "_test_hooks")]
     if let Some(o) = observe {
         o.set_applied_gen(generation);
@@ -769,6 +819,7 @@ fn apply_epoch(
         o.set_queued(false);
         o.set_awaiting(false);
         o.set_packets_this_epoch(0);
+        o.set_bytes_this_epoch(0);
         o.set_seqn(buffer.seqn.0);
     }
     debug!("reader: installed inbound epoch gen={generation} reset_seqn={}", epoch.reset_seqn);
@@ -1241,11 +1292,12 @@ async fn reader_loop<R: AsyncRead + Unpin>(
     evt_tx: mpsc::UnboundedSender<ReaderEvent>,
     hooks: ReaderHooks,
     credit: Arc<PeerCreditBoard>,
+    packets_this_epoch: Arc<AtomicU64>,
+    bytes_this_epoch: Arc<AtomicU64>,
 ) {
     #[cfg(not(feature = "_test_hooks"))]
     let _ = &hooks;
     let mut decompress = Decompress::None;
-    let mut packets_this_epoch: u64 = 0;
     #[cfg(feature = "_test_hooks")]
     let observe = hooks.observe.clone();
     #[cfg(feature = "_test_hooks")]
@@ -1345,12 +1397,20 @@ async fn reader_loop<R: AsyncRead + Unpin>(
             break;
         }
 
-        packets_this_epoch = packets_this_epoch.saturating_add(1);
+        // I5: every packet that consumed a wire seqn (open succeeded).
+        // Payload bytes = decrypted inner payload (buffer[5..]), matching
+        // outbound SSHBuffer.bytes / cipher.write payload_len.
+        let payload_len = buffer.buffer.len().saturating_sub(5) as u64;
+        let pkts = packets_this_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let bytes = bytes_this_epoch.fetch_add(payload_len, Ordering::AcqRel) + payload_len;
         #[cfg(feature = "_test_hooks")]
         if let Some(ref o) = observe {
-            o.set_packets_this_epoch(packets_this_epoch);
+            o.set_packets_this_epoch(pkts);
+            o.set_bytes_this_epoch(bytes);
             o.set_seqn(buffer.seqn.0);
         }
+        #[cfg(not(feature = "_test_hooks"))]
+        let _ = (pkts, bytes);
 
         // Pin: after a full packet is open, before decompress.
         #[cfg(feature = "_test_hooks")]
@@ -1468,7 +1528,8 @@ async fn reader_loop<R: AsyncRead + Unpin>(
                 &mut cipher,
                 &mut decompress,
                 &mut buffer,
-                &mut packets_this_epoch,
+                &packets_this_epoch,
+                &bytes_this_epoch,
                 epoch,
                 #[cfg(feature = "_test_hooks")]
                 &observe,
@@ -1593,6 +1654,7 @@ mod mid_read_tests {
             inject_until_overflow: None,
             inject_close_for: None,
             window_observe: None,
+            ..Default::default()
         };
         let (handle, join, mut ctrl, mut evts) = spawn_reader(
             server,
@@ -1716,6 +1778,7 @@ mod mid_read_tests {
             inject_until_overflow: None,
             inject_close_for: None,
             window_observe: None,
+            ..Default::default()
         };
         let (handle, join, mut ctrl, _evts) = spawn_reader(
             server,

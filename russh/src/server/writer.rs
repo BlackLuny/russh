@@ -8,7 +8,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use log::{debug, warn};
@@ -97,6 +97,47 @@ pub struct WriterHooks {
     /// Test-only: observe unsealed queue inserts and seal-time drops.
     #[cfg(feature = "_test_hooks")]
     pub stop_discard: Option<Arc<crate::server::supervisor::StopDiscardSlot>>,
+    /// Share this packets atomic with Session (S6a wrap-near inject).
+    #[cfg(feature = "_test_hooks")]
+    pub packets_override: Option<Arc<AtomicU64>>,
+    /// Share this cipher-bytes atomic with Session (S6a W6 inject).
+    #[cfg(feature = "_test_hooks")]
+    pub cipher_bytes_override: Option<Arc<AtomicUsize>>,
+    /// I6/W3: live observation of outbound epoch packet count / seqn.
+    #[cfg(feature = "_test_hooks")]
+    pub observe: Option<Arc<WriterObserveSlot>>,
+    /// Invert: increment packets even on tombstone drop (must-red).
+    #[cfg(feature = "_test_hooks")]
+    pub invert_tombstone_counts: bool,
+}
+
+/// Live Writer I5 observation (`_test_hooks`). Separate from the production
+/// atomics so "seed observe only" cannot fake a trigger unless flush is
+/// inverted to read this slot.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Default)]
+pub struct WriterObserveSlot {
+    packets_this_epoch: AtomicU64,
+    seqn: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl WriterObserveSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn set_packets_this_epoch(&self, n: u64) {
+        self.packets_this_epoch.store(n, Ordering::SeqCst);
+    }
+    pub fn packets_this_epoch(&self) -> u64 {
+        self.packets_this_epoch.load(Ordering::SeqCst)
+    }
+    pub fn set_seqn(&self, s: u32) {
+        self.seqn.store(s, Ordering::SeqCst);
+    }
+    pub fn seqn(&self) -> u32 {
+        self.seqn.load(Ordering::SeqCst)
+    }
 }
 
 pub const KEX_QUEUE_CAP: usize = 16;
@@ -253,6 +294,8 @@ pub struct WriterHandle {
     pending_bytes: Arc<AtomicUsize>,
     /// PacketWriter.buffer().bytes for rekey volume limits.
     cipher_bytes: Arc<AtomicUsize>,
+    /// I5 outbound packet count this key-epoch (Session-readable).
+    packets_this_epoch: Arc<AtomicU64>,
     capacity: Arc<Notify>,
     #[cfg(feature = "_test_hooks")]
     full_ledger: Option<Arc<FullLedger>>,
@@ -577,6 +620,11 @@ impl WriterHandle {
         self.cipher_bytes.load(Ordering::Acquire)
     }
 
+    /// Packets sealed on the current outbound epoch (I5).
+    pub fn packets_this_epoch(&self) -> u64 {
+        self.packets_this_epoch.load(Ordering::Acquire)
+    }
+
     pub fn capacity_notify(&self) -> Arc<Notify> {
         self.capacity.clone()
     }
@@ -675,8 +723,22 @@ where
     #[cfg(not(feature = "_test_hooks"))]
     let pending_bytes = Arc::new(AtomicUsize::new(0));
     let pending_bytes_w = pending_bytes.clone();
+    #[cfg(feature = "_test_hooks")]
+    let cipher_bytes = hooks
+        .cipher_bytes_override
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+    #[cfg(not(feature = "_test_hooks"))]
     let cipher_bytes = Arc::new(AtomicUsize::new(0));
     let cipher_bytes_w = cipher_bytes.clone();
+    #[cfg(feature = "_test_hooks")]
+    let packets_this_epoch = hooks
+        .packets_override
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    #[cfg(not(feature = "_test_hooks"))]
+    let packets_this_epoch = Arc::new(AtomicU64::new(0));
+    let packets_this_epoch_w = packets_this_epoch.clone();
     let capacity = Arc::new(Notify::new());
     let capacity_w = capacity.clone();
     #[cfg(feature = "_test_hooks")]
@@ -689,6 +751,7 @@ where
         kex_tx,
         pending_bytes,
         cipher_bytes,
+        packets_this_epoch,
         capacity,
         #[cfg(feature = "_test_hooks")]
         full_ledger: hooks.full_ledger.clone(),
@@ -782,6 +845,7 @@ where
                             &mut out_q,
                             &pending_bytes_w,
                             &cipher_bytes_w,
+                            &packets_this_epoch_w,
                             &evt_tx,
                             &mut shutting_down,
                             &mut poll_cancel,
@@ -814,6 +878,7 @@ where
                                 &mut out_q,
                                 &pending_bytes_w,
                                 &cipher_bytes_w,
+                                &packets_this_epoch_w,
                                 &evt_tx,
                                 &mut shutting_down,
                                 &mut poll_cancel,
@@ -846,6 +911,7 @@ where
                             &mut out_q,
                             &pending_bytes_w,
                             &cipher_bytes_w,
+                            &packets_this_epoch_w,
                             &evt_tx,
                             &mut shutting_down,
                             &mut poll_cancel,
@@ -958,6 +1024,7 @@ where
                                 &mut out_q,
                                 &pending_bytes_w,
                                 &cipher_bytes_w,
+                                &packets_this_epoch_w,
                                 &evt_tx,
                                 &mut shutting_down,
                                 &mut poll_cancel,
@@ -1026,6 +1093,7 @@ fn seal_one_payload(
     out_q: &mut VecDeque<Bytes>,
     pending_bytes: &AtomicUsize,
     cipher_bytes: &AtomicUsize,
+    packets_this_epoch: &AtomicU64,
     p: Bytes,
     hooks: &WriterHooks,
     #[cfg_attr(not(feature = "_test_hooks"), allow(unused_variables))]
@@ -1059,6 +1127,11 @@ fn seal_one_payload(
         #[cfg(feature = "_test_hooks")]
         if let Some(ref s) = hooks.stop_discard {
             s.note_seal_drop();
+        }
+        #[cfg(feature = "_test_hooks")]
+        if hooks.invert_tombstone_counts {
+            // Invert: pretend a dropped payload consumed seqn (must-red).
+            packets_this_epoch.fetch_add(1, Ordering::AcqRel);
         }
         return Ok(());
     }
@@ -1128,17 +1201,24 @@ fn seal_one_payload(
         drain_segs.push_back((wire_len, as_kex));
     }
     cipher_bytes.store(packet_writer.buffer().bytes, Ordering::Release);
+    packets_this_epoch.fetch_add(1, Ordering::AcqRel);
+    #[cfg(feature = "_test_hooks")]
+    if let Some(ref o) = hooks.observe {
+        o.set_seqn(packet_writer.buffer().seqn.0);
+    }
     Ok(())
 }
 
 fn install_epoch(
     packet_writer: &mut PacketWriter,
     cipher_bytes: &AtomicUsize,
+    packets_this_epoch: &AtomicU64,
     cipher: Box<dyn SealingKey + Send>,
     outbound_compression: Compression,
     activate_compress: bool,
     reset_seqn: bool,
     generation: u64,
+    #[cfg(feature = "_test_hooks")] observe: &Option<Arc<WriterObserveSlot>>,
 ) {
     packet_writer.set_cipher(cipher);
     if activate_compress {
@@ -1152,6 +1232,13 @@ fn install_epoch(
     }
     packet_writer.buffer().bytes = 0;
     cipher_bytes.store(0, Ordering::Release);
+    // I5 count reset is independent of strict-kex wire seqn reset.
+    packets_this_epoch.store(0, Ordering::Release);
+    #[cfg(feature = "_test_hooks")]
+    if let Some(o) = observe {
+        o.set_packets_this_epoch(0);
+        o.set_seqn(packet_writer.buffer().seqn.0);
+    }
     debug!(
         "writer: installed outbound epoch gen={generation} reset_seqn={reset_seqn} activate_compress={activate_compress}"
     );
@@ -1164,6 +1251,7 @@ fn handle_writer_cmd(
     out_q: &mut VecDeque<Bytes>,
     pending_bytes: &AtomicUsize,
     cipher_bytes: &AtomicUsize,
+    packets_this_epoch: &AtomicU64,
     evt_tx: &mpsc::UnboundedSender<WriterEvent>,
     shutting_down: &mut bool,
     poll_cancel: &mut bool,
@@ -1181,6 +1269,7 @@ fn handle_writer_cmd(
                 out_q,
                 pending_bytes,
                 cipher_bytes,
+                packets_this_epoch,
                 p,
                 hooks,
                 false,
@@ -1226,6 +1315,7 @@ fn handle_writer_cmd(
                     out_q,
                     pending_bytes,
                     cipher_bytes,
+                    packets_this_epoch,
                     p,
                     hooks,
                     true,
@@ -1271,11 +1361,14 @@ fn handle_writer_cmd(
             install_epoch(
                 packet_writer,
                 cipher_bytes,
+                packets_this_epoch,
                 cipher,
                 outbound_compression,
                 activate_compress,
                 reset_seqn,
                 generation,
+                #[cfg(feature = "_test_hooks")]
+                &hooks.observe,
             );
             let _ = ack.send(Ok(()));
             let _ = evt_tx.send(WriterEvent::InstallAckOutbound { generation });
@@ -1292,11 +1385,14 @@ fn handle_writer_cmd(
             install_epoch(
                 packet_writer,
                 cipher_bytes,
+                packets_this_epoch,
                 cipher,
                 outbound_compression,
                 activate_compress,
                 reset_seqn,
                 generation,
+                #[cfg(feature = "_test_hooks")]
+                &hooks.observe,
             );
             let _ = ack.send(Ok(()));
             let _ = evt_tx.send(WriterEvent::InstallAckOutbound { generation });
@@ -2220,6 +2316,75 @@ mod tests {
         assert_eq!(fl.kex_in_writer(), 0);
         assert_eq!(slot.mismatch(), 0);
 
+        join.abort();
+        let _ = join.await;
+    }
+
+    fn data_payload(recip: u32) -> Bytes {
+        let mut v = vec![crate::msg::CHANNEL_DATA];
+        v.extend_from_slice(&recip.to_be_bytes());
+        v.extend_from_slice(&[0, 0, 0, 1, b'x']);
+        Bytes::from(v)
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn tombstone_drop_does_not_count_packets() {
+        let tomb = CloseTombstone::new();
+        tomb.insert(7);
+        let packets = Arc::new(AtomicU64::new(0));
+        let progress = AtomicWriteProgress::new();
+        let (_c, cancel_rx) = watch::channel(false);
+        let hooks = WriterHooks {
+            tombstone: tomb,
+            packets_override: Some(packets.clone()),
+            ..WriterHooks::default()
+        };
+        let (handle, join, _evt) = spawn_writer_with_hooks(
+            tokio::io::sink(),
+            PacketWriter::clear(),
+            progress,
+            cancel_rx,
+            hooks,
+        );
+        handle.try_seal_payload(data_payload(7)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            packets.load(Ordering::SeqCst),
+            0,
+            "S6a HARD: tombstone drop must not increment packets"
+        );
+        join.abort();
+        let _ = join.await;
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn invert_tombstone_counts_is_red() {
+        let tomb = CloseTombstone::new();
+        tomb.insert(7);
+        let packets = Arc::new(AtomicU64::new(0));
+        let progress = AtomicWriteProgress::new();
+        let (_c, cancel_rx) = watch::channel(false);
+        let hooks = WriterHooks {
+            tombstone: tomb,
+            packets_override: Some(packets.clone()),
+            invert_tombstone_counts: true,
+            ..WriterHooks::default()
+        };
+        let (handle, join, _evt) = spawn_writer_with_hooks(
+            tokio::io::sink(),
+            PacketWriter::clear(),
+            progress,
+            cancel_rx,
+            hooks,
+        );
+        handle.try_seal_payload(data_payload(7)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            packets.load(Ordering::SeqCst) >= 1,
+            "S6a HARD invert class tombstone_counted: drop incremented packets"
+        );
         join.abort();
         let _ = join.await;
     }

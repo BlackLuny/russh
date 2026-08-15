@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use channels::{ChannelAcked, OutboundLiveSet, WindowSizeRef};
 use futures::stream::FuturesUnordered;
@@ -54,6 +55,36 @@ use crate::server::reader::ReaderHooks;
 use crate::server::writer::{stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
 use crate::{ChannelOpenFailure, ReplyQueue, ReplyVerdict, map_err, msg};
+
+/// I5 first trigger: packets per direction per key-epoch.
+pub(crate) const REKEY_MAX_PACKETS: u64 = 1 << 31;
+
+/// I6: rekey trigger / merge / idle-drop counters. Always compiled
+/// (not `_test_hooks`-gated). Reason detail goes to `tracing`/`log`.
+#[derive(Debug, Default)]
+pub struct RekeyI6 {
+    /// Times `flush` actually called `begin_rekey` from the I5 predicate.
+    triggers: AtomicU64,
+    /// Times inbound and outbound predicates were both true in one flush.
+    merges: AtomicU64,
+    /// Times the I5 predicate was true but `kex != Idle` (storm).
+    idle_drops: AtomicU64,
+}
+
+impl RekeyI6 {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn triggers(&self) -> u64 {
+        self.triggers.load(Ordering::SeqCst)
+    }
+    pub fn merges(&self) -> u64 {
+        self.merges.load(Ordering::SeqCst)
+    }
+    pub fn idle_drops(&self) -> u64 {
+        self.idle_drops.load(Ordering::SeqCst)
+    }
+}
 
 fn lane_item_is_zero_data(item: &LaneItem) -> bool {
     matches!(item, LaneItem::Data(d) if d.is_empty())
@@ -2750,6 +2781,10 @@ impl Session {
                     capacity_chain: self.common.config.capacity_chain.clone(),
                     dequeue_hold: self.common.config.dequeue_hold.clone(),
                     stop_discard: self.common.config.stop_discard.clone(),
+                    packets_override: self.common.config.rekey_out_packets.clone(),
+                    cipher_bytes_override: self.common.config.rekey_out_bytes.clone(),
+                    observe: self.common.config.writer_observe.clone(),
+                    invert_tombstone_counts: self.common.config.invert_tombstone_counts,
                 }
             }
             #[cfg(not(feature = "_test_hooks"))]
@@ -2783,6 +2818,8 @@ impl Session {
                     post_read_hold: None,
                     apply_hold: self.common.config.reader_apply_hold.clone(),
                     force_ctrl_full: self.common.config.force_ctrl_full.clone(),
+                    packets_override: self.common.config.rekey_in_packets.clone(),
+                    bytes_override: self.common.config.rekey_in_bytes.clone(),
                     lane_observe: self.common.config.lane_observe.clone(),
                     inject_zero_data: self.common.config.inject_zero_data.clone(),
                     inject_until_overflow: self.common.config.inject_until_overflow.clone(),
@@ -5004,6 +5041,167 @@ impl Session {
         0
     }
 
+    fn rekey_max_packets(&self) -> u64 {
+        #[cfg(feature = "_test_hooks")]
+        if let Some(n) = self.common.config.rekey_max_packets_override {
+            return n;
+        }
+        REKEY_MAX_PACKETS
+    }
+
+    /// Four-direction I5 predicate (out/in × packets/bytes) plus existing
+    /// time / rekey_wanted. Packet threshold is `REKEY_MAX_PACKETS` (or a
+    /// `_test_hooks` override). Bytes read `Limits.rekey_write_limit` /
+    /// `rekey_read_limit` (P8-1).
+    fn i5_volume_due(&mut self) -> bool {
+        let (wanted, time_due) = {
+            let Some(enc) = self.common.encrypted.as_mut() else {
+                return false;
+            };
+            if enc.kex.skip_exchange() {
+                return false;
+            }
+            let wanted = std::mem::replace(&mut enc.rekey_wanted, false);
+            let now = russh_util::time::Instant::now();
+            let time_due = now.duration_since(enc.last_rekey)
+                >= self.common.config.as_ref().limits.rekey_time_limit;
+            (wanted, time_due)
+        };
+        let limits = &self.common.config.as_ref().limits;
+
+        let max_pkts = self.rekey_max_packets();
+        #[cfg(feature = "_test_hooks")]
+        let skip_pkts = self.common.config.invert_skip_packet_rekey;
+        #[cfg(not(feature = "_test_hooks"))]
+        let skip_pkts = false;
+        #[cfg(feature = "_test_hooks")]
+        let observe_only = self.common.config.invert_i5_observe_only;
+        #[cfg(not(feature = "_test_hooks"))]
+        let observe_only = false;
+
+        let (out_pkts, out_bytes) = if let Some(w) = self.writer.as_ref() {
+            let pkts = if observe_only {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    self.common
+                        .config
+                        .writer_observe
+                        .as_ref()
+                        .map(|o| o.packets_this_epoch())
+                        .unwrap_or(0)
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    w.packets_this_epoch()
+                }
+            } else {
+                w.packets_this_epoch()
+            };
+            (pkts, w.cipher_bytes() as u64)
+        } else {
+            (0, 0)
+        };
+        let (in_pkts, in_bytes) = if let Some(r) = self.reader.as_ref() {
+            let pkts = if observe_only {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    self.common
+                        .config
+                        .reader_observe
+                        .as_ref()
+                        .map(|o| o.packets_this_epoch())
+                        .unwrap_or(0)
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    r.packets_this_epoch()
+                }
+            } else {
+                r.packets_this_epoch()
+            };
+            let bytes = if observe_only {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    self.common
+                        .config
+                        .reader_observe
+                        .as_ref()
+                        .map(|o| o.bytes_this_epoch())
+                        .unwrap_or(0)
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    r.bytes_this_epoch()
+                }
+            } else {
+                r.bytes_this_epoch()
+            };
+            (pkts, bytes)
+        } else {
+            (0, 0)
+        };
+
+        let out_pkt_due = !skip_pkts && out_pkts >= max_pkts;
+        let in_pkt_due = !skip_pkts && in_pkts >= max_pkts;
+        let out_byte_due = out_bytes >= limits.rekey_write_limit as u64;
+        let in_byte_due = in_bytes >= limits.rekey_read_limit as u64;
+        let out_due = out_pkt_due || out_byte_due;
+        let in_due = in_pkt_due || in_byte_due;
+        if out_due && in_due {
+            self.common.config.rekey_i6.merges.fetch_add(1, Ordering::SeqCst);
+        }
+        if out_pkt_due || in_pkt_due || out_byte_due || in_byte_due {
+            debug!(
+                "i5 rekey due out_pkts={out_pkts}/{max_pkts} in_pkts={in_pkts}/{max_pkts} \
+                 out_bytes={out_bytes}/{} in_bytes={in_bytes}/{} time={time_due} wanted={wanted}",
+                limits.rekey_write_limit, limits.rekey_read_limit
+            );
+        }
+        wanted || out_due || in_due || time_due
+    }
+
+    fn apply_i5_rekey(&mut self, due: bool) -> Result<(), crate::Error> {
+        if !due {
+            return Ok(());
+        }
+        let idle = self.kex == SessionKexState::Idle;
+        #[cfg(feature = "_test_hooks")]
+        let force = self.common.config.invert_skip_idle_gate;
+        #[cfg(not(feature = "_test_hooks"))]
+        let force = false;
+        if !idle {
+            if force {
+                // Invert: count a second trigger without re-entering kex
+                // (a real second begin_rekey would corrupt the in-flight
+                // transaction; the pending-guard invert covers that object).
+                self.common
+                    .config
+                    .rekey_i6
+                    .triggers
+                    .fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.common
+                    .config
+                    .rekey_i6
+                    .idle_drops
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            return Ok(());
+        }
+        debug!("starting rekeying");
+        self.common
+            .config
+            .rekey_i6
+            .triggers
+            .fetch_add(1, Ordering::SeqCst);
+        if let Some(ref mut enc) = self.common.encrypted {
+            if enc.exchange.take().is_some() {
+                self.begin_rekey()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Flush the session: stage plaintext packets then seal via Writer (S2b)
     /// or local PacketWriter (pre-spawn / tests).
     ///
@@ -5115,40 +5313,15 @@ impl Session {
                 }
             }
 
-            let rekey = if let Some(ref mut enc) = self.common.encrypted {
-                if enc.kex.skip_exchange() {
-                    false
-                } else {
-                    let limits = &self.common.config.as_ref().limits;
-                    let now = russh_util::time::Instant::now();
-                    let dur = now.duration_since(enc.last_rekey);
-                    let cipher_bytes = self.writer.as_ref().map(|w| w.cipher_bytes()).unwrap_or(0);
-                    std::mem::replace(&mut enc.rekey_wanted, false)
-                        || cipher_bytes >= limits.rekey_write_limit
-                        || dur >= limits.rekey_time_limit
-                }
-            } else {
-                false
-            };
-            if rekey && self.kex == SessionKexState::Idle {
-                debug!("starting rekeying");
-                if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.exchange.take().is_some() {
-                        self.begin_rekey()?;
-                    }
-                }
-            }
+            let rekey = self.i5_volume_due();
+            self.apply_i5_rekey(rekey)?;
         } else if let Some(ref mut enc) = self.common.encrypted {
             let rekey = enc.flush(
                 &self.common.config.as_ref().limits,
                 &mut self.common.packet_writer,
             )?;
-            if rekey && self.kex == SessionKexState::Idle {
-                debug!("starting rekeying");
-                if enc.exchange.take().is_some() {
-                    self.begin_rekey()?;
-                }
-            }
+            // No-writer path (unit tests): still honor Idle gate + I6.
+            self.apply_i5_rekey(rekey)?;
         }
         Ok(())
     }
@@ -6270,8 +6443,17 @@ impl Session {
 
     pub(crate) fn begin_rekey(&mut self) -> Result<(), Error> {
         if self.pending_kex_install.is_some() {
-            // Never open a second install transaction over an unfinished one.
-            return Err(Error::Kex);
+            #[cfg(feature = "_test_hooks")]
+            if self.common.config.invert_skip_pending_rekey_guard {
+                // Invert: fall through and open a second transaction (must-red).
+            } else {
+                // Never open a second install transaction over an unfinished one.
+                return Err(Error::Kex);
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                return Err(Error::Kex);
+            }
         }
         debug!("beginning re-key");
         let mut kex = ServerKex::new(
@@ -9744,5 +9926,46 @@ mod tests {
                 "P1 HARD: invert must fail with enumerated class still_accepts_ctrl, got {other:?}"
             ),
         }
+    }
+
+    fn pending_install_stub() -> PendingKexInstall {
+        PendingKexInstall {
+            generation: 1,
+            after: None,
+            phase: PendingKexPhase::WaitingAck,
+            inbound_acked: false,
+            inbound_sent: false,
+        }
+    }
+
+    /// Extra gate: pending install blocks a second `begin_rekey`.
+    #[test]
+    fn begin_rekey_rejects_second_while_pending() {
+        let mut session = authenticated_session();
+        session.pending_kex_install = Some(pending_install_stub());
+        match session.begin_rekey() {
+            Err(Error::Kex) => {}
+            other => panic!("S6a HARD: second begin_rekey must Err(Kex), got {other:?}"),
+        }
+    }
+
+    /// Invert: skip the pending guard → second begin_rekey is accepted.
+    #[cfg(feature = "_test_hooks")]
+    #[test]
+    fn invert_skip_pending_rekey_guard_is_red() {
+        let mut cfg = crate::server::Config::default();
+        cfg.invert_skip_pending_rekey_guard = true;
+        let mut session = authenticated_session_with(cfg);
+        session.pending_kex_install = Some(pending_install_stub());
+        match session.begin_rekey() {
+            Ok(()) => {}
+            other => panic!(
+                "S6a HARD: invert must accept second begin_rekey (class double_rekey), got {other:?}"
+            ),
+        }
+        assert!(
+            session.kex.active(),
+            "S6a HARD invert class double_rekey: second kex is live"
+        );
     }
 }
