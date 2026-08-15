@@ -372,6 +372,16 @@ pub struct Config {
     /// regression must go red (`still_accepts_ctrl`).
     #[cfg(feature = "_test_hooks")]
     pub invert_skip_close_discard_on_park: bool,
+    /// Test-only ackstall invert: skip `settle_outbound_after_stage`
+    /// (drain → flush → release). Combined with
+    /// `pin_outbound_before_credit`, Handle::data must stall.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_outbound_settle: bool,
+    /// Test-only ackstall pin: apply aggregation-board credit *after*
+    /// the loop-top batch drain so a `ChannelDataAcked` is dispatched
+    /// before WINDOW_ADJUST is applied (data-msg-before-ADJUST).
+    #[cfg(feature = "_test_hooks")]
+    pub pin_outbound_before_credit: bool,
 }
 
 impl Default for Config {
@@ -525,6 +535,10 @@ impl Default for Config {
             invert_eager_lane_pop: false,
             #[cfg(feature = "_test_hooks")]
             invert_skip_close_discard_on_park: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_outbound_settle: false,
+            #[cfg(feature = "_test_hooks")]
+            pin_outbound_before_credit: false,
         }
     }
 }

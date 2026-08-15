@@ -2173,6 +2173,29 @@ impl Session {
         self.dispatch_window_adjusted(handler, id, new_size).await
     }
 
+    /// Drain the aggregation board into `apply_peer_window_credit`. Shared by
+    /// the production loop-top site and the `_test_hooks` pin that runs the
+    /// same apply *after* the batch drain (data-msg-before-ADJUST).
+    async fn apply_pending_peer_credit<H: Handler + Send>(
+        &mut self,
+        mut handler: Option<&mut H>,
+    ) -> Result<(), H::Error> {
+        let pending = match self.peer_credit.as_ref() {
+            Some(board) => board.take_all(),
+            None => return Ok(()),
+        };
+        for (id, amt) in pending {
+            let amount = if amt > u32::MAX as u64 {
+                u32::MAX
+            } else {
+                amt as u32
+            };
+            self.apply_peer_window_credit(id, amount, handler.as_mut().map(|h| &mut **h))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Replay WINDOW_ADJUST grants skipped while outbound sat at the hard cap.
     pub(crate) async fn retry_deferred_window_grants<H: Handler + Send>(
         &mut self,
@@ -2227,6 +2250,22 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// After any loop-top stage (credit apply / batch dispatch) and at
+    /// loop-bottom: drain `pending_data` → flush `enc.write` → release
+    /// parked `Handle::data` acks. Entering `select!` without this parks
+    /// producers forever (ackstall). `flush` already honors
+    /// `hold_enc_packet_during_kex`.
+    pub(crate) fn settle_outbound_after_stage(&mut self) -> Result<(), crate::Error> {
+        #[cfg(feature = "_test_hooks")]
+        if self.common.config.invert_skip_outbound_settle {
+            return Ok(());
+        }
+        self.try_drain_pending_data_under_budget()?;
+        self.flush()?;
+        self.release_outbound_acks();
+        Ok(())
     }
 
     /// Outbound mirror of the inbound `Overflow` path: bound how much un-transmitted data a
@@ -2959,21 +2998,24 @@ impl Session {
             if more_lanes && !self.common.disconnected {
                 continue;
             }
-            // Aggregation board drain: always here, never in the notify arm.
-            if let Some(board) = self.peer_credit.as_ref() {
-                let pending = board.take_all();
-                for (id, amt) in pending {
-                    let amount = if amt > u32::MAX as u64 {
-                        u32::MAX
-                    } else {
-                        amt as u32
-                    };
-                    if let Err(e) = self
-                        .apply_peer_window_credit(id, amount, handler.as_mut())
-                        .await
-                    {
-                        return Err(e);
-                    }
+            // Aggregation board drain: always here (or, under the pin hook,
+            // after the batch drain). Never in the notify arm.
+            #[cfg(feature = "_test_hooks")]
+            let pin_outbound_before_credit = self.common.config.pin_outbound_before_credit;
+            #[cfg(not(feature = "_test_hooks"))]
+            let pin_outbound_before_credit = false;
+            if !pin_outbound_before_credit {
+                if let Err(e) = self.apply_pending_peer_credit(handler.as_mut()).await {
+                    return Err(e);
+                }
+                // Hole A: apply drains pending_data → enc.write. Must settle
+                // before select or the sealed bytes never leave and the ack
+                // stays parked.
+                if let Err(e) = self.settle_outbound_after_stage() {
+                    debug!("settle outbound (after credit): {e:?}");
+                    record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                    self.common.disconnected = true;
+                    continue;
                 }
             }
 
@@ -3078,6 +3120,20 @@ impl Session {
                 if self.common.disconnected {
                     continue;
                 }
+            }
+            if pin_outbound_before_credit {
+                if let Err(e) = self.apply_pending_peer_credit(handler.as_mut()).await {
+                    return Err(e);
+                }
+            }
+            // Hole B: batch dispatch of ChannelDataAcked parks the ack and
+            // may fill pending_data; batch itself only flushes. Settle
+            // before select. Also covers the pin path's late credit apply.
+            if let Err(e) = self.settle_outbound_after_stage() {
+                debug!("settle outbound (loop-top): {e:?}");
+                record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
+                self.common.disconnected = true;
+                continue;
             }
 
             // Advance pending atomic KEX install (NeedSubmit) without blocking.
@@ -3628,15 +3684,12 @@ impl Session {
                 }
             }
 
-            // Stage plaintext → SealRaw/SealPayload into Writer (S2b).
-            if let Err(e) = self.flush() {
-                debug!("flush: {e:?}");
-                record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
-                self.common.disconnected = true;
-            }
-            // Unpark channel pending_data once Writer frees HWM budget.
-            if let Err(e) = self.try_drain_pending_data_under_budget() {
-                debug!("drain pending under budget: {e:?}");
+            // Stage plaintext → SealRaw/SealPayload into Writer (S2b), then
+            // unpark Handle::data. Same settle as loop-top (drain → flush →
+            // release); grants stay after it so a new ADJUST is not a third
+            // pre-select stage.
+            if let Err(e) = self.settle_outbound_after_stage() {
+                debug!("settle outbound (loop-bottom): {e:?}");
                 record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                 self.common.disconnected = true;
             }
@@ -3645,7 +3698,6 @@ impl Session {
                 record_cause(DisconnectCause::PeerError, &mut supervisor_cause);
                 self.common.disconnected = true;
             }
-            self.release_outbound_acks();
 
             if self.common.received_data {
                 // Reset the number of failed keepalive attempts. We don't
@@ -8907,6 +8959,78 @@ mod tests {
         session.release_outbound_acks();
 
         assert!(acked.await.is_ok());
+    }
+
+    /// Credit apply drains `pending_data` into `enc.write` but must not
+    /// leave the parked `Handle::data` ack hanging — settle flush+release
+    /// is what unparks. Invert skip leaves the oneshot pending.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn settle_after_credit_unparks_ack() {
+        settle_after_credit_round(false)
+            .await
+            .unwrap_or_else(|e| panic!("settle HARD: production must unpark: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn settle_skip_leaves_ack_parked() {
+        match settle_after_credit_round(true).await {
+            Err("ack_still_parked") => {}
+            other => panic!(
+                "settle HARD: invert must fail with ack_still_parked, got {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    async fn settle_after_credit_round(skip: bool) -> Result<(), &'static str> {
+        let mut cfg = crate::server::Config::default();
+        cfg.invert_skip_outbound_settle = skip;
+        let mut session = authenticated_session_with(cfg);
+        let id = insert_encrypted_channel(&mut session, 1024);
+        confirm_test_channel(&mut session, id, 0);
+        session
+            .data(id, Bytes::from_static(&[0u8; 16]))
+            .map_err(|_| "data")?;
+        assert!(
+            session.has_pending_data_apply(id),
+            "zero peer window must queue pending_data"
+        );
+
+        let (ack, mut acked) = oneshot::channel();
+        session.outbound_acks.entry(id).or_default().push_back(ack);
+
+        session
+            .apply_peer_window_credit::<TestHandler>(id, 1024, None)
+            .await
+            .map_err(|_| "apply")?;
+        assert!(
+            !session.has_pending_data_apply(id),
+            "credit must drain pending_data into enc.write"
+        );
+
+        session
+            .settle_outbound_after_stage()
+            .map_err(|_| "settle")?;
+
+        match acked.try_recv() {
+            Ok(()) => {
+                if skip {
+                    Err("ack_released")
+                } else {
+                    Ok(())
+                }
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if skip {
+                    Err("ack_still_parked")
+                } else {
+                    Err("ack_not_released")
+                }
+            }
+            Err(oneshot::error::TryRecvError::Closed) => Err("ack_closed"),
+        }
     }
 
     /// Backpressure parks the channel without popping: FIFO DATA→DATA→CLOSE
