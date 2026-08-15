@@ -126,12 +126,6 @@ pub struct Config {
     /// **false**; this slice does not wire the disconnect (RFC 4254 §5.2
     /// extra-data ignore stays). Independent decision later.
     pub strict_window_enforcement: bool,
-    /// Hard safety cap on the number of inbound payload bytes that may be queued per channel
-    /// while its application buffer is full (head-of-line backpressure, see
-    /// `RC2_HOL_FIX_DESIGN.md`). With delivery-gated window grants a well-behaved peer can hold at
-    /// most ~`window_size` bytes in flight, so this only trips when a peer ignores its advertised
-    /// window; exceeding it closes that one channel as a protocol violation, never the session.
-    pub max_pending_inbound_bytes: usize,
     /// Hard safety cap on the number of outbound payload bytes that may be queued per channel
     /// while the peer's receive window is exhausted.
     ///
@@ -365,6 +359,19 @@ pub struct Config {
     /// (S3c #13 inverted). L4 must go red.
     #[cfg(feature = "_test_hooks")]
     pub invert_open_confirm_before_lane: bool,
+    /// Test-only S5a invert: grant `undelivered = 0` (omit lane occupancy).
+    /// Q8 must go red with an enumerated failure class.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_omit_lane_from_undelivered: bool,
+    /// Test-only S5a invert: pop the lane before `try_reserve` and
+    /// `send().await` (old session-loop stall). Isolation must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_eager_lane_pop: bool,
+    /// Test-only S5a invert: skip StopDiscard when a CLOSE is already
+    /// in the lane but the app buffer / Executor is Full. Dual-Full
+    /// regression must go red (`still_accepts_ctrl`).
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_close_discard_on_park: bool,
 }
 
 impl Default for Config {
@@ -388,7 +395,6 @@ impl Default for Config {
             inbound_lane_count_slack: crate::server::inbound_lane::INBOUND_LANE_COUNT_SLACK,
             inbound_min_packet_size: crate::server::inbound_lane::INBOUND_LANE_MIN_PACKET as u32,
             strict_window_enforcement: false,
-            max_pending_inbound_bytes: 8 * 2_000_000,
             max_pending_outbound_bytes: 8 * 2_000_000,
             limits: Limits::default(),
             preferred: Default::default(),
@@ -513,6 +519,12 @@ impl Default for Config {
             slot_observe: None,
             #[cfg(feature = "_test_hooks")]
             invert_open_confirm_before_lane: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_omit_lane_from_undelivered: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_eager_lane_pop: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_close_discard_on_park: false,
         }
     }
 }
@@ -553,7 +565,6 @@ impl Debug for Config {
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("channel_buffer_size", &self.channel_buffer_size)
             .field("event_buffer_size", &self.event_buffer_size)
-            .field("max_pending_inbound_bytes", &self.max_pending_inbound_bytes)
             .field("max_pending_outbound_bytes", &self.max_pending_outbound_bytes)
             .field("limits", &self.limits)
             .field("preferred", &self.preferred)
@@ -1533,8 +1544,9 @@ where
         pending_reads: Vec::new(),
         pending_len: 0,
         channels: HashMap::new(),
-        inbound: HashMap::new(),
+        inbound_gate: HashMap::new(),
         inbound_needs_reserve: Vec::new(),
+        backpressured: std::collections::HashSet::new(),
         outbound_acks: std::collections::HashMap::new(),
         open_global_requests: VecDeque::new(),
         kex: SessionKexState::Idle,

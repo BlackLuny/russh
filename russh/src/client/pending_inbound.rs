@@ -1,10 +1,11 @@
 //! Per-channel non-blocking inbound delivery (Scheme C — see `RC2_HOL_FIX_DESIGN.md`).
 //!
-//! Shared by the server and client session loops: inbound `CHANNEL_DATA` / `EXTENDED_DATA` /
-//! `EOF` / `CLOSE` is handed to the per-channel application buffer with `try_send`; when the
-//! buffer is full the channel becomes backpressured and items queue here behind a single
-//! in-flight `reserve_owned()` future, so the shared session loop never blocks on one channel's
-//! slow consumer, and the channel's inbound window grant is withheld until delivery.
+//! Client-only: the server replaced this queue with lane-gated drainage (S5a). Inbound
+//! `CHANNEL_DATA` / `EXTENDED_DATA` / `EOF` / `CLOSE` is handed to the per-channel application
+//! buffer with `try_send`; when the buffer is full the channel becomes backpressured and items
+//! queue here behind a single in-flight `reserve_owned()` future, so the shared session loop
+//! never blocks on one channel's slow consumer, and the inbound window grant is withheld until
+//! delivery.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;

@@ -542,6 +542,44 @@ impl ReaderHandle {
             .and_then(|mut g| g.pop_any_non_payload_except(skip))
     }
 
+    pub fn peek_gated(
+        &self,
+        hold_data: &HashSet<ChannelId>,
+        hold_all: &HashSet<ChannelId>,
+        non_payload_only: bool,
+    ) -> Option<ChannelId> {
+        self.lanes
+            .lock()
+            .ok()
+            .and_then(|g| g.peek_gated(hold_data, hold_all, non_payload_only))
+    }
+
+    pub fn pop_channel(&self, id: ChannelId) -> Option<LaneItem> {
+        self.lanes.lock().ok().and_then(|mut g| g.pop_channel(id))
+    }
+
+    pub fn close_queued(&self, id: ChannelId) -> bool {
+        self.lanes
+            .lock()
+            .ok()
+            .is_some_and(|g| g.close_queued(id))
+    }
+
+    pub fn close_queued_ids(&self) -> Vec<ChannelId> {
+        self.lanes
+            .lock()
+            .ok()
+            .map(|g| g.close_queued_ids())
+            .unwrap_or_default()
+    }
+
+    pub fn head_needs_app(&self, id: ChannelId) -> bool {
+        self.lanes
+            .lock()
+            .ok()
+            .is_some_and(|g| g.head_needs_app(id))
+    }
+
     pub fn has_ready(&self) -> bool {
         self.lanes.lock().ok().is_some_and(|g| g.has_ready())
     }
@@ -659,7 +697,18 @@ where
     let (enable_tx, enable_rx) = mpsc::channel::<EnableInboundDecompress>(4);
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<CtrlMsg>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<ReaderEvent>();
-    let lanes = Arc::new(Mutex::new(LaneTable::new(min_packet, count_slack)));
+    let lanes = Arc::new(Mutex::new({
+        let table = LaneTable::new(min_packet, count_slack);
+        #[cfg(feature = "_test_hooks")]
+        let table = {
+            let mut table = table;
+            if let Some(o) = hooks.lane_observe.clone() {
+                table.set_observe(o);
+            }
+            table
+        };
+        table
+    }));
     let ready = Arc::new(Notify::new());
     let ctrl_bytes = Arc::new(AtomicUsize::new(0));
 

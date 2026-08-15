@@ -32,7 +32,8 @@ use super::*;
 use crate::helpers::NameList;
 use crate::map_err;
 use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage, ensure_end};
-use crate::pending_inbound::{InboundDelivery, InboundItem};
+use crate::ChannelMsg;
+use tokio::sync::mpsc::error::TrySendError;
 
 impl Session {
     /// Returns false iff a request was rejected.
@@ -585,8 +586,9 @@ mod tests {
             pending_reads: Vec::new(),
             pending_len: 0,
             channels: std::collections::HashMap::new(),
-            inbound: std::collections::HashMap::new(),
+            inbound_gate: std::collections::HashMap::new(),
             inbound_needs_reserve: Vec::new(),
+            backpressured: std::collections::HashSet::new(),
             outbound_acks: std::collections::HashMap::new(),
             open_global_requests: std::collections::VecDeque::new(),
             kex: SessionKexState::Idle,
@@ -1186,19 +1188,13 @@ impl Session {
                         .as_ref()
                         .is_some_and(|enc| !enc.channel_exists(channel_num));
                     if we_closed_first && self.channels.contains_key(&channel_num) {
-                        match self.deliver_inbound(channel_num, InboundItem::Close) {
-                            InboundDelivery::Queued => {
-                                // Deferred to pump_inbound, after the queued data.
-                            }
-                            InboundDelivery::Delivered
-                            | InboundDelivery::Overflow
-                            | InboundDelivery::ChannelGone => {
-                                debug!("handler.channel_close {channel_num:?} (peer ack of our close)");
-                                self.dispatch_close(handler.as_mut().map(|h| &mut **h), channel_num)
-                                    .await?;
-                                self.finalize_close(channel_num);
-                            }
-                        }
+                        // No-lane / object-test path: no Scheme C queue.
+                        // Full still finalizes so the channels table cannot leak.
+                        let _ = self.try_send_app(channel_num, ChannelMsg::Close);
+                        debug!("handler.channel_close {channel_num:?} (peer ack of our close)");
+                        self.dispatch_close(handler.as_mut().map(|h| &mut **h), channel_num)
+                            .await?;
+                        self.finalize_close(channel_num);
                     }
                     return Ok(());
                 }
@@ -1209,27 +1205,14 @@ impl Session {
                 // `CHANNEL_WINDOW_ADJUST` the closing peer will never send, stranding the
                 // mandatory reply and leaking the channel entry.
                 self.discard_channel_outbound(channel_num)?;
-                // Queue the Close in-order behind any pending inbound data so that already-queued
-                // data is delivered before teardown. On the fast path the Close reaches the channel
-                // buffer immediately, so the `channel_close` callback + teardown run now; when it is
-                // queued, both are deferred to `pump_inbound`'s Close branch (in FIFO order, after
-                // any data ahead of it). Delivering `ChannelMsg::Close` to the channel is what lets
-                // consumers waiting on `Channel::wait()` observe an explicit close instead of `None`.
-                match self.deliver_inbound(channel_num, InboundItem::Close) {
-                    InboundDelivery::Queued => {
-                        // channel_close callback + finalize deferred to pump_inbound.
-                    }
-                    // Delivered (buffer had room) / Overflow / ChannelGone: nothing further will be
-                    // queued, so fire the callback and tear the channel down now.
-                    InboundDelivery::Delivered
-                    | InboundDelivery::Overflow
-                    | InboundDelivery::ChannelGone => {
-                        debug!("handler.channel_close {channel_num:?}");
-                        self.dispatch_close(handler.as_mut().map(|h| &mut **h), channel_num)
-                            .await?;
-                        self.finalize_close(channel_num);
-                    }
-                }
+                // Production CLOSE is a scoped Reader-lane item. This arm is
+                // the no-lane / ctrl-fallback (object tests, parse miss).
+                // No Scheme C: try_send then finalize so the table cannot leak.
+                let _ = self.try_send_app(channel_num, ChannelMsg::Close);
+                debug!("handler.channel_close {channel_num:?}");
+                self.dispatch_close(handler.as_mut().map(|h| &mut **h), channel_num)
+                    .await?;
+                self.finalize_close(channel_num);
                 Ok(())
             }
             msg::CHANNEL_EOF => {
@@ -1238,22 +1221,12 @@ impl Session {
                 if !self.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                // Eof carries no bytes, so it never overflows; it is delivered in FIFO order.
-                match self.deliver_inbound(channel_num, InboundItem::Eof) {
-                    InboundDelivery::Queued => {
-                        // channel_eof callback deferred to pump_inbound (after any queued data).
-                    }
-                    // Delivered: queued into the app buffer. ChannelGone: no app stream retained
-                    // (handler-callback-only server, or receiver dropped). Either way fire the
-                    // callback now, matching the pre-refactor unconditional `handler.channel_eof`.
-                    // (Eof carries no bytes, so Overflow never occurs.)
-                    InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
-                        debug!("handler.channel_eof {channel_num:?}");
-                        self.dispatch_eof(handler.as_mut().map(|h| &mut **h), channel_num)
-                            .await?;
-                    }
-                    InboundDelivery::Overflow => {}
-                }
+                // Production EOF is a scoped Reader-lane item. Ctrl fallback:
+                // try_send (Full cannot park — no Scheme C) then callback.
+                let _ = self.try_send_app(channel_num, ChannelMsg::Eof);
+                debug!("handler.channel_eof {channel_num:?}");
+                self.dispatch_eof(handler.as_mut().map(|h| &mut **h), channel_num)
+                    .await?;
                 Ok(())
             }
             msg::CHANNEL_EXTENDED_DATA | msg::CHANNEL_DATA => {
@@ -1280,30 +1253,34 @@ impl Session {
                     }
                 }
 
-                let item = if let Some(ext) = ext {
-                    InboundItem::ExtendedData {
+                if data.is_empty() {
+                    // Zero-byte DATA delivers nothing (would read as EOF).
+                    self.maybe_grant_after_delivery(
+                        channel_num,
+                        handler.as_mut().map(|h| &mut **h),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let msg = if let Some(ext) = ext {
+                    ChannelMsg::ExtendedData {
                         ext,
                         data: data.clone(),
                     }
                 } else {
-                    InboundItem::Data(data.clone())
+                    ChannelMsg::Data { data: data.clone() }
                 };
-                match self.deliver_inbound(channel_num, item) {
-                    InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
-                        // Delivered: the data is in the per-channel application buffer.
-                        // ChannelGone: no application-side `Channel` stream is retained — the very
-                        // common handler-callback-only server pattern (the server drops the
-                        // `Channel` and works purely through `Handler::data`), or the receiver was
-                        // dropped. There is no app buffer to backpressure, so behave like the
-                        // pre-refactor path: grant window and fire the handler callback
-                        // unconditionally (the old code always called `handler.data` after a
-                        // best-effort `chan.send().await.unwrap_or(())`). Skipping the callback here
-                        // wedges every such server (no echo / no progress).
-                        self.maybe_grant_after_delivery(channel_num, handler.as_mut().map(|h| &mut **h))
-                            .await?;
-                        // This is the no-lane / ctrl-fallback DATA path. Treat like
-                        // ChannelGone (handler-mode): still invoke. The Reader
-                        // Delivered skip lives in dispatch_lane_payload.
+                match self.try_send_app(channel_num, msg) {
+                    Ok(()) | Err(TrySendError::Closed(_)) => {
+                        // Delivered or ChannelGone (handler-only server). This
+                        // is the no-lane / ctrl-fallback DATA path: still
+                        // invoke Handler::data. The Reader Delivered skip
+                        // lives in finish_lane_item.
+                        self.maybe_grant_after_delivery(
+                            channel_num,
+                            handler.as_mut().map(|h| &mut **h),
+                        )
+                        .await?;
                         if let Some(ext) = ext {
                             self.dispatch_extended_data(
                                 handler.as_mut().map(|h| &mut **h),
@@ -1322,24 +1299,13 @@ impl Session {
                             .await?;
                         }
                     }
-                    InboundDelivery::Queued => {
-                        // Grant withheld (per-channel backpressure); the handler callback is
-                        // deferred to pump_inbound so it never fires before the data is buffered.
-                    }
-                    InboundDelivery::Overflow => {
-                        // Protocol violation: the peer ignored its advertised window. Send a wire
-                        // CHANNEL_CLOSE for this channel, drop its queue, and remove local state —
-                        // close this one channel only, never the session.
-                        log::warn!(
-                            "inbound pending cap exceeded for channel {channel_num:?}; closing channel (peer ignored window)"
+                    Err(TrySendError::Full(_)) => {
+                        // No Scheme C on the no-lane path. Do not block
+                        // `reply()` (structural ban). The peer's window
+                        // already accounts for these bytes.
+                        log::debug!(
+                            "ctrl-fallback DATA dropped (app buffer full, no lane) {channel_num:?}"
                         );
-                        // Discard anything queued outbound for this channel rather than parking
-                        // the close behind it: a peer that ignores its window is not a peer we
-                        // can expect a window adjustment from, so a parked close would strand the
-                        // reply and leak this channel for the rest of the session.
-                        self.discard_channel_outbound(channel_num)?;
-                        self.teardown_inbound_channel(channel_num);
-                        self.channels.remove(&channel_num);
                     }
                 }
                 Ok(())
@@ -1872,7 +1838,7 @@ impl Session {
                         .map_err(|_| crate::Error::SendError)?;
                 }
 
-                // Server-open registered an unconfirmed lane. Scheme C
+                // Server-open registered an unconfirmed lane. Gate
                 // teardown is a no-op if the id is absent; it does *not*
                 // close the lane. Do not discard outbound: the Handle has
                 // not returned a Channel yet, so nothing is queued, and

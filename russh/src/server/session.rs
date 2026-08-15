@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use channels::WindowSizeRef;
@@ -7,17 +8,38 @@ use futures::StreamExt;
 use kex::ServerKex;
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{OwnedPermit, Receiver, Sender, channel};
 use tokio::sync::oneshot;
 
 use super::*;
 use crate::channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf};
+
+/// Boxed `reserve_owned()` future for a backpressured channel's app buffer.
+/// Tagged with the Reader lane's monotonic generation; a stale result
+/// (id reused after `close_lane`) is dropped when the tag ≠ live `lane_gen`.
+pub(crate) type BoxReserve = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    ChannelId,
+                    u64,
+                    Result<OwnedPermit<ChannelMsg>, ()>,
+                ),
+            > + Send,
+    >,
+>;
+
+/// Single-flight reserve state. No payload queue — items stay in the lane.
+/// Versioning lives on the Reader lane (`lane_gen`), not here: a fresh
+/// `or_default()` gate must not reset the ABA tag to 0.
+#[derive(Debug, Default)]
+pub(crate) struct InboundGate {
+    pub reserving: bool,
+}
 use crate::helpers::NameList;
 use crate::kex::{
     EXTENSION_SUPPORT_AS_CLIENT, KexAlgorithmImplementor, KexCause, SessionKexState,
-};
-use crate::pending_inbound::{
-    self, BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
 };
 use crate::server::supervisor::{
     AtomicWriteProgress, DisconnectCause, RekeyDeadline, WriteWatchdog,
@@ -33,6 +55,23 @@ use crate::server::writer::{stop_writer_task, WriterEvent, WriterHandle};
 use crate::session::EncryptedState;
 use crate::{ChannelOpenFailure, ReplyQueue, ReplyVerdict, map_err, msg};
 
+fn lane_item_is_zero_data(item: &LaneItem) -> bool {
+    matches!(item, LaneItem::Data(d) if d.is_empty())
+        || matches!(item, LaneItem::ExtendedData { data, .. } if data.is_empty())
+}
+
+fn lane_item_to_msg(item: &LaneItem) -> Option<ChannelMsg> {
+    match item {
+        LaneItem::Data(data) => Some(ChannelMsg::Data { data: data.clone() }),
+        LaneItem::ExtendedData { ext, data } => Some(ChannelMsg::ExtendedData {
+            ext: *ext,
+            data: data.clone(),
+        }),
+        LaneItem::Eof => Some(ChannelMsg::Eof),
+        LaneItem::Close => Some(ChannelMsg::Close),
+        LaneItem::Request { .. } | LaneItem::Success { .. } | LaneItem::Failure { .. } => None,
+    }
+}
 
 /// A connected server session. This type is unique to a client.
 ///
@@ -48,12 +87,16 @@ pub struct Session {
     pub(crate) pending_reads: Vec<Vec<u8>>,
     pub(crate) pending_len: u32,
     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
-    /// Per-channel inbound backpressure queues (Scheme C). Present only for channels that are
-    /// currently backpressured (their app buffer filled up).
-    pub(crate) inbound: HashMap<ChannelId, InboundQueue>,
-    /// Channels that have a pending item but no in-flight `reserve_owned()` future yet; the run
-    /// loop drains this into its `FuturesUnordered` after each inbound batch.
+    /// Per-channel app-buffer gate (S5a). Present only while a channel is
+    /// backpressured or has an in-flight `reserve_owned()`. No second queue —
+    /// data stays in the Reader lane until a permit is held.
+    pub(crate) inbound_gate: HashMap<ChannelId, InboundGate>,
+    /// Channels that need a `reserve_owned()` future registered into the run
+    /// loop's `FuturesUnordered` (at most one in flight per channel).
     pub(crate) inbound_needs_reserve: Vec<ChannelId>,
+    /// App-buffer-full channels: `peek_gated` `hold_all` set. Combined with
+    /// `pending_open_ids` (`hold_data`) — see `pump_reader_lanes`.
+    pub(crate) backpressured: HashSet<ChannelId>,
     /// Producers parked in [`Handle::data`] / [`Handle::extended_data`], keyed by the channel
     /// whose backlog they are waiting to drain. Released by `release_outbound_acks` once that
     /// channel's `pending_data` empties; dropped (waking the producer with an error) when the
@@ -1224,10 +1267,20 @@ impl Session {
     /// again if the quantum was exhausted.
     const LANE_PUMP_QUANTUM: usize = 64;
 
-    /// Pop Reader lanes into `deliver_inbound` / REQUEST dispatch. One
-    /// `InboundItem` is moved — never memcpy'd into Scheme C.
+    /// Pop Reader lanes into the app buffer / REQUEST dispatch.
+    /// App-bound items are reserved *before* pop: Full parks the channel
+    /// in `backpressured` (`hold_all`) and leaves the head in the lane.
+    ///
+    /// Skip-set union (explicit):
+    /// * `pending_open_ids` → `hold_data`: DATA/EXT stay while OPEN
+    ///   callback holds `Channel`; REQUEST/EOF/CLOSE remain poppable.
+    /// * `backpressured` → `hold_all`: the whole channel is skipped
+    ///   (DATA/EXT/EOF/CLOSE and REQUEST) until a permit arrives.
+    /// * `executor_full()` → `non_payload_only`: DATA/EXT never leave
+    ///   the lane; REQUEST/EOF/CLOSE still need the same two holds.
+    /// Combined: `peek_gated(pending_open, backpressured, exec_full)`.
     /// Returns `true` when the quantum was exhausted (more work may remain).
-    async fn pump_reader_lanes<H: Handler + Send>(
+    pub(crate) async fn pump_reader_lanes<H: Handler + Send>(
         &mut self,
         mut handler: Option<&mut H>,
     ) -> Result<bool, H::Error> {
@@ -1244,12 +1297,31 @@ impl Session {
             {
                 let lane = r.total_occupancy_bytes();
                 let count = r.total_occupancy_count();
-                let scheme: usize = self.inbound.values().map(|q| q.pending_bytes).sum();
                 o.set_occ(lane, count);
-                o.note_split(lane, scheme);
+                o.note_split(lane, 0);
             }
             return Ok(false);
         }
+        // Peer CLOSE has already been pushed onto the lane (Reader
+        // publishes WireClose first, then Close). Ctrl consumption is
+        // gated on `!exec_full`, so StopDiscard must not wait for a
+        // permit or a ctrl slot. Full-table scan of live lanes each
+        // pump (same order as `peek_gated`; incremental set is P3).
+        // Covers (1) Full park with Close at the head and (2)
+        // executor_full skipping a DATA head that still has Close
+        // behind it.
+        self.discard_close_queued_lanes()
+            .map_err(|e| e.into())?;
+        let invert_eager = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common.config.invert_eager_lane_pop
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                false
+            }
+        };
         let mut popped = 0usize;
         loop {
             if popped >= Self::LANE_PUMP_QUANTUM {
@@ -1258,113 +1330,275 @@ impl Session {
             let Some(reader) = self.reader.clone() else {
                 break;
             };
-            let Some((id, item)) = (if self.executor_full() {
-                reader.pop_any_non_payload_except(&self.pending_open_ids)
-            } else {
-                reader.pop_any_except(&self.pending_open_ids)
-            }) else {
+            if invert_eager {
+                let Some((id, item)) = (if self.executor_full() {
+                    reader.pop_any_non_payload_except(&self.pending_open_ids)
+                } else {
+                    reader.pop_any_except(&self.pending_open_ids)
+                }) else {
+                    break;
+                };
+                popped += 1;
+                self.dispatch_eager_lane_item(id, item, handler.as_mut().map(|h| &mut **h))
+                    .await?;
+                continue;
+            }
+            let Some(id) = reader.peek_gated(
+                &self.pending_open_ids,
+                &self.backpressured,
+                self.executor_full(),
+            ) else {
                 break;
             };
-            popped += 1;
-            match item {
-                LaneItem::Data(data) => {
-                    // Window already consumed at Reader receive (single ledger).
-                    #[cfg(feature = "_test_hooks")]
-                    if let Some(o) = self.common.config.lane_observe.as_ref() {
-                        o.note_pop_data();
+            if reader.head_needs_app(id) {
+                match self.try_reserve_app(id) {
+                    Ok(permit) => {
+                        let Some(item) = reader.pop_channel(id) else {
+                            break;
+                        };
+                        popped += 1;
+                        self.finish_lane_item(
+                            id,
+                            item,
+                            Some(permit),
+                            false,
+                            handler.as_mut().map(|h| &mut **h),
+                        )
+                        .await?;
                     }
-                    self.dispatch_lane_payload(
-                        id,
-                        InboundItem::Data(data),
-                        handler.as_mut().map(|h| &mut **h),
-                    )
-                    .await?;
-                }
-                LaneItem::ExtendedData { ext, data } => {
-                    self.dispatch_lane_payload(
-                        id,
-                        InboundItem::ExtendedData { ext, data },
-                        handler.as_mut().map(|h| &mut **h),
-                    )
-                    .await?;
-                }
-                LaneItem::Eof => {
-                    self.dispatch_lane_payload(
-                        id,
-                        InboundItem::Eof,
-                        handler.as_mut().map(|h| &mut **h),
-                    )
-                    .await?;
-                }
-                LaneItem::Close => {
-                    self.dispatch_lane_payload(
-                        id,
-                        InboundItem::Close,
-                        handler.as_mut().map(|h| &mut **h),
-                    )
-                    .await?;
-                }
-                LaneItem::Request { payload } => {
-                    #[cfg(feature = "_test_hooks")]
-                    if let Some(o) = self.common.config.lane_observe.as_ref() {
-                        o.note_pop_request();
+                    Err(TrySendError::Full(())) => {
+                        self.maybe_discard_for_peer_close(id)
+                            .map_err(|e| e.into())?;
+                        self.park_backpressure(id);
+                        continue;
                     }
-                    let mut r = payload.as_ref();
-                    self.server_read_authenticated(
-                        handler.as_mut().map(|h| &mut **h),
-                        msg::CHANNEL_REQUEST,
-                        &mut r,
-                    )
-                    .await?;
-                    #[cfg(feature = "_test_hooks")]
-                    if let Some(d) = self.common.config.lane_request_pop_delay {
-                        if !d.is_zero() {
-                            tokio::time::sleep(d).await;
+                    Err(TrySendError::Closed(())) => {
+                        if reader.close_queued(id) {
+                            self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
+                                .await?;
+                            self.finalize_close(id);
+                        } else {
+                            let Some(item) = reader.pop_channel(id) else {
+                                break;
+                            };
+                            popped += 1;
+                            self.finish_lane_item(
+                                id,
+                                item,
+                                None,
+                                true,
+                                handler.as_mut().map(|h| &mut **h),
+                            )
+                            .await?;
                         }
                     }
                 }
-                LaneItem::Success { payload } => {
-                    let mut r = payload.as_ref();
-                    self.server_read_authenticated(
-                        handler.as_mut().map(|h| &mut **h),
-                        msg::CHANNEL_SUCCESS,
-                        &mut r,
-                    )
+            } else {
+                let Some(item) = reader.pop_channel(id) else {
+                    break;
+                };
+                popped += 1;
+                self.dispatch_lane_control(item, handler.as_mut().map(|h| &mut **h))
                     .await?;
-                }
-                LaneItem::Failure { payload } => {
-                    let mut r = payload.as_ref();
-                    self.server_read_authenticated(
-                        handler.as_mut().map(|h| &mut **h),
-                        msg::CHANNEL_FAILURE,
-                        &mut r,
-                    )
-                    .await?;
-                }
             }
         }
         Ok(false)
     }
 
-    async fn dispatch_lane_payload<H: Handler + Send>(
-        &mut self,
+    fn try_reserve_app(
+        &self,
         id: ChannelId,
-        item: InboundItem,
+    ) -> Result<OwnedPermit<ChannelMsg>, TrySendError<()>> {
+        match self.channels.get(&id) {
+            Some(chan) => std::ops::Deref::deref(chan)
+                .clone()
+                .try_reserve_owned()
+                .map_err(|e| match e {
+                    TrySendError::Full(_) => TrySendError::Full(()),
+                    TrySendError::Closed(_) => TrySendError::Closed(()),
+                }),
+            None => Err(TrySendError::Closed(())),
+        }
+    }
+
+    fn park_backpressure(&mut self, id: ChannelId) {
+        self.backpressured.insert(id);
+        let gate = self.inbound_gate.entry(id).or_default();
+        if !gate.reserving {
+            gate.reserving = true;
+            self.inbound_needs_reserve.push(id);
+        }
+    }
+
+    fn live_lane_gen(&self, id: ChannelId) -> u64 {
+        self.reader
+            .as_ref()
+            .and_then(|r| r.lane_gen(id))
+            .unwrap_or(0)
+    }
+
+    fn skip_close_discard_on_park(&self) -> bool {
+        #[cfg(feature = "_test_hooks")]
+        {
+            self.common.config.invert_skip_close_discard_on_park
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        {
+            false
+        }
+    }
+
+    /// Idempotent StopDiscard when a peer CLOSE is already in the lane.
+    /// Safe against a later WireClose / `finish_lane_item` Close: those
+    /// see `we_closed_first` / `already_gone` and do not emit a second
+    /// wire CLOSE.
+    fn maybe_discard_for_peer_close(&mut self, id: ChannelId) -> Result<(), crate::Error> {
+        if self.skip_close_discard_on_park() {
+            return Ok(());
+        }
+        let close_queued = self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.close_queued(id));
+        if !close_queued {
+            return Ok(());
+        }
+        let we_closed_first = self
+            .common
+            .encrypted
+            .as_ref()
+            .is_some_and(|enc| !enc.channel_exists(id));
+        if we_closed_first {
+            return Ok(());
+        }
+        self.discard_channel_outbound(id)
+    }
+
+    fn discard_close_queued_lanes(&mut self) -> Result<(), crate::Error> {
+        let ids = self
+            .reader
+            .as_ref()
+            .map(|r| r.close_queued_ids())
+            .unwrap_or_default();
+        for id in ids {
+            self.maybe_discard_for_peer_close(id)?;
+        }
+        Ok(())
+    }
+
+    fn invert_delivered_handler_data(&self) -> bool {
+        #[cfg(feature = "_test_hooks")]
+        {
+            self.common.config.invert_delivered_handler_data
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        {
+            false
+        }
+    }
+
+    async fn dispatch_lane_control<H: Handler + Send>(
+        &mut self,
+        item: LaneItem,
         mut handler: Option<&mut H>,
     ) -> Result<(), H::Error> {
-        let is_close = matches!(item, InboundItem::Close);
-        let is_eof = matches!(item, InboundItem::Eof);
+        match item {
+            LaneItem::Request { payload } => {
+                #[cfg(feature = "_test_hooks")]
+                if let Some(o) = self.common.config.lane_observe.as_ref() {
+                    o.note_pop_request();
+                }
+                let mut r = payload.as_ref();
+                self.server_read_authenticated(
+                    handler.as_mut().map(|h| &mut **h),
+                    msg::CHANNEL_REQUEST,
+                    &mut r,
+                )
+                .await?;
+                #[cfg(feature = "_test_hooks")]
+                if let Some(d) = self.common.config.lane_request_pop_delay {
+                    if !d.is_zero() {
+                        tokio::time::sleep(d).await;
+                    }
+                }
+            }
+            LaneItem::Success { payload } => {
+                let mut r = payload.as_ref();
+                self.server_read_authenticated(
+                    handler.as_mut().map(|h| &mut **h),
+                    msg::CHANNEL_SUCCESS,
+                    &mut r,
+                )
+                .await?;
+            }
+            LaneItem::Failure { payload } => {
+                let mut r = payload.as_ref();
+                self.server_read_authenticated(
+                    handler.as_mut().map(|h| &mut **h),
+                    msg::CHANNEL_FAILURE,
+                    &mut r,
+                )
+                .await?;
+            }
+            other => {
+                // App-bound items go through finish_lane_item.
+                let _ = other;
+            }
+        }
+        Ok(())
+    }
+
+    /// Invert path: pop first, then `send().await` (old session-loop stall).
+    async fn dispatch_eager_lane_item<H: Handler + Send>(
+        &mut self,
+        id: ChannelId,
+        item: LaneItem,
+        mut handler: Option<&mut H>,
+    ) -> Result<(), H::Error> {
+        if matches!(
+            &item,
+            LaneItem::Request { .. } | LaneItem::Success { .. } | LaneItem::Failure { .. }
+        ) {
+            return self.dispatch_lane_control(item, handler).await;
+        }
+        let msg = match lane_item_to_msg(&item) {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        if let Some(chan) = self.channels.get(&id) {
+            let sender = std::ops::Deref::deref(chan).clone();
+            let _ = sender.send(msg).await;
+            self.finish_lane_item(id, item, None, false, handler.as_mut().map(|h| &mut **h))
+                .await?;
+        } else {
+            self.finish_lane_item(id, item, None, true, handler.as_mut().map(|h| &mut **h))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_lane_item<H: Handler + Send>(
+        &mut self,
+        id: ChannelId,
+        item: LaneItem,
+        permit: Option<OwnedPermit<ChannelMsg>>,
+        gone: bool,
+        mut handler: Option<&mut H>,
+    ) -> Result<(), H::Error> {
+        let is_close = matches!(item, LaneItem::Close);
+        let is_eof = matches!(item, LaneItem::Eof);
+        let zero = lane_item_is_zero_data(&item);
         let (ext, data) = match &item {
-            InboundItem::Data(d) => (None, Some(d.clone())),
-            InboundItem::ExtendedData { ext, data } => (Some(*ext), Some(data.clone())),
+            LaneItem::Data(d) => (None, Some(d.clone())),
+            LaneItem::ExtendedData { ext, data } => (Some(*ext), Some(data.clone())),
             _ => (None, None),
         };
         #[cfg(feature = "_test_hooks")]
-        if let (Some(r), Some(o)) = (self.reader.as_ref(), self.common.config.lane_observe.as_ref())
-        {
-            // Post-pop: remaining lane bytes are a *different* payload.
-            o.set_scheme(pending_inbound::pending_bytes_for(&self.inbound, id));
-            let _ = r;
+        if let Some(o) = self.common.config.lane_observe.as_ref() {
+            if data.is_some() && !zero {
+                o.note_pop_data();
+            }
+            o.set_scheme(0);
         }
         if is_close {
             let we_closed_first = self
@@ -1376,60 +1610,52 @@ impl Session {
                 self.discard_channel_outbound(id).map_err(|e| e.into())?;
             }
         }
-        let delivery = self.deliver_inbound(id, item);
-        let delivered = matches!(delivery, InboundDelivery::Delivered);
-        let gone = matches!(delivery, InboundDelivery::ChannelGone);
-        match delivery {
-            InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
-                if data.is_some() {
-                    self.maybe_grant_after_delivery(id, handler.as_mut().map(|h| &mut **h))
+        let delivered = if zero {
+            // Zero-byte DATA delivers nothing (would read as EOF on AsyncRead).
+            true
+        } else if let Some(permit) = permit {
+            if let Some(msg) = lane_item_to_msg(&item) {
+                permit.send(msg);
+            }
+            true
+        } else if gone {
+            false
+        } else if let Some(msg) = lane_item_to_msg(&item) {
+            // Invert eager path already sent; skip a second send.
+            let _ = msg;
+            true
+        } else {
+            true
+        };
+        if data.is_some() {
+            self.maybe_grant_after_delivery(id, handler.as_mut().map(|h| &mut **h))
+                .await?;
+        }
+        if let Some(d) = data {
+            let invert = self.invert_delivered_handler_data();
+            #[cfg(feature = "_test_hooks")]
+            if delivered && self.pending_kex_install.is_some() {
+                if let Some(ref slot) = self.common.config.kex_install_observe {
+                    slot.mark_data_while_pending(d.len() as u64);
+                }
+            }
+            // Delivered DATA skips Handler::data (H1/H8). ChannelGone
+            // (handler-mode) still posts. Invert restores the old
+            // inline-wait so H1 goes red.
+            let call_data = gone || (delivered && invert);
+            if call_data {
+                if let Some(ext) = ext {
+                    self.dispatch_extended_data(handler, id, ext, &d).await?;
+                } else {
+                    self.dispatch_data(handler, id, &d, delivered && invert)
                         .await?;
                 }
-                if let Some(d) = data {
-                    let invert = {
-                        #[cfg(feature = "_test_hooks")]
-                        {
-                            self.common.config.invert_delivered_handler_data
-                        }
-                        #[cfg(not(feature = "_test_hooks"))]
-                        {
-                            false
-                        }
-                    };
-                    // Delivered DATA skips Handler::data (H1/H8). ChannelGone
-                    // (handler-mode) still posts. Invert restores the old
-                    // inline-wait so H1 goes red.
-                    #[cfg(feature = "_test_hooks")]
-                    if delivered && self.pending_kex_install.is_some() {
-                        if let Some(ref slot) = self.common.config.kex_install_observe {
-                            slot.mark_data_while_pending(d.len() as u64);
-                        }
-                    }
-                    let call_data = gone || (delivered && invert);
-                    if call_data {
-                        if let Some(ext) = ext {
-                            self.dispatch_extended_data(handler, id, ext, &d).await?;
-                        } else {
-                            self.dispatch_data(handler, id, &d, delivered && invert)
-                                .await?;
-                        }
-                    }
-                } else if is_eof {
-                    self.dispatch_eof(handler, id).await?;
-                } else if is_close {
-                    self.dispatch_close(handler, id).await?;
-                    self.finalize_close(id);
-                }
             }
-            InboundDelivery::Queued => {}
-            InboundDelivery::Overflow => {
-                log::warn!(
-                    "inbound pending cap exceeded for channel {id:?}; closing channel"
-                );
-                self.discard_channel_outbound(id).map_err(|e| e.into())?;
-                self.teardown_inbound_channel(id);
-                self.channels.remove(&id);
-            }
+        } else if is_eof {
+            self.dispatch_eof(handler, id).await?;
+        } else if is_close {
+            self.dispatch_close(handler, id).await?;
+            self.finalize_close(id);
         }
         Ok(())
     }
@@ -1534,67 +1760,80 @@ impl Session {
         }
     }
 
-    /// Deliver one inbound [`InboundItem`] to a channel's application buffer without ever blocking
-    /// the shared session loop (Scheme C). Fast path uses `try_send`; on `Full` the channel becomes
-    /// backpressured and the item is queued behind a single in-flight `reserve_owned()` future.
-    pub(crate) fn deliver_inbound(&mut self, id: ChannelId, item: InboundItem) -> InboundDelivery {
-        pending_inbound::deliver_inbound(
-            &self.channels,
-            &mut self.inbound,
-            &mut self.inbound_needs_reserve,
-            self.common.config.max_pending_inbound_bytes,
-            id,
-            item,
-        )
+    /// Try-send an app-bound message on the no-lane / ctrl-fallback path.
+    /// There is no Scheme C queue: Full cannot park the item.
+    pub(crate) fn try_send_app(
+        &self,
+        id: ChannelId,
+        msg: ChannelMsg,
+    ) -> Result<(), TrySendError<ChannelMsg>> {
+        match self.channels.get(&id) {
+            Some(chan) => std::ops::Deref::deref(chan).try_send(msg),
+            None => Err(TrySendError::Closed(msg)),
+        }
     }
 
     /// For each channel flagged in `inbound_needs_reserve`, register a single `reserve_owned()`
-    /// future (tagged with the current generation) into the run loop's `FuturesUnordered`.
+    /// future tagged with the live Reader lane generation.
     pub(crate) fn drain_needs_reserve(&mut self, reserves: &mut FuturesUnordered<BoxReserve>) {
-        pending_inbound::drain_needs_reserve(
-            &self.channels,
-            &mut self.inbound,
-            &mut self.inbound_needs_reserve,
-            reserves,
-        );
+        for id in std::mem::take(&mut self.inbound_needs_reserve) {
+            let reserving = self
+                .inbound_gate
+                .get(&id)
+                .is_some_and(|g| g.reserving);
+            if !reserving {
+                continue;
+            }
+            let generation = self.live_lane_gen(id);
+            match self.channels.get(&id) {
+                Some(chan) => {
+                    let sender = std::ops::Deref::deref(chan).clone();
+                    let fut: BoxReserve = Box::pin(async move {
+                        let r = sender.reserve_owned().await.map_err(|_| ());
+                        (id, generation, r)
+                    });
+                    reserves.push(fut);
+                }
+                None => {
+                    self.teardown_inbound_channel(id);
+                }
+            }
+        }
     }
 
-    /// Resolve one completed `reserve_owned()` future: deliver the head item into the application
-    /// buffer, grant window (I2) if it was payload, fire the item's handler callback **after**
-    /// delivery (so a custom `Handler` never observes data before it reaches the channel buffer —
-    /// matching the fast path), finalize a delivered `Close`, and re-arm the next reserve.
+    /// Resolve one completed `reserve_owned()` future: pop the lane head, send via the
+    /// permit, grant window, fire callbacks **after** the data is in the app buffer,
+    /// then drop the channel from `backpressured` so the next pump can rotate.
     pub(crate) async fn pump_inbound<H: Handler + Send>(
         &mut self,
         id: ChannelId,
         generation: u64,
-        res: Result<tokio::sync::mpsc::OwnedPermit<ChannelMsg>, ()>,
+        res: Result<OwnedPermit<ChannelMsg>, ()>,
         mut handler: Option<&mut H>,
     ) -> Result<(), H::Error> {
+        if generation != self.live_lane_gen(id) {
+            // Stale: torn-down lane or a later episode of the same id.
+            return Ok(());
+        }
         {
-            let q = match self.inbound.get_mut(&id) {
-                Some(q) => q,
+            let g = match self.inbound_gate.get_mut(&id) {
+                Some(g) => g,
                 None => return Ok(()),
             };
-            if generation != q.generation {
-                // Stale result for a torn-down channel; drop it.
-                return Ok(());
-            }
-            q.reserving = false;
+            g.reserving = false;
         }
 
         let permit = match res {
             Ok(p) => p,
             Err(()) => {
-                // Application dropped its receiver while we were reserving. If the peer's
-                // `Close` is sitting in the queue, its teardown was deferred onto delivery —
-                // and delivery can no longer happen. Dropping the queue alone would drop that
-                // deferred teardown with it: `handler.channel_close` never fires and the
-                // `self.channels` entry (whose enc-side twin was already removed when the
-                // CLOSE arrived) leaks for the life of the session. Finalize now instead.
+                // Receiver dropped while we were reserving. If CLOSE is still
+                // in the lane, delivery can no longer happen — fire
+                // `channel_close` and `finalize_close` so the channels table
+                // does not leak (S5a invariant 4).
                 let close_queued = self
-                    .inbound
-                    .get(&id)
-                    .is_some_and(|q| q.close_queued);
+                    .reader
+                    .as_ref()
+                    .is_some_and(|r| r.close_queued(id));
                 if close_queued {
                     self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
                         .await?;
@@ -1606,95 +1845,30 @@ impl Session {
             }
         };
 
-        let item = match self
-            .inbound
-            .get_mut(&id)
-            .and_then(|q| q.queue.pop_front())
-        {
-            Some(item) => item,
-            None => return Ok(()),
+        let Some(reader) = self.reader.clone() else {
+            return Ok(());
         };
-        if let Some(q) = self.inbound.get_mut(&id) {
-            q.pending_bytes = q.pending_bytes.saturating_sub(item.byte_len());
-        }
-        let grants = item.grants_window();
-        // Capture the deferred handler-callback payload before the item is consumed (cheap Bytes
-        // clone). The callback is fired below, after the data is in the application buffer.
-        let callback = DeferredCallback::capture(&item);
-        permit.send(item.into_msg());
-
-        if grants {
-            self.maybe_grant_after_delivery(id, handler.as_mut().map(|h| &mut **h))
-                .await?;
-        }
-
-        match callback {
-            DeferredCallback::Data(data) => {
-                // Scheme C delivery is always into the app buffer (Delivered).
-                // Skip Handler::data unless invert restores the old call.
-                let invert = {
-                    #[cfg(feature = "_test_hooks")]
-                    {
-                        self.common.config.invert_delivered_handler_data
-                    }
-                    #[cfg(not(feature = "_test_hooks"))]
-                    {
-                        false
-                    }
-                };
-                if invert {
-                    self.dispatch_data(handler.as_mut().map(|h| &mut **h), id, &data, true)
-                        .await?;
-                }
-            }
-            DeferredCallback::ExtendedData { ext, data } => {
-                let invert = {
-                    #[cfg(feature = "_test_hooks")]
-                    {
-                        self.common.config.invert_delivered_handler_data
-                    }
-                    #[cfg(not(feature = "_test_hooks"))]
-                    {
-                        false
-                    }
-                };
-                if invert {
-                    self.dispatch_extended_data(
-                        handler.as_mut().map(|h| &mut **h),
-                        id,
-                        ext,
-                        &data,
-                    )
-                    .await?;
-                }
-            }
-            DeferredCallback::Eof => {
-                self.dispatch_eof(handler.as_mut().map(|h| &mut **h), id)
-                    .await?;
-            }
-            DeferredCallback::Close => {
-                self.dispatch_close(handler.as_mut().map(|h| &mut **h), id)
-                    .await?;
-                self.finalize_close(id);
-                return Ok(());
-            }
-        }
-
-        let more = self
-            .inbound
+        let Some(item) = reader.pop_channel(id) else {
+            self.backpressured.remove(&id);
+            self.inbound_gate.remove(&id);
+            return Ok(());
+        };
+        self.backpressured.remove(&id);
+        if self
+            .inbound_gate
             .get(&id)
-            .map(|q| !q.queue.is_empty())
-            .unwrap_or(false);
-        if more {
-            if let Some(q) = self.inbound.get_mut(&id) {
-                q.reserving = true;
-            }
-            self.inbound_needs_reserve.push(id);
-        } else {
-            // Drained: return the channel to the flowing fast path.
-            self.inbound.remove(&id);
+            .is_some_and(|g| !g.reserving)
+        {
+            self.inbound_gate.remove(&id);
         }
-        Ok(())
+        self.finish_lane_item(
+            id,
+            item,
+            Some(permit),
+            false,
+            handler.as_mut().map(|h| &mut **h),
+        )
+        .await
     }
 
     /// I2: grant more inbound receive window for a channel after its data was accepted into the
@@ -1706,26 +1880,30 @@ impl Session {
         handler: Option<&mut H>,
     ) -> Result<(), crate::Error> {
         let target = self.target_window_size;
-        // Bytes still queued undelivered for this channel keep occupying its advertised window;
-        // only the portion already handed to the application may be re-granted. Callers reach
-        // here after `pending_bytes` has been decremented for the item just delivered, so this is
-        // exactly the still-outstanding backlog.
-        let scheme_c = self
-            .inbound
-            .get(&id)
-            .map(|q| q.pending_bytes)
-            .unwrap_or(0);
+        // Bytes still sitting in the Reader lane keep occupying the advertised
+        // window. Scheme C is gone: undelivered is lane-only. Invert
+        // `invert_omit_lane_from_undelivered` restores the over-grant so Q8
+        // goes red (enumerated class, not bare is_err).
         let lane_bytes = self
             .reader
             .as_ref()
             .map(|r| r.occupancy_bytes(id))
             .unwrap_or(0);
-        // Q8: sum both sides. Counting only Scheme C (or only the lane)
-        // mis-grants a full window at the pump handoff.
-        let undelivered = scheme_c
-            .saturating_add(lane_bytes)
-            .try_into()
-            .unwrap_or(u32::MAX);
+        let omit_lane = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common.config.invert_omit_lane_from_undelivered
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                false
+            }
+        };
+        let undelivered = if omit_lane {
+            0
+        } else {
+            lane_bytes.try_into().unwrap_or(u32::MAX)
+        };
         // StopDiscard latch: CLOSE already framed or channel gone —
         // never register / emit a WINDOW_ADJUST for it.
         if !self.outbound_channel_accepts_ctrl(id) {
@@ -2141,13 +2319,10 @@ impl Session {
     }
 
     /// Deferred CHANNEL_CLOSE teardown: only run once the queued `Close` has actually been
-    /// delivered, so queued data ahead of it is never dropped. Bumps the generation so any
-    /// late-resolving reserve future is recognised as stale.
+    /// delivered, so queued data ahead of it is never dropped. Removes the Reader
+    /// lane; a late reserve future is stale when its tag ≠ live `lane_gen`.
     pub(crate) fn finalize_close(&mut self, id: ChannelId) {
-        if let Some(q) = self.inbound.get_mut(&id) {
-            q.generation = q.generation.wrapping_add(1);
-        }
-        self.inbound.remove(&id);
+        self.teardown_inbound_channel(id);
         if let Some(r) = &self.reader {
             r.close_lane(id, r.lane_gen(id).unwrap_or(0));
         }
@@ -2166,10 +2341,13 @@ impl Session {
         self.publish_slots();
     }
 
-    /// Tear down a channel's inbound queue when its application receiver was dropped mid-flight.
-    /// Bumps the generation so a stale reserve result is ignored.
+    /// Tear down a channel's inbound gate when its application receiver was dropped mid-flight.
+    /// Stale reserve futures are rejected by `live_lane_gen` (Reader lane
+    /// generation), not by a gate-local counter that resets on `or_default`.
     pub(crate) fn teardown_inbound_channel(&mut self, id: ChannelId) {
-        pending_inbound::teardown_inbound(&mut self.inbound, id);
+        self.inbound_gate.remove(&id);
+        self.backpressured.remove(&id);
+        self.inbound_needs_reserve.retain(|x| *x != id);
     }
 
     fn maybe_decompress(&mut self, buffer: &SSHBuffer) -> Result<IncomingSshPacket, Error> {
@@ -2414,9 +2592,9 @@ impl Session {
             future_or_pending(self.common.config.inactivity_timeout, tokio::time::sleep);
         pin!(inactivity_timer);
 
-        // Scheme C: in-flight `reserve_owned()` futures for backpressured channels. Kept local to
-        // the run loop (not on `Session`, which must stay `Debug`). Each resolution delivers one
-        // queued inbound item without the loop ever blocking on a single channel's slow consumer.
+        // Lane-gated drainage: in-flight `reserve_owned()` futures for
+        // backpressured channels. Kept local to the run loop (not on `Session`,
+        // which must stay `Debug`). Permit in hand → pop lane head → send.
         let mut inbound_reserves: FuturesUnordered<BoxReserve> = FuturesUnordered::new();
 
         // ── S2b: spawn WriterTask owning PacketWriter + write half ───────────
@@ -6038,6 +6216,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
     use crate::compression::{Compression, Decompress};
     use crate::kex::{KEXES, NONE, SessionKexState};
     use crate::session::{CommonSession, Encrypted, EncryptedState, Exchange};
@@ -6107,8 +6287,9 @@ mod tests {
             pending_reads: Vec::new(),
             pending_len: 0,
             channels: HashMap::new(),
-            inbound: HashMap::new(),
+            inbound_gate: HashMap::new(),
             inbound_needs_reserve: Vec::new(),
+            backpressured: HashSet::new(),
             outbound_acks: std::collections::HashMap::new(),
             open_global_requests: VecDeque::new(),
             kex: SessionKexState::Idle,
@@ -8278,7 +8459,7 @@ mod tests {
         let _ = Bytes::new();
     }
 
-    // ----- RC2 inbound head-of-line-blocking fix (Scheme C) -----
+    // ----- RC2 inbound HOL: lane-gated drainage (S5a) -----
 
     use bytes::Bytes;
 
@@ -8442,89 +8623,103 @@ mod tests {
         );
     }
 
-    /// A window grant must never re-authorise the peer for bytes that are off the wire but still
-    /// queued undelivered. Topping straight back up to `target` did exactly that: one delivered
-    /// item released credit for the whole backlog, so a *compliant* peer could keep refilling the
-    /// queue until `max_pending_inbound_bytes` tripped and its channel was closed as a protocol
-    /// violation.
-    #[tokio::test]
-    async fn window_grant_excludes_undelivered_backlog() {
-        let mut session = authenticated_session();
-        let target = session.target_window_size;
-        let id = insert_encrypted_channel(&mut session, target);
-        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
-
-        // Peer spends its whole window; only a small part has reached the application.
-        let undelivered = target / 2;
-        {
-            let enc = session.common.encrypted.as_mut().unwrap();
-            enc.consume_recv_window(id, target as usize);
-            assert_eq!(enc.sender_window_size(id), 0);
-        }
-        session.inbound.entry(id).or_default().pending_bytes = undelivered as usize;
-
-        let mut handler = TestHandler;
-        session
-            .maybe_grant_after_delivery(id, Some(&mut handler))
-            .await
-            .unwrap();
-
-        // The advertised window may cover only what the application actually consumed.
-        let enc = session.common.encrypted.as_ref().unwrap();
-        assert_eq!(
-            enc.sender_window_size(id),
-            (target - undelivered) as usize,
-            "grant must leave the undelivered backlog occupying the window"
-        );
-    }
-
-    /// Brief S3b #4: undelivered must be lane + Scheme C. Counting only
-    /// Scheme C would grant `target - scheme_c` and ignore the lane.
-    #[tokio::test]
-    async fn window_grant_sums_lane_and_scheme_c() {
-        use crate::server::inbound_lane::{LaneItem, LaneTable};
+    fn attach_lane(
+        session: &mut Session,
+        id: ChannelId,
+        window: u32,
+        items: Vec<crate::server::inbound_lane::LaneItem>,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::server::inbound_lane::LaneTable>> {
+        use crate::server::inbound_lane::LaneTable;
         use crate::server::reader::ReaderHandle;
         use std::sync::{Arc, Mutex};
 
-        let mut session = authenticated_session();
+        let lanes = Arc::new(Mutex::new(LaneTable::new(8, 32)));
+        {
+            let mut g = lanes.lock().unwrap();
+            g.open(id, 1, window, 32768, true);
+            for item in items {
+                assert_eq!(
+                    g.try_push(id, item),
+                    crate::server::inbound_lane::LanePush::Accepted
+                );
+            }
+        }
+        session.reader = Some(ReaderHandle::test_stub(lanes.clone()));
+        lanes
+    }
+
+    async fn q8_grant_round(omit_lane: bool) -> Result<u32, &'static str> {
+        use crate::server::inbound_lane::LaneItem;
+
+        let mut cfg = crate::server::Config::default();
+        #[cfg(feature = "_test_hooks")]
+        {
+            cfg.invert_omit_lane_from_undelivered = omit_lane;
+        }
+        let mut session = authenticated_session_with(cfg);
         let target = session.target_window_size;
         let id = insert_encrypted_channel(&mut session, target);
         let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
 
         let lane_hold = 64usize;
-        let scheme_c = (target / 4) as usize;
-        let lanes = Arc::new(Mutex::new(LaneTable::new(8, 32)));
-        {
-            let mut g = lanes.lock().unwrap();
-            g.open(id, 1, target, 32768, true);
-            // Single ledger: consume the whole granted window on the Reader
-            // cell (Session Encrypted must not independently -=).
-            g.consume_window(id, target as usize);
-            assert_eq!(g.window_remaining(id), Some(0));
-            assert_eq!(
-                g.try_push(id, LaneItem::Data(bytes::Bytes::from(vec![0u8; lane_hold]))),
-                crate::server::inbound_lane::LanePush::Accepted
-            );
-        }
-        session.reader = Some(ReaderHandle::test_stub(lanes));
-        session.inbound.entry(id).or_default().pending_bytes = scheme_c;
+        let lanes = attach_lane(
+            &mut session,
+            id,
+            target,
+            vec![LaneItem::Data(bytes::Bytes::from(vec![0u8; lane_hold]))],
+        );
+        lanes.lock().unwrap().consume_window(id, target as usize);
+        assert_eq!(lanes.lock().unwrap().window_remaining(id), Some(0));
 
         let mut handler = TestHandler;
         session
             .maybe_grant_after_delivery(id, Some(&mut handler))
             .await
-            .unwrap();
+            .map_err(|_| "grant")?;
 
-        let want = target as usize - scheme_c - lane_hold;
+        let got = session
+            .common
+            .encrypted
+            .as_ref()
+            .unwrap()
+            .sender_window_size(id) as u32;
+        Ok(got)
+    }
+
+    /// Q8 production: undelivered is lane occupancy only. Grant must leave
+    /// lane bytes occupying the window.
+    #[tokio::test]
+    async fn window_grant_is_lane_only() {
+        match q8_grant_round(false).await {
+            Ok(got) => {
+                let target = crate::server::Config::default().window_size;
+                let want = target - 64;
+                assert_eq!(got, want, "grant must subtract lane occupancy only");
+            }
+            Err(e) => panic!("Q8 HARD: production lane-only grant failed: {e}"),
+        }
+    }
+
+    /// Q8 invert: omit the lane term → full-window grant → enumerated red.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn window_grant_omit_lane_is_red() {
+        let target = crate::server::Config::default().window_size;
+        match q8_grant_round(true).await {
+            Ok(got) if got == target => {}
+            Ok(got) if got > target - 64 => {
+                // over_grant is also an enumerated red class
+            }
+            other => panic!(
+                "Q8 HARD: invert must fail with enumerated class \
+                 (lane_omitted|over_grant), got {other:?}"
+            ),
+        }
+        // Explicit class: full-window grant is `lane_omitted`.
+        let got = q8_grant_round(true).await.expect("invert still grants");
         assert_eq!(
-            session
-                .common
-                .encrypted
-                .as_ref()
-                .unwrap()
-                .sender_window_size(id),
-            want,
-            "grant must subtract lane_bytes + scheme_c (got sender; want {want} = target {target} - scheme {scheme_c} - lane {lane_hold})"
+            got, target,
+            "Q8 HARD: omit-lane invert class is lane_omitted (got {got}, target {target})"
         );
     }
 
@@ -8714,45 +8909,88 @@ mod tests {
         assert!(acked.await.is_ok());
     }
 
-    /// Once a channel is backpressured, further items queue in FIFO order across kinds (Data before
-    /// Close), exactly one reserve is requested, and the grant is withheld (the queue just grows).
+    /// Backpressure parks the channel without popping: FIFO DATA→DATA→CLOSE
+    /// stays in the lane, exactly one reserve is requested, grant is withheld.
     #[tokio::test]
     async fn inbound_fifo_preserves_order_and_backpressures() {
+        use crate::server::inbound_lane::LaneItem;
+
         let mut session = authenticated_session();
-        let id = ChannelId(1);
-        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
+        let id = insert_encrypted_channel(&mut session, 1024);
+        let (_tx, mut rx) = insert_test_channel(&mut session, id, 1);
+        attach_lane(
+            &mut session,
+            id,
+            1024,
+            vec![
+                LaneItem::Data(Bytes::from_static(b"a")),
+                LaneItem::Data(Bytes::from_static(b"bb")),
+                LaneItem::Data(Bytes::from_static(b"ccc")),
+                LaneItem::Close,
+            ],
+        );
 
-        // First item fits the buffer (capacity 1).
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"a"))),
-            InboundDelivery::Delivered
-        ));
-        // Buffer now full: subsequent items queue, preserving arrival order including Close.
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"bb"))),
-            InboundDelivery::Queued
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"ccc"))),
-            InboundDelivery::Queued
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Close),
-            InboundDelivery::Queued
-        ));
+        let mut handler = TestHandler;
+        session
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .unwrap();
 
-        let q = session.inbound.get(&id).expect("backpressured");
-        assert_eq!(q.queue.len(), 3);
-        assert_eq!(q.pending_bytes, 2 + 3); // "bb" + "ccc"; Close carries no bytes
-        assert!(q.reserving);
-        assert!(matches!(q.queue.front(), Some(InboundItem::Data(d)) if d.as_ref() == b"bb"));
-        assert!(matches!(q.queue.back(), Some(InboundItem::Close)));
-        // Exactly one reserve requested for the channel despite three queued items.
+        assert!(
+            session.backpressured.contains(&id),
+            "second DATA must park the channel"
+        );
         assert_eq!(session.inbound_needs_reserve, vec![id]);
+        assert_eq!(
+            session.reader.as_ref().unwrap().occupancy_count(id),
+            3,
+            "bb + ccc + Close stay in the lane"
+        );
+        match rx.try_recv() {
+            Ok(ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), b"a"),
+            other => panic!("expected first DATA(a) in the app buffer, got {other:?}"),
+        }
+
+        let mut reserves = FuturesUnordered::new();
+        session.drain_needs_reserve(&mut reserves);
+        let (cid, generation, res) = reserves.next().await.expect("one reserve");
+        assert_eq!(cid, id);
+        assert!(res.is_ok());
+        session
+            .pump_inbound(id, generation, res, Some(&mut handler))
+            .await
+            .unwrap();
+        match rx.try_recv() {
+            Ok(ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), b"bb"),
+            other => panic!("expected DATA(bb) after permit, got {other:?}"),
+        }
+        assert!(
+            !session.backpressured.contains(&id),
+            "delivered item returns the channel to rotation"
+        );
+        // bb was drained above, so the next pump can deliver ccc, then
+        // park on Close (buffer holds ccc). Close stays at the lane head.
+        session
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .unwrap();
+        assert!(
+            session.backpressured.contains(&id),
+            "Close still needs a permit (buffer holds ccc)"
+        );
+        assert_eq!(
+            session.reader.as_ref().unwrap().occupancy_count(id),
+            1,
+            "Close remains at the head; no skip-ahead"
+        );
+        assert!(
+            session.reader.as_ref().unwrap().close_queued(id),
+            "CLOSE must still be the parked head"
+        );
     }
 
-    /// S4b: Delivered DATA no longer calls `Handler::data`. The queued path still
-    /// delivers into the application buffer after `permit.send`; the callback stays 0.
+    /// S4b: Delivered DATA no longer calls `Handler::data`. Permit-path
+    /// delivery into the application buffer; the callback stays 0.
     #[tokio::test]
     async fn queued_handler_callback_is_deferred_until_delivery() {
         struct Rec(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
@@ -8769,30 +9007,38 @@ mod tests {
             }
         }
 
+        use crate::server::inbound_lane::LaneItem;
+
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let mut handler = Rec(seen.clone());
         let mut session = authenticated_session();
-        let id = ChannelId(1);
-        let (tx, mut rx) = insert_test_channel(&mut session, id, 1);
+        let id = insert_encrypted_channel(&mut session, 1024);
+        let (_tx, mut rx) = insert_test_channel(&mut session, id, 1);
+        attach_lane(
+            &mut session,
+            id,
+            1024,
+            vec![
+                LaneItem::Data(Bytes::from_static(b"a")),
+                LaneItem::Data(Bytes::from_static(b"b")),
+            ],
+        );
 
-        // Fill the buffer, then queue "b".
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"a"))),
-            InboundDelivery::Delivered
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"b"))),
-            InboundDelivery::Queued
-        ));
-        // The queued item's handler callback must not have fired yet.
-        assert!(seen.lock().unwrap().is_empty());
-
-        // Free a slot and pump: "b" is delivered to the app buffer; Handler::data is not called.
-        assert!(matches!(rx.recv().await, Some(ChannelMsg::Data { .. })));
-        let generation = session.inbound.get(&id).unwrap().generation;
-        let permit = tx.clone().reserve_owned().await.unwrap();
         session
-            .pump_inbound(id, generation, Ok(permit), Some(&mut handler))
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(session.backpressured.contains(&id));
+
+        assert!(matches!(rx.recv().await, Some(ChannelMsg::Data { .. })));
+        let generation = session.reader.as_ref().unwrap().lane_gen(id).unwrap();
+        let mut reserves = FuturesUnordered::new();
+        session.drain_needs_reserve(&mut reserves);
+        let (_, got_gen, res) = reserves.next().await.expect("reserve");
+        assert_eq!(got_gen, generation);
+        session
+            .pump_inbound(id, generation, res, Some(&mut handler))
             .await
             .unwrap();
 
@@ -8804,70 +9050,7 @@ mod tests {
             Some(ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), b"b"),
             other => panic!("expected delivered Data(b), got {other:?}"),
         }
-        // Queue drained -> channel returns to the flowing fast path.
-        assert!(!session.inbound.contains_key(&id));
-    }
-
-    /// The hard per-channel cap is enforced on the FIRST overflowing item, not only once already
-    /// backpressured — even when the buffer just became full.
-    #[tokio::test]
-    async fn first_full_item_respects_pending_cap() {
-        let config = crate::server::Config {
-            max_pending_inbound_bytes: 4,
-            ..Default::default()
-        };
-        let mut session = authenticated_session_with(config);
-        let id = ChannelId(1);
-        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
-
-        // Fills the single buffer slot.
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"aaaa"))),
-            InboundDelivery::Delivered
-        ));
-        // Buffer full now; the very first queued item already exceeds the 4-byte cap -> Overflow,
-        // and nothing is queued.
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"bbbbb"))),
-            InboundDelivery::Overflow
-        ));
-        assert!(!session.inbound.contains_key(&id));
-    }
-
-    /// Exceeding the cap while already backpressured returns Overflow and leaves the existing queue
-    /// (and other channels) untouched — the caller closes just this one channel.
-    #[tokio::test]
-    async fn overflow_while_backpressured_isolated_to_channel() {
-        let config = crate::server::Config {
-            max_pending_inbound_bytes: 6,
-            ..Default::default()
-        };
-        let mut session = authenticated_session_with(config);
-        let victim = ChannelId(1);
-        let other = ChannelId(2);
-        let (_tx_v, _rx_v) = insert_test_channel(&mut session, victim, 1);
-        let (_tx_o, _rx_o) = insert_test_channel(&mut session, other, 1);
-
-        assert!(matches!(
-            session.deliver_inbound(victim, InboundItem::Data(Bytes::from_static(b"aa"))),
-            InboundDelivery::Delivered
-        ));
-        assert!(matches!(
-            session.deliver_inbound(victim, InboundItem::Data(Bytes::from_static(b"bbbb"))),
-            InboundDelivery::Queued
-        ));
-        // 4 (queued) + 3 > cap 6 -> Overflow; the queued "bbbb" stays, nothing new added.
-        assert!(matches!(
-            session.deliver_inbound(victim, InboundItem::Data(Bytes::from_static(b"ccc"))),
-            InboundDelivery::Overflow
-        ));
-        assert_eq!(session.inbound.get(&victim).unwrap().queue.len(), 1);
-        // The other channel is entirely unaffected and still on the fast path.
-        assert!(matches!(
-            session.deliver_inbound(other, InboundItem::Data(Bytes::from_static(b"z"))),
-            InboundDelivery::Delivered
-        ));
-        assert!(!session.inbound.contains_key(&other));
+        assert!(!session.inbound_gate.contains_key(&id));
     }
 
     /// A peer CLOSE for a server-initiated open that is still awaiting OPEN_CONFIRMATION must be
@@ -8930,61 +9113,45 @@ mod tests {
         );
     }
 
-    /// The inbound pending cap counts payload bytes, so zero-byte items are invisible to it.
-    /// While a channel is backpressured, empty DATA is dropped outright and repeated Eof/Close
-    /// queue at most one each — otherwise a hostile peer could grow the queue without bound
-    /// through items the cap never sees.
-    #[tokio::test]
-    async fn zero_byte_items_cannot_grow_queue_unboundedly() {
-        let mut session = authenticated_session();
+    /// Zero-byte DATA / dup EOF/CLOSE are dropped at the lane (`DroppedZero` /
+    /// `DroppedDup`). Count-bound slack covers the rest. This is the S3b
+    /// coverage that replaces Scheme C's pending-cap patches.
+    #[test]
+    fn zero_byte_and_dup_ctrl_are_dropped_at_lane() {
+        use crate::server::inbound_lane::{LaneItem, LanePush, LaneTable};
+
+        let mut t = LaneTable::new(8, 32);
         let id = ChannelId(1);
-        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
-
-        // Fill the buffer, then backpressure with one real payload item.
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"a"))),
-            InboundDelivery::Delivered
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"bb"))),
-            InboundDelivery::Queued
-        ));
-
-        // Empty DATA delivers nothing: dropped, never queued.
+        t.open(id, 1, 1024, 32768, true);
+        assert_eq!(
+            t.try_push(id, LaneItem::Data(Bytes::from_static(b"a"))),
+            LanePush::Accepted
+        );
         for _ in 0..64 {
-            assert!(matches!(
-                session.deliver_inbound(id, InboundItem::Data(Bytes::new())),
-                InboundDelivery::Delivered
-            ));
-            assert!(matches!(
-                session.deliver_inbound(
+            assert_eq!(
+                t.try_push(id, LaneItem::Data(Bytes::new())),
+                LanePush::DroppedZero
+            );
+            assert_eq!(
+                t.try_push(
                     id,
-                    InboundItem::ExtendedData {
+                    LaneItem::ExtendedData {
                         ext: 1,
                         data: Bytes::new()
                     }
                 ),
-                InboundDelivery::Delivered
-            ));
+                LanePush::DroppedZero
+            );
         }
-        assert_eq!(session.inbound.get(&id).unwrap().queue.len(), 1);
-
-        // Eof and Close queue once each; repeats are dropped (reported Queued so callers defer).
+        assert_eq!(t.occupancy_count(id), 1);
+        assert_eq!(t.try_push(id, LaneItem::Eof), LanePush::Accepted);
+        assert_eq!(t.try_push(id, LaneItem::Close), LanePush::Accepted);
         for _ in 0..64 {
-            assert!(matches!(
-                session.deliver_inbound(id, InboundItem::Eof),
-                InboundDelivery::Queued
-            ));
+            assert_eq!(t.try_push(id, LaneItem::Eof), LanePush::DroppedDup);
+            assert_eq!(t.try_push(id, LaneItem::Close), LanePush::DroppedDup);
         }
-        for _ in 0..64 {
-            assert!(matches!(
-                session.deliver_inbound(id, InboundItem::Close),
-                InboundDelivery::Queued
-            ));
-        }
-        let q = session.inbound.get(&id).unwrap();
-        assert_eq!(q.queue.len(), 3, "bb + one Eof + one Close, nothing else");
-        assert_eq!(q.pending_bytes, 2);
+        assert_eq!(t.occupancy_count(id), 3, "a + one Eof + one Close");
+        assert_eq!(t.occupancy_bytes(id), 1);
     }
 
     /// If the application bare-drops its channel receiver while a peer `Close` is queued behind
@@ -9006,29 +9173,33 @@ mod tests {
             }
         }
 
+        use crate::server::inbound_lane::LaneItem;
+
         let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handler = CloseRec(closes.clone());
         let mut session = authenticated_session();
-        let id = ChannelId(1);
+        let id = insert_encrypted_channel(&mut session, 1024);
         let (_tx, rx) = insert_test_channel(&mut session, id, 1);
+        attach_lane(
+            &mut session,
+            id,
+            1024,
+            vec![
+                LaneItem::Data(Bytes::from_static(b"a")),
+                LaneItem::Data(Bytes::from_static(b"bb")),
+                LaneItem::Close,
+            ],
+        );
 
-        // Backpressure the channel, then queue the peer's Close behind the data.
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"a"))),
-            InboundDelivery::Delivered
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"bb"))),
-            InboundDelivery::Queued
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Close),
-            InboundDelivery::Queued
-        ));
+        session
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .unwrap();
+        assert!(session.backpressured.contains(&id));
+        assert!(session.reader.as_ref().unwrap().close_queued(id));
 
-        // App bare-drops the receiver; the in-flight reserve resolves Err.
         drop(rx);
-        let generation = session.inbound.get(&id).unwrap().generation;
+        let generation = session.reader.as_ref().unwrap().lane_gen(id).unwrap();
         session
             .pump_inbound(id, generation, Err(()), Some(&mut handler))
             .await
@@ -9036,38 +9207,146 @@ mod tests {
 
         assert!(
             !session.channels.contains_key(&id),
-            "queued Close must still tear down the app-side entry"
+            "CLOSE still in the lane must tear down the app-side entry"
         );
-        assert!(!session.inbound.contains_key(&id));
+        assert!(!session.inbound_gate.contains_key(&id));
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// Contrast: a bare receiver drop with no Close queued keeps the app-side entry (the peer may
-    /// still close later, and that path — try_send returning Closed — cleans it up then).
+    /// Contrast: a bare receiver drop with no Close in the lane keeps the
+    /// app-side entry (the peer may still close later).
     #[tokio::test]
     async fn receiver_drop_without_queued_close_only_drops_queue() {
-        let mut session = authenticated_session();
-        let id = ChannelId(1);
-        let (_tx, rx) = insert_test_channel(&mut session, id, 1);
+        use crate::server::inbound_lane::LaneItem;
 
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"a"))),
-            InboundDelivery::Delivered
-        ));
-        assert!(matches!(
-            session.deliver_inbound(id, InboundItem::Data(Bytes::from_static(b"bb"))),
-            InboundDelivery::Queued
-        ));
+        let mut session = authenticated_session();
+        let id = insert_encrypted_channel(&mut session, 1024);
+        let (_tx, rx) = insert_test_channel(&mut session, id, 1);
+        attach_lane(
+            &mut session,
+            id,
+            1024,
+            vec![
+                LaneItem::Data(Bytes::from_static(b"a")),
+                LaneItem::Data(Bytes::from_static(b"bb")),
+            ],
+        );
+
+        let mut handler = TestHandler;
+        session
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .unwrap();
+        assert!(session.backpressured.contains(&id));
 
         drop(rx);
-        let generation = session.inbound.get(&id).unwrap().generation;
-        let mut handler = TestHandler;
+        let generation = session.reader.as_ref().unwrap().lane_gen(id).unwrap();
         session
             .pump_inbound(id, generation, Err(()), Some(&mut handler))
             .await
             .unwrap();
 
         assert!(session.channels.contains_key(&id));
-        assert!(!session.inbound.contains_key(&id));
+        assert!(!session.inbound_gate.contains_key(&id));
+        assert!(!session.backpressured.contains(&id));
+    }
+
+    /// Dual Full: invoke_tx capacity 1 and full, app buffer capacity 1 and
+    /// full, Close in the lane. Production must StopDiscard immediately
+    /// (`!accepts_ctrl`). Invert restores the S5a-r1 hole.
+    async fn dual_full_close_async(
+        invert: bool,
+        close_at_head: bool,
+    ) -> Result<(), &'static str> {
+        use crate::server::executor::{HandlerExecutor, Invoke, InvokeMsg};
+        use crate::server::inbound_lane::LaneItem;
+        use tokio::sync::{mpsc, watch};
+
+        let mut cfg = crate::server::Config::default();
+        #[cfg(feature = "_test_hooks")]
+        {
+            cfg.invert_skip_close_discard_on_park = invert;
+        }
+        let mut session = authenticated_session_with(cfg);
+        let id = insert_encrypted_channel(&mut session, 1024);
+        confirm_test_channel(&mut session, id, 1024);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
+        session
+            .try_send_app(id, ChannelMsg::Data { data: Bytes::from_static(b"x") })
+            .map_err(|_| "fill_buf")?;
+
+        let (invoke_tx, invoke_rx) = mpsc::channel(1);
+        invoke_tx
+            .try_send(InvokeMsg {
+                generation: 1,
+                invoke: Invoke::ChannelEof { id },
+            })
+            .map_err(|_| "fill_exec")?;
+        let (_result_tx, result_rx) = mpsc::channel(1);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        session.executor = Some(HandlerExecutor {
+            invoke_tx,
+            result_rx,
+            cancel,
+        });
+        if !session.executor_full() {
+            return Err("exec_not_full");
+        }
+        let _keep_exec = invoke_rx;
+
+        let items = if close_at_head {
+            vec![LaneItem::Close]
+        } else {
+            vec![
+                LaneItem::Data(Bytes::from_static(b"y")),
+                LaneItem::Close,
+            ]
+        };
+        attach_lane(&mut session, id, 1024, items);
+        if !session.outbound_channel_accepts_ctrl(id) {
+            return Err("pre_closed");
+        }
+
+        let mut handler = TestHandler;
+        session
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .map_err(|_| "pump")?;
+
+        if invert {
+            if session.outbound_channel_accepts_ctrl(id) {
+                return Err("still_accepts_ctrl");
+            }
+            return Err("expected_red");
+        }
+        if session.outbound_channel_accepts_ctrl(id) {
+            return Err("still_accepts_ctrl");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dual_full_close_at_head_stop_discard() {
+        dual_full_close_async(false, true)
+            .await
+            .unwrap_or_else(|e| panic!("P1 HARD: Close-at-head must StopDiscard: {e}"));
+    }
+
+    #[tokio::test]
+    async fn dual_full_close_behind_data_stop_discard() {
+        dual_full_close_async(false, false)
+            .await
+            .unwrap_or_else(|e| panic!("P1 HARD: Close-behind-DATA must StopDiscard: {e}"));
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn dual_full_close_invert_is_red() {
+        match dual_full_close_async(true, true).await {
+            Err("still_accepts_ctrl") => {}
+            other => panic!(
+                "P1 HARD: invert must fail with enumerated class still_accepts_ctrl, got {other:?}"
+            ),
+        }
     }
 }

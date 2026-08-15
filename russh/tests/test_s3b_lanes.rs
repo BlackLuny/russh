@@ -1,4 +1,5 @@
-//! S3b: per-channel inbound lane + dual bounds + CLOSE dual path + Scheme C.
+//! S3b: per-channel inbound lane + dual bounds + CLOSE dual path.
+//! S5a: lane-gated drainage (no Scheme C on the server).
 //!
 //! Real `Session::run`. Hard rule: miss → fail. Requires `_test_hooks`.
 
@@ -512,38 +513,121 @@ async fn q7_ctrl_full_cancels() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Q8: a payload is in the lane *or* Scheme C, never memcpy'd into both.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn q8_no_double_count_handoff() -> Result<(), anyhow::Error> {
-    let rec = Rec::default();
-    let hold = Arc::new(AtomicBool::new(true));
+/// Q8: app buffer Full keeps the next payload in the lane (occupancy
+/// does not drop, no extra *lane pop*) until the consumer frees a slot;
+/// then exactly one further pop/delivery. Occupancy and `lane_pops` are
+/// sampled at the table pop exit, so eager pop is visible.
+async fn q8_round(eager: bool) -> Result<(), &'static str> {
+    let rec = IsoRec::default();
     let observe = LaneObserveSlot::new();
     let mut cfg = base_cfg();
     cfg.channel_buffer_size = 1;
-    cfg.lane_pump_hold = Some(hold.clone());
     cfg.lane_observe = Some(observe.clone());
-    let addr = spawn_rec(rec.clone(), cfg).await;
-    let (session, _) = connect_faulty(addr, default_client_config(), Progress::new()).await?;
-    let mut ch = session.channel_open_session().await?;
-    ch.data_bytes(vec![7u8; 32]).await?;
-    wait_for("Q8 in lane", Duration::from_secs(3), || observe.last_bytes() >= 32).await?;
-    let in_lane = observe.last_bytes();
-    assert!(in_lane >= 32, "Q8 HARD: payload must sit in the Reader lane first ({in_lane})");
-    assert_eq!(
-        observe.last_scheme(),
-        0,
-        "Q8 HARD: payload still in the lane must not also be in Scheme C"
-    );
-    assert_eq!(observe.overlap(), 0, "Q8 HARD: same-payload double occupancy");
-    hold.store(false, Ordering::SeqCst);
-    // Wake Session (pump hold release is not itself a select event).
-    ch.data_bytes(vec![8u8]).await?;
-    wait_for("Q8 pumped", Duration::from_secs(3), || {
-        rec.data_seen.load(Ordering::SeqCst)
+    cfg.invert_eager_lane_pop = eager;
+    let addr = spawn_iso(rec.clone(), cfg).await;
+    let (session, _) = connect_faulty(addr, default_client_config(), Progress::new())
+        .await
+        .map_err(|_| "connect")?;
+    let mut ch = session.channel_open_session().await.map_err(|_| "open")?;
+    wait_for("Q8 opened", Duration::from_secs(3), || {
+        rec.opens.load(Ordering::SeqCst) >= 1
     })
-    .await?;
-    eprintln!("q8 lane_after={} overlap={}", observe.last_bytes(), observe.overlap());
+    .await
+    .map_err(|_| "open_timeout")?;
+    ch.data_bytes(vec![7u8; 32]).await.map_err(|_| "data1")?;
+    wait_for("Q8 first pop", Duration::from_secs(3), || {
+        observe.lane_pops() >= 1
+    })
+    .await
+    .map_err(|_| "first_pop_timeout")?;
+    let pops_after_first = observe.lane_pops();
+    ch.data_bytes(vec![8u8; 32]).await.map_err(|_| "data2")?;
+    wait_for("Q8 parked or eager-pop", Duration::from_secs(3), || {
+        observe.last_bytes() >= 32 || observe.lane_pops() > pops_after_first
+    })
+    .await
+    .map_err(|_| "park_timeout")?;
+    if observe.lane_pops() > pops_after_first {
+        eprintln!(
+            "q8 eager={eager} class=pop_before_permit pops={} after_first={pops_after_first} occ={}",
+            observe.lane_pops(),
+            observe.last_bytes()
+        );
+        return Err("pop_before_permit");
+    }
+    let occ = observe.last_bytes();
+    if occ < 32 {
+        eprintln!("q8 eager={eager} class=occupancy_dropped occ={occ}");
+        return Err("occupancy_dropped");
+    }
+    sleep(Duration::from_millis(150)).await;
+    if observe.last_bytes() < occ {
+        eprintln!(
+            "q8 eager={eager} class=occupancy_dropped occ_was={occ} now={}",
+            observe.last_bytes()
+        );
+        return Err("occupancy_dropped");
+    }
+    if observe.lane_pops() != pops_after_first {
+        eprintln!(
+            "q8 eager={eager} class=pop_before_permit pops={} after_first={pops_after_first}",
+            observe.lane_pops()
+        );
+        return Err("pop_before_permit");
+    }
+
+    let mut held = rec.a.lock().unwrap().take().ok_or("no_held_channel")?;
+    let mut n = 0u32;
+    let mut bytes = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while n < 2 && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(400), held.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) => {
+                n += 1;
+                bytes += data.len();
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    if n != 2 {
+        return Err("delivery_count");
+    }
+    if bytes != 64 {
+        return Err("delivery_bytes");
+    }
+    wait_for("Q8 second pop", Duration::from_secs(3), || {
+        observe.lane_pops() >= pops_after_first + 1
+    })
+    .await
+    .map_err(|_| "second_pop_timeout")?;
+    if observe.lane_pops() != pops_after_first + 1 {
+        return Err("extra_pop");
+    }
+    eprintln!(
+        "q8 eager={eager} occ={occ} pops_first={pops_after_first} pops_after={}",
+        observe.lane_pops()
+    );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn q8_no_double_count_handoff() -> Result<(), anyhow::Error> {
+    q8_round(false)
+        .await
+        .map_err(|e| anyhow::anyhow!("Q8 HARD: production must stay parked: {e}"))
+}
+
+/// Same Q8 with `invert_eager_lane_pop`: must go red with an enumerated
+/// class (occupancy drop or pop before permit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn q8_eager_pop_is_red() -> Result<(), anyhow::Error> {
+    match q8_round(true).await {
+        Err("occupancy_dropped") | Err("pop_before_permit") => Ok(()),
+        other => anyhow::bail!(
+            "Q8 HARD: invert must fail with occupancy_dropped|pop_before_permit, got {other:?}"
+        ),
+    }
 }
 
 /// P2-3: CLOSE for a never-opened channel must not call Handler::channel_close.
@@ -771,5 +855,211 @@ async fn count_cap_uses_min8_not_raw_config() -> Result<(), anyhow::Error> {
         "HARD: 8B packets must not hit count_cap when min_packet=16"
     );
     hold.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+// ── S5a: lane-gated drainage ──────────────────────────────────────────────
+
+struct IsoRec {
+    a: Arc<Mutex<Option<Channel<Msg>>>>,
+    b_bytes: Arc<AtomicU64>,
+    opens: Arc<AtomicU32>,
+}
+
+impl Default for IsoRec {
+    fn default() -> Self {
+        Self {
+            a: Arc::new(Mutex::new(None)),
+            b_bytes: Arc::new(AtomicU64::new(0)),
+            opens: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl Clone for IsoRec {
+    fn clone(&self) -> Self {
+        Self {
+            a: self.a.clone(),
+            b_bytes: self.b_bytes.clone(),
+            opens: self.opens.clone(),
+        }
+    }
+}
+
+struct IsoServer {
+    rec: IsoRec,
+}
+
+impl Server for IsoServer {
+    type Handler = IsoHandler;
+    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
+        IsoHandler {
+            rec: self.rec.clone(),
+        }
+    }
+}
+
+struct IsoHandler {
+    rec: IsoRec,
+}
+
+impl Handler for IsoHandler {
+    type Error = russh::Error;
+
+    async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        _: &str,
+        _: &ssh_key::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        let n = self.rec.opens.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            *self.rec.a.lock().unwrap() = Some(channel);
+        } else {
+            let b_bytes = self.rec.b_bytes.clone();
+            tokio::spawn(async move {
+                let mut ch = channel;
+                while let Some(msg) = ch.wait().await {
+                    if let ChannelMsg::Data { data } = msg {
+                        b_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
+async fn spawn_iso(rec: IsoRec, cfg: russh::server::Config) -> std::net::SocketAddr {
+    let addr = free_addr();
+    let mut srv = IsoServer { rec };
+    tokio::spawn(async move {
+        let _ = srv.run_on_address(Arc::new(cfg), addr).await;
+    });
+    wait_listening(addr).await;
+    addr
+}
+
+/// I1: unread A must not stall B (real Session::run + socket).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5a_slow_consumer_does_not_block_other_channel() -> Result<(), anyhow::Error> {
+    s5a_isolation_round(false).await
+}
+
+/// Invert: eager pop + send().await stalls the loop; B does not flow.
+#[cfg(feature = "_test_hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5a_eager_pop_isolation_is_red() -> Result<(), anyhow::Error> {
+    match s5a_isolation_round(true).await {
+        Err(e) if e.to_string().contains("blocked") => Ok(()),
+        other => anyhow::bail!(
+            "S5a I1 invert must fail with enumerated class blocked, got {other:?}"
+        ),
+    }
+}
+
+async fn s5a_isolation_round(eager: bool) -> Result<(), anyhow::Error> {
+    let rec = IsoRec::default();
+    let mut cfg = base_cfg();
+    cfg.channel_buffer_size = 1;
+    cfg.window_size = 64 * 1024;
+    cfg.invert_eager_lane_pop = eager;
+    let addr = spawn_iso(rec.clone(), cfg).await;
+    let (session, _) = connect_faulty(addr, default_client_config(), Progress::new()).await?;
+    let mut a = session.channel_open_session().await?;
+    let mut b = session.channel_open_session().await?;
+    wait_for("two opens", Duration::from_secs(3), || {
+        rec.opens.load(Ordering::SeqCst) >= 2
+    })
+    .await?;
+    a.data_bytes(vec![1u8; 16]).await?;
+    a.data_bytes(vec![2u8; 16]).await?;
+    a.data_bytes(vec![3u8; 16]).await?;
+    // Let Session pump A into backpressure (or invert-block) before B
+    // is on the wire, so HashMap pop order cannot deliver B first.
+    sleep(Duration::from_millis(200)).await;
+    b.data_bytes(vec![9u8; 32]).await?;
+    let ok = wait_for("B flows", Duration::from_secs(3), || {
+        rec.b_bytes.load(Ordering::SeqCst) >= 32
+    })
+    .await;
+    if eager {
+        if ok.is_ok() || rec.b_bytes.load(Ordering::SeqCst) >= 32 {
+            anyhow::bail!("expected_red");
+        }
+        anyhow::bail!("blocked");
+    }
+    ok?;
+    assert!(
+        rec.b_bytes.load(Ordering::SeqCst) >= 32,
+        "S5a I1 HARD: B must flow while A is unread"
+    );
+    let _ = a;
+    let _ = b;
+    Ok(())
+}
+
+/// I6: a compliant peer filling the window of a backpressured channel
+/// stays within the lane byte bound (no Overflow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5a_backpressure_stays_within_lane_bound() -> Result<(), anyhow::Error> {
+    let rec = IsoRec::default();
+    let observe = LaneObserveSlot::new();
+    let mut cfg = base_cfg();
+    cfg.channel_buffer_size = 1;
+    cfg.window_size = 256;
+    cfg.maximum_packet_size = 64;
+    cfg.lane_observe = Some(observe.clone());
+    let addr = spawn_iso(rec.clone(), cfg).await;
+    let mut ccfg = default_client_config();
+    ccfg.window_size = 256;
+    ccfg.maximum_packet_size = 64;
+    let (session, _) = connect_faulty(addr, ccfg, Progress::new()).await?;
+    let mut a = session.channel_open_session().await?;
+    let _b = session.channel_open_session().await?;
+    wait_for("opened", Duration::from_secs(3), || {
+        rec.opens.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+    for _ in 0..4 {
+        a.data_bytes(vec![0u8; 64]).await?;
+    }
+    wait_for("lane occupied", Duration::from_secs(3), || {
+        observe.last_byte_cap() > 0 && observe.last_bytes() >= 64
+    })
+    .await?;
+    assert!(
+        observe.last_byte_cap() > 0,
+        "S5a I6 HARD: byte_cap must be observed"
+    );
+    assert!(
+        observe.last_bytes() >= 64,
+        "S5a I6 HARD: expected parked occupancy, got {}",
+        observe.last_bytes()
+    );
+    assert!(
+        observe.last_bytes() <= observe.last_byte_cap(),
+        "S5a I6 HARD: occupancy {} > byte_cap {}",
+        observe.last_bytes(),
+        observe.last_byte_cap()
+    );
+    assert_eq!(
+        observe.overflows(),
+        0,
+        "S5a I6 HARD: compliant window fill must not Overflow"
+    );
     Ok(())
 }

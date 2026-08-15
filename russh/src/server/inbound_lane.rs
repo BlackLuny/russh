@@ -1,8 +1,8 @@
 //! S3b per-channel inbound lane: dual-bound FIFO of decrypted channel messages.
 //!
-//! This is **not** Scheme C (`pending_inbound`). Occupancy here and Scheme C
-//! `pending_bytes` are mutually exclusive: Session pops an item, then
-//! `deliver_inbound`. Grant `undelivered` must sum both.
+//! After S5a this is the only server inbound backlog: Session does not pop a
+//! channel's head until the app buffer has a permit (`try_reserve`). Grant
+//! `undelivered` is lane occupancy only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -224,6 +224,8 @@ pub struct LaneTable {
     min_packet: usize,
     slack: usize,
     next_gen: u64,
+    #[cfg(feature = "_test_hooks")]
+    observe: Option<Arc<LaneObserveSlot>>,
 }
 
 impl LaneTable {
@@ -233,7 +235,26 @@ impl LaneTable {
             min_packet: min_packet.max(1),
             slack,
             next_gen: 1,
+            #[cfg(feature = "_test_hooks")]
+            observe: None,
         }
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    pub fn set_observe(&mut self, slot: Arc<LaneObserveSlot>) {
+        self.observe = Some(slot);
+    }
+
+    /// Unified pop exit: every `pop_any*` / `pop_channel` path goes here
+    /// so `_test_hooks` occupancy and `lane_pops` see the pop, not delivery.
+    fn take_pop(&mut self, id: ChannelId) -> Option<LaneItem> {
+        let item = self.lanes.get_mut(&id)?.pop()?;
+        #[cfg(feature = "_test_hooks")]
+        if let Some(o) = &self.observe {
+            o.note_lane_pop();
+            o.set_occ(self.total_occupancy_bytes(), self.total_occupancy_count());
+        }
+        Some(item)
     }
 
     pub fn open(
@@ -299,7 +320,7 @@ impl LaneTable {
                 !l.is_empty() && !(hold.contains(id) && l.head_is_payload_data())
             })
             .map(|(id, _)| *id)?;
-        let item = self.lanes.get_mut(&id)?.pop()?;
+        let item = self.take_pop(id)?;
         Some((id, item))
     }
 
@@ -319,8 +340,75 @@ impl LaneTable {
                     && !(hold.contains(id) && l.head_is_payload_data())
             })
             .map(|(id, _)| *id)?;
-        let item = self.lanes.get_mut(&id)?.pop()?;
+        let item = self.take_pop(id)?;
         Some((id, item))
+    }
+
+    /// Select a lane without popping.
+    ///
+    /// * `hold_data` — skip DATA/EXT when that is the head (OPEN callback
+    ///   still holds `Channel`; REQUEST/EOF/CLOSE stay FIFO-poppable).
+    /// * `hold_all` — skip the entire channel (app-buffer backpressure:
+    ///   DATA/EXT/EOF/CLOSE stay in the lane until a permit arrives).
+    /// * `non_payload_only` — Executor full: only REQUEST/EOF/CLOSE/SUCCESS/FAILURE.
+    ///
+    /// Union: a channel in both sets is skipped for every app-bound head
+    /// (`hold_all`) and for DATA/EXT (`hold_data`). REQUEST on a
+    /// `hold_all` channel is also skipped so we never pop past a parked
+    /// backpressure wait.
+    pub fn peek_gated(
+        &self,
+        hold_data: &HashSet<ChannelId>,
+        hold_all: &HashSet<ChannelId>,
+        non_payload_only: bool,
+    ) -> Option<ChannelId> {
+        self.lanes
+            .iter()
+            .find(|(id, l)| {
+                if l.is_empty() {
+                    return false;
+                }
+                if hold_all.contains(id) {
+                    return false;
+                }
+                if non_payload_only && l.head_is_payload_data() {
+                    return false;
+                }
+                !(hold_data.contains(id) && l.head_is_payload_data())
+            })
+            .map(|(id, _)| *id)
+    }
+
+    pub fn pop_channel(&mut self, id: ChannelId) -> Option<LaneItem> {
+        self.take_pop(id)
+    }
+
+    pub fn close_queued(&self, id: ChannelId) -> bool {
+        self.lanes.get(&id).is_some_and(|l| l.close_queued)
+    }
+
+    /// Channels whose lane already holds a peer CLOSE. Full-table filter
+    /// each pump (O(live lanes), same order as `peek_gated`). An incremental
+    /// close-queued set is P3 debt — not worth the extra state unless a
+    /// profile shows a huge lane table.
+    pub fn close_queued_ids(&self) -> Vec<ChannelId> {
+        self.lanes
+            .iter()
+            .filter(|(_, l)| l.close_queued)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    pub fn head_needs_app(&self, id: ChannelId) -> bool {
+        self.lanes.get(&id).is_some_and(|l| {
+            matches!(
+                l.items.front(),
+                Some(LaneItem::Data(_))
+                    | Some(LaneItem::ExtendedData { .. })
+                    | Some(LaneItem::Eof)
+                    | Some(LaneItem::Close)
+            )
+        })
     }
 
     pub fn occupancy_bytes(&self, id: ChannelId) -> usize {
@@ -465,10 +553,12 @@ pub struct LaneObserveSlot {
     last_byte_cap: std::sync::atomic::AtomicUsize,
     last_count_cap: std::sync::atomic::AtomicUsize,
     last_scheme: std::sync::atomic::AtomicUsize,
-    /// Seen both lane and Scheme C occupancy for the same snapshot (Q8).
+    /// Legacy Q8 overlap counter (Scheme C is gone; stays 0).
     overlap: AtomicU64,
     /// Q2: a DATA pop happened before a REQUEST pop (same Session pump era).
     data_pops: AtomicU64,
+    /// Every lane pop (any `LaneItem`), counted at the table pop exit.
+    lane_pops: AtomicU64,
     request_pops: AtomicU64,
     data_before_request: AtomicU64,
 }
@@ -540,6 +630,15 @@ impl LaneObserveSlot {
     pub fn note_pop_request(&self) {
         self.request_pops.fetch_add(1, Ordering::SeqCst);
     }
+    pub fn data_pops(&self) -> u64 {
+        self.data_pops.load(Ordering::SeqCst)
+    }
+    pub fn note_lane_pop(&self) {
+        self.lane_pops.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn lane_pops(&self) -> u64 {
+        self.lane_pops.load(Ordering::SeqCst)
+    }
     pub fn data_before_request(&self) -> bool {
         self.data_before_request.load(Ordering::SeqCst) != 0
     }
@@ -552,8 +651,7 @@ impl LaneObserveSlot {
     pub fn set_scheme(&self, n: usize) {
         self.last_scheme.store(n, Ordering::SeqCst);
     }
-    /// Pump-hold snapshot: the same payload must not sit in both
-    /// the Reader lane and Scheme C.
+    /// Pump-hold snapshot: Scheme C is gone, so `scheme_c` is always 0.
     pub fn note_split(&self, lane: usize, scheme_c: usize) {
         self.last_scheme.store(scheme_c, Ordering::SeqCst);
         if lane > 0 && scheme_c > 0 {

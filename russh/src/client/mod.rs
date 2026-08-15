@@ -60,8 +60,8 @@ use tokio::sync::mpsc::{
 use tokio::sync::oneshot;
 
 pub use crate::auth::AuthResult;
-use crate::pending_inbound::{
-    self, BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
+use pending_inbound::{
+    BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
 };
 use crate::channels::{
     Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
@@ -80,6 +80,7 @@ use crate::{
 
 mod encrypted;
 mod kex;
+mod pending_inbound;
 mod session;
 
 /// Test-only rekey fault-injection gates. Available with `--features _test_hooks`.
@@ -106,8 +107,8 @@ pub struct Session {
     receiver: Receiver<Msg>,
     sender: UnboundedSender<Reply>,
     channels: HashMap<ChannelId, ChannelRef>,
-    /// Per-channel inbound backpressure queues (Scheme C). Present only for channels that are
-    /// currently backpressured (their app buffer filled up). Mirrors the server session.
+    /// Per-channel inbound backpressure queues (Scheme C). Client-only until S8;
+    /// the server uses lane-gated drainage instead.
     inbound: HashMap<ChannelId, InboundQueue>,
     /// Channels that have a pending item but no in-flight `reserve_owned()` future yet; the run
     /// loop drains this into its `FuturesUnordered` after each inbound packet.
@@ -2544,11 +2545,10 @@ pub struct Config {
     /// never the session. See the server-side `Config::max_pending_outbound_bytes`.
     pub max_pending_outbound_bytes: usize,
     /// Hard safety cap on the number of inbound payload bytes that may be queued per channel
-    /// while its application buffer is full (Scheme C backpressure, mirrored from the server —
-    /// see the server-side `Config::max_pending_inbound_bytes`). With delivery-gated window
-    /// grants a well-behaved peer holds at most ~`window_size` bytes in flight, so this only
-    /// trips when a peer ignores its advertised window; exceeding it closes that one channel,
-    /// never the session.
+    /// while its application buffer is full (client Scheme C). Server inbound is bounded by
+    /// the Reader lane instead. A well-behaved peer holds at most ~`window_size` bytes in
+    /// flight, so this only trips when a peer ignores its advertised window; exceeding it
+    /// closes that one channel, never the session.
     pub max_pending_inbound_bytes: usize,
     /// Lists of preferred algorithms.
     pub preferred: negotiation::Preferred,

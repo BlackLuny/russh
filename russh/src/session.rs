@@ -397,9 +397,9 @@ impl Encrypted {
     /// window: the peer may hold at most `target` bytes of un-consumed window at any time, and
     /// the most we may advertise is therefore `target - undelivered`. Topping straight back up to
     /// `target` here would re-authorise the peer for data we have not yet delivered, letting the
-    /// pending queue grow one full window per delivered item until it trips
-    /// `max_pending_inbound_bytes` and a *compliant* peer's channel gets closed as a protocol
-    /// violation. Server callers pass their live `pending_bytes`; the client path passes 0.
+    /// pending queue grow one full window per delivered item. Server callers
+    /// pass Reader lane occupancy; the client path passes Scheme C pending
+    /// bytes (or 0 when drained).
     pub fn maybe_grant_recv_window(
         &mut self,
         channel: ChannelId,
@@ -1081,7 +1081,7 @@ impl Encrypted {
         // a rekey firing mid-bulk-transfer could park the loop in a per-channel
         // `chan.send().await` with the receiver arm gated for the whole exchange, wedging the
         // session permanently (reproduced at the default 1 GiB `rekey_write_limit`). Both
-        // loops now deliver inbound data without blocking (Scheme C, `pending_inbound.rs`), so
+        // loops now deliver inbound data without blocking (server: lane-gated; client: Scheme C), so
         // the loop always keeps reading the socket and a re-exchange always completes;
         // `tests/test_rekey_under_load.rs` holds the line. Deployments that still want no
         // volume/time rekey can set `Limits` to effectively-infinite thresholds.
