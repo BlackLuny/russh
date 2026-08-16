@@ -62,6 +62,12 @@ macro_rules! push_packet {
 }
 
 mod channels;
+#[cfg(feature = "_test_hooks")]
+pub use channels::io::{
+    acquire_invert_bound2_discard_ready, acquire_invert_park_before_register,
+    s8b_object_ack_before_register_round, s8b_object_register_round, InvertParkGuard,
+    S8bObjectClass,
+};
 pub use channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf};
 
 mod parsing;

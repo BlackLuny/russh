@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use futures::FutureExt;
 use tokio::io::AsyncWrite;
@@ -18,6 +18,20 @@ use bytes::Bytes;
 use super::ChannelMsg;
 use crate::ChannelId;
 use crate::channels::{ChannelAcked, OutboundLiveSet};
+
+/// `_test_hooks`: invert D2 (park-before-register) and fix1 (bound-2
+/// discard of a Ready that may be this write's ack).
+#[cfg(feature = "_test_hooks")]
+pub struct ChannelTxTestHooks {
+    pub invert_park_before_register: std::sync::atomic::AtomicBool,
+    pub invert_bound2_discard_ready: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "_test_hooks")]
+pub static CHANNEL_TX_HOOKS: ChannelTxTestHooks = ChannelTxTestHooks {
+    invert_park_before_register: std::sync::atomic::AtomicBool::new(false),
+    invert_bound2_discard_ready: std::sync::atomic::AtomicBool::new(false),
+};
 
 type BoxedThreadsafeFuture<T> = Pin<Box<dyn Sync + Send + std::future::Future<Output = T>>>;
 type OwnedPermitFuture<S> =
@@ -98,10 +112,7 @@ where
 
     fn start_acked_send(&mut self, buf: &[u8]) -> Result<(), io::Error> {
         if self.known_dead() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "channel closed",
-            ));
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"));
         }
         if self.max_packet_size == 0 {
             return Err(io::Error::new(
@@ -203,6 +214,49 @@ where
             Err(SendError(())) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed")),
         }
     }
+
+    /// Register `window_size_notication` as a `Notify` waiter.
+    ///
+    /// One poll. On the acked path every Ready is a live signal (this
+    /// write's ack, or a stale permit — both complete early, same as
+    /// the `acked_waiting` branch). There is no discardable Ready:
+    /// eating one and parking on a fresh `notified()` hangs a single
+    /// writer that will not see a second `notify_one`.
+    fn register_window_notify(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        #[cfg(feature = "_test_hooks")]
+        if CHANNEL_TX_HOOKS
+            .invert_bound2_discard_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return self.register_window_notify_bound2(cx);
+        }
+        match self.window_size_notication.poll_unpin(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => {
+                self.window_size_notication = WatchNotification::new(Arc::clone(&self.notify));
+                Poll::Ready(())
+            }
+        }
+    }
+
+    /// S8b bound-2: treat the first Ready as stale, rebuild, park.
+    /// Invert-only — that Ready may be this write's ack.
+    #[cfg(feature = "_test_hooks")]
+    fn register_window_notify_bound2(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        const REGISTER_BOUND: usize = 2;
+        for attempt in 0..REGISTER_BOUND {
+            match self.window_size_notication.poll_unpin(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    self.window_size_notication = WatchNotification::new(Arc::clone(&self.notify));
+                    if attempt + 1 == REGISTER_BOUND {
+                        return Poll::Ready(());
+                    }
+                }
+            }
+        }
+        Poll::Pending
+    }
 }
 
 impl<S> AsyncWrite for ChannelTx<S>
@@ -243,15 +297,46 @@ where
                 if let Err(e) = self.start_acked_send(buf) {
                     return Poll::Ready(Err(e));
                 }
+                // Notification is created here (natural object) but
+                // not registered yet. Registering before the send
+                // future is polled would enqueue this writer as a
+                // waiter and steal `notify_one` from an already
+                // parked sibling on the same Notify.
             }
             let fut = self.acked_send_fut.as_mut().expect("acked send");
             let r = ready!(fut.as_mut().poll_unpin(cx));
             self.acked_send_fut = None;
             match r {
                 Ok(_) => {
-                    self.acked_waiting = true;
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+                    #[cfg(feature = "_test_hooks")]
+                    if CHANNEL_TX_HOOKS
+                        .invert_park_before_register
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        // Old order: park, register on the *next* poll.
+                        self.acked_waiting = true;
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    match self.register_window_notify(cx) {
+                        Poll::Ready(()) => {
+                            // Already signalled (stale permit or a
+                            // notify during register). Early Ok is
+                            // tolerated: the next write re-enters
+                            // acked_waiting if backlog is still pending.
+                            self.acked_waiting = false;
+                            return Poll::Ready(Ok(self.acked_n));
+                        }
+                        Poll::Pending => {
+                            // Registered. No wake_by_ref: Notify holds
+                            // `cx.waker()`. The old self-wake existed
+                            // only to force a second poll that
+                            // registered — that second poll *was* the
+                            // lost-wake window.
+                            self.acked_waiting = true;
+                            return Poll::Pending;
+                        }
+                    }
                 }
                 Err(()) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -293,5 +378,215 @@ impl<S> Drop for ChannelTx<S> {
     fn drop(&mut self) {
         // Allow other writers to make progress
         self.notify.notify_one();
+    }
+}
+
+/// Object-level D2 gate (manual poll, no tokio scheduling).
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S8bObjectClass {
+    BothReady,
+    LostWake { lost: usize, ready: usize },
+    AckReady,
+    AckBeforeRegisterParked,
+    SendNotAccepted,
+    Unexpected,
+}
+
+#[cfg(feature = "_test_hooks")]
+static INVERT_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "_test_hooks")]
+pub struct InvertParkGuard;
+
+#[cfg(feature = "_test_hooks")]
+impl Drop for InvertParkGuard {
+    fn drop(&mut self) {
+        CHANNEL_TX_HOOKS
+            .invert_park_before_register
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        CHANNEL_TX_HOOKS
+            .invert_bound2_discard_ready
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        INVERT_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+pub fn acquire_invert_park_before_register(invert: bool) -> InvertParkGuard {
+    while INVERT_BUSY
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    CHANNEL_TX_HOOKS
+        .invert_park_before_register
+        .store(invert, std::sync::atomic::Ordering::SeqCst);
+    CHANNEL_TX_HOOKS
+        .invert_bound2_discard_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    InvertParkGuard
+}
+
+#[cfg(feature = "_test_hooks")]
+pub fn acquire_invert_bound2_discard_ready() -> InvertParkGuard {
+    while INVERT_BUSY
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    CHANNEL_TX_HOOKS
+        .invert_park_before_register
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    CHANNEL_TX_HOOKS
+        .invert_bound2_discard_ready
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    InvertParkGuard
+}
+
+#[cfg(feature = "_test_hooks")]
+struct ProbeMsg;
+
+#[cfg(feature = "_test_hooks")]
+impl From<(ChannelId, ChannelMsg)> for ProbeMsg {
+    fn from(_: (ChannelId, ChannelMsg)) -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+impl ChannelAcked for ProbeMsg {
+    fn try_data_acked(
+        _id: ChannelId,
+        _ext: Option<u32>,
+        _data: Bytes,
+        _ack: tokio::sync::oneshot::Sender<()>,
+    ) -> Option<Self> {
+        Some(Self)
+    }
+}
+
+/// Two acked writers, same Notify. Poll to "send accepted, Pending",
+/// then `notify_one` ×2 with no intervening poll, then poll both.
+/// Production: both Ready(Ok). Invert: exactly one Ready, one Pending.
+#[cfg(feature = "_test_hooks")]
+pub fn s8b_object_register_round(invert: bool) -> S8bObjectClass {
+    let _guard = acquire_invert_park_before_register(invert);
+    let (tx, mut rx) = mpsc::channel::<ProbeMsg>(4);
+    let notify = Arc::new(Notify::new());
+    let window = Arc::new(Mutex::new(0u32));
+    let id = ChannelId(1);
+    let mut w0 = ChannelTx::new(
+        tx.clone(),
+        id,
+        Arc::clone(&window),
+        Arc::clone(&notify),
+        32,
+        None,
+        true,
+        None,
+    );
+    let mut w1 = ChannelTx::new(tx, id, window, Arc::clone(&notify), 32, Some(1), true, None);
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let buf = [0u8; 8];
+
+    let p0 = Pin::new(&mut w0).poll_write(&mut cx, &buf);
+    let p1 = Pin::new(&mut w1).poll_write(&mut cx, &buf);
+
+    let mut accepted = 0usize;
+    while rx.try_recv().is_ok() {
+        accepted += 1;
+    }
+    if accepted < 2 {
+        return S8bObjectClass::SendNotAccepted;
+    }
+    if !p0.is_pending() || !p1.is_pending() {
+        return S8bObjectClass::Unexpected;
+    }
+
+    // No further poll — this is the unregistered window invert restores.
+    notify.notify_one();
+    notify.notify_one();
+
+    let r0 = Pin::new(&mut w0).poll_write(&mut cx, &buf);
+    let r1 = Pin::new(&mut w1).poll_write(&mut cx, &buf);
+    let ready0 = matches!(r0, Poll::Ready(Ok(_)));
+    let ready1 = matches!(r1, Poll::Ready(Ok(_)));
+    let pend0 = r0.is_pending();
+    let pend1 = r1.is_pending();
+    match (ready0, ready1, pend0, pend1) {
+        (true, true, _, _) => S8bObjectClass::BothReady,
+        (true, false, _, true) => {
+            eprintln!("s8b LostWake lost=writer1 ready=writer0 invert={invert}");
+            S8bObjectClass::LostWake { lost: 1, ready: 0 }
+        }
+        (false, true, true, _) => {
+            eprintln!("s8b LostWake lost=writer0 ready=writer1 invert={invert}");
+            S8bObjectClass::LostWake { lost: 0, ready: 1 }
+        }
+        _ => S8bObjectClass::Unexpected,
+    }
+}
+
+/// Single acked writer: first poll parks on a full mpsc (send Pending).
+/// Drain the filler (session can accept) and `notify_one` (ack) *before*
+/// the next poll. That next poll completes send and then registers —
+/// the permit is already stored. Production must `Ready(Ok)`. Bound-2
+/// discard of that Ready parks forever → `AckBeforeRegisterParked`.
+#[cfg(feature = "_test_hooks")]
+pub fn s8b_object_ack_before_register_round(bound2: bool) -> S8bObjectClass {
+    let _guard = if bound2 {
+        acquire_invert_bound2_discard_ready()
+    } else {
+        acquire_invert_park_before_register(false)
+    };
+    let (tx, mut rx) = mpsc::channel::<ProbeMsg>(1);
+    if tx.try_send(ProbeMsg).is_err() {
+        return S8bObjectClass::Unexpected;
+    }
+    let notify = Arc::new(Notify::new());
+    let window = Arc::new(Mutex::new(0u32));
+    let mut w = ChannelTx::new(
+        tx,
+        ChannelId(1),
+        window,
+        Arc::clone(&notify),
+        32,
+        None,
+        true,
+        None,
+    );
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let buf = [0u8; 8];
+
+    if !Pin::new(&mut w).poll_write(&mut cx, &buf).is_pending() {
+        return S8bObjectClass::Unexpected;
+    }
+    if rx.try_recv().is_err() {
+        return S8bObjectClass::SendNotAccepted;
+    }
+    notify.notify_one();
+
+    match Pin::new(&mut w).poll_write(&mut cx, &buf) {
+        Poll::Ready(Ok(_)) => S8bObjectClass::AckReady,
+        Poll::Pending => {
+            eprintln!("s8b AckBeforeRegisterParked bound2={bound2}");
+            S8bObjectClass::AckBeforeRegisterParked
+        }
+        Poll::Ready(Err(_)) => S8bObjectClass::Unexpected,
     }
 }
