@@ -62,6 +62,32 @@ fn ack_before_register_bound2_is_parked() {
     }
 }
 
+/// D2-P2: discard (live.remove then notify) in the pre-accept window
+/// must surface BrokenPipe on the early-Ok arm, not a fake Ok.
+/// Pre-fix tree is the invert: this test is red on e4cf099.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn known_dead_after_discard_is_broken_pipe() {
+    match russh::s8c_object_known_dead_round(true) {
+        russh::S8bObjectClass::DeadBrokenPipe => {}
+        russh::S8bObjectClass::DeadReportedOk => {
+            panic!("DeadReportedOk: early Ok after discard (known_dead skipped)")
+        }
+        other => panic!("discard path must DeadBrokenPipe (not Timeout), got {other:?}"),
+    }
+}
+
+/// Same construction, channel still live: stale-permit early Ok must
+/// survive. Proves the check does not break the tolerated permit path.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn known_dead_check_does_not_break_live_early_ok() {
+    match russh::s8c_object_known_dead_round(false) {
+        russh::S8bObjectClass::AckReady => {}
+        other => panic!("live channel must still early-Ok, got {other:?}"),
+    }
+}
+
 fn addr() -> SocketAddr {
     TcpListener::bind(("127.0.0.1", 0))
         .unwrap()

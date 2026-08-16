@@ -9,7 +9,7 @@ pub use tx::ChannelTx;
 pub use tx::{
     InvertParkGuard, S8bObjectClass, acquire_invert_bound2_discard_ready,
     acquire_invert_park_before_register, s8b_object_ack_before_register_round,
-    s8b_object_register_round,
+    s8b_object_register_round, s8c_object_known_dead_round,
 };
 
 use crate::{Channel, ChannelId, ChannelMsg, ChannelReadHalf};

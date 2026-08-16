@@ -4,13 +4,16 @@
 //! `direct-tcpip` echo/sink/source. Mirrors zfc inbound shape (reject
 //! exec/shell/sftp). Default `RekeyPolicy` / `Preferred`; knobs via CLI.
 //!
-//! `required-features=["_test_hooks"]` keeps this binary out of the default
+//! `required-features=["s8_fixture"]` keeps this binary out of the default
 //! `cargo build --examples` surface and marks it as not a user example.
-//! The fixture itself uses only ungated public `Config` fields.
+//! The fixture itself uses only ungated public `Config` fields. Empty
+//! feature on purpose: soak builds `--features s8_fixture` without
+//! `_test_hooks` (plan §3.3).
 //!
 //! `tcpip_forward` 接受(与 zfc 拒绝不同)仅为 `-R` 冒烟所需.
 //!
-//! Build: `cargo run -p russh --example s8_matrix_server --features _test_hooks`
+//! Build (matrix): `cargo run -p russh --example s8_matrix_server --features _test_hooks,s8_fixture`
+//! Build (soak):    `cargo build -p russh --release --example s8_matrix_server --features s8_fixture`
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

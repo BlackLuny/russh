@@ -324,7 +324,16 @@ where
                             // notify during register). Early Ok is
                             // tolerated: the next write re-enters
                             // acked_waiting if backlog is still pending.
+                            // Same post-check list as the
+                            // `acked_waiting` Ready arm: known_dead
+                            // first (discard is remove-then-wake).
                             self.acked_waiting = false;
+                            if self.known_dead() {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "channel closed",
+                                )));
+                            }
                             return Poll::Ready(Ok(self.acked_n));
                         }
                         Poll::Pending => {
@@ -386,10 +395,18 @@ impl<S> Drop for ChannelTx<S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum S8bObjectClass {
     BothReady,
-    LostWake { lost: usize, ready: usize },
+    LostWake {
+        lost: usize,
+        ready: usize,
+    },
     AckReady,
     AckBeforeRegisterParked,
     SendNotAccepted,
+    /// Early Ok after discard removed the id from `OutboundLiveSet`.
+    /// Pre-D2-P2 production path (the "invert" is the unfixed tree).
+    DeadReportedOk,
+    /// Early-Ok arm returned BrokenPipe because `known_dead()`.
+    DeadBrokenPipe,
     Unexpected,
 }
 
@@ -588,5 +605,71 @@ pub fn s8b_object_ack_before_register_round(bound2: bool) -> S8bObjectClass {
             S8bObjectClass::AckBeforeRegisterParked
         }
         Poll::Ready(Err(_)) => S8bObjectClass::Unexpected,
+    }
+}
+
+/// Single acked writer + `OutboundLiveSet`. First poll parks on a
+/// full mpsc (notification created, not registered). Then optionally
+/// `live.remove` + `notify_one` (S5b discard: remove then wake) and
+/// drain the filler. Second poll hits the early-Ok arm.
+///
+/// Production after D2-P2: `remove=true` → `DeadBrokenPipe`.
+/// Pre-fix: `remove=true` → `DeadReportedOk` (the unfixed tree is
+/// the invert; no new hook). `remove=false`: `AckReady` — the
+/// stale-permit early Ok must survive the `known_dead` check.
+#[cfg(feature = "_test_hooks")]
+pub fn s8c_object_known_dead_round(remove: bool) -> S8bObjectClass {
+    let (tx, mut rx) = mpsc::channel::<ProbeMsg>(1);
+    if tx.try_send(ProbeMsg).is_err() {
+        return S8bObjectClass::Unexpected;
+    }
+    let notify = Arc::new(Notify::new());
+    let window = Arc::new(Mutex::new(0u32));
+    let id = ChannelId(1);
+    let live = Arc::new(OutboundLiveSet::default());
+    live.insert(id);
+    let mut w = ChannelTx::new(
+        tx,
+        id,
+        window,
+        Arc::clone(&notify),
+        32,
+        None,
+        true,
+        Some(Arc::clone(&live)),
+    );
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let buf = [0u8; 8];
+
+    if !Pin::new(&mut w).poll_write(&mut cx, &buf).is_pending() {
+        return S8bObjectClass::Unexpected;
+    }
+
+    if remove {
+        live.remove(id);
+    }
+    notify.notify_one();
+    if rx.try_recv().is_err() {
+        return S8bObjectClass::SendNotAccepted;
+    }
+
+    match Pin::new(&mut w).poll_write(&mut cx, &buf) {
+        Poll::Ready(Ok(_)) => {
+            if remove {
+                eprintln!("s8c DeadReportedOk remove={remove}");
+                S8bObjectClass::DeadReportedOk
+            } else {
+                S8bObjectClass::AckReady
+            }
+        }
+        Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
+            if remove {
+                S8bObjectClass::DeadBrokenPipe
+            } else {
+                S8bObjectClass::Unexpected
+            }
+        }
+        Poll::Pending | Poll::Ready(Err(_)) => S8bObjectClass::Unexpected,
     }
 }
