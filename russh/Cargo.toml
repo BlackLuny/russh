@@ -179,3 +179,12 @@ required-features = ["_test_hooks"]
 [[test]]
 name = "test_s7_sched"
 required-features = ["_test_hooks"]
+
+# S8a real-client matrix fixture. Not an API usage example.
+# `_test_hooks` gating is deliberate: keep this out of default
+# `cargo build --examples` and mark it non-user — the fixture does
+# not call hook-gated APIs.
+[[example]]
+name = "s8_matrix_server"
+path = "examples/s8_matrix_server.rs"
+required-features = ["_test_hooks"]
