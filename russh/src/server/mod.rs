@@ -1716,7 +1716,7 @@ where
         pending_open_ids: std::collections::HashSet::new(),
         global_replies: crate::ReplyQueue::default(),
         openings: std::collections::HashMap::new(),
-        channel_gens: std::collections::HashMap::new(),
+        next_channel_gen: 1,
         conn_budget,
         channel_global_held: HashMap::new(),
         channel_window_covered: HashMap::new(),

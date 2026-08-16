@@ -630,7 +630,7 @@ mod tests {
             pending_open_ids: std::collections::HashSet::new(),
             global_replies: crate::ReplyQueue::default(),
             openings: std::collections::HashMap::new(),
-            channel_gens: std::collections::HashMap::new(),
+            next_channel_gen: 1,
             conn_budget: None,
             channel_global_held: std::collections::HashMap::new(),
             channel_window_covered: std::collections::HashMap::new(),

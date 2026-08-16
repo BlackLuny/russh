@@ -1070,7 +1070,7 @@ impl Session {
             pending_open_ids: std::collections::HashSet::new(),
             global_replies: crate::ReplyQueue::default(),
             openings: HashMap::new(),
-            channel_gens: HashMap::new(),
+            next_channel_gen: 1,
             conn_budget: None,
             channel_global_held: HashMap::new(),
             channel_window_covered: HashMap::new(),

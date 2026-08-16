@@ -199,8 +199,9 @@ pub struct Session {
     pub(crate) global_replies: ReplyQueue,
     /// Peer CHANNEL_OPENs reserved but not yet accepted/rejected/expired.
     pub(crate) openings: HashMap<ChannelId, OpeningSlot>,
-    /// Last generation issued per channel id (ABA guard).
-    pub(crate) channel_gens: HashMap<ChannelId, u64>,
+    /// Monotonic generation for CHANNEL_OPEN leases (ABA guard).
+    /// Global uniqueness is stronger than per-id; ids are not reused.
+    pub(crate) next_channel_gen: u64,
     /// This connection's slice of the process-level ledger (S4d).
     /// `None` on object-test sessions that never went through `run_stream`.
     pub(crate) conn_budget: Option<crate::server::global_budget::ConnAccount>,
@@ -1166,13 +1167,13 @@ impl Session {
         }
     }
 
-    fn next_open_gen(&mut self, id: ChannelId) -> u64 {
-        let e = self.channel_gens.entry(id).or_insert(0);
-        *e = e.wrapping_add(1);
-        if *e == 0 {
-            *e = 1;
+    fn next_open_gen(&mut self, _id: ChannelId) -> u64 {
+        let g = self.next_channel_gen;
+        self.next_channel_gen = self.next_channel_gen.wrapping_add(1);
+        if self.next_channel_gen == 0 {
+            self.next_channel_gen = 1;
         }
-        *e
+        g
     }
 
     /// Reserve an opening slot after CHANNEL_OPEN parse, before Handler.
@@ -1248,8 +1249,6 @@ impl Session {
             if let Some(ref s) = self.common.config.slot_observe {
                 s.note_expired();
             }
-            let e = self.channel_gens.entry(id).or_insert(slot.generation);
-            *e = e.wrapping_add(1);
         }
         self.pending_open_ids.remove(&id);
         self.teardown_inbound_channel(id);
@@ -5765,8 +5764,6 @@ impl Session {
             self.channel_global_held.remove(&id);
             self.release_global_inbound_credit(reserved);
             self.write_open_failure(pending.recipient_channel, reason)?;
-            let e = self.channel_gens.entry(id).or_insert(pending.generation);
-            *e = e.wrapping_add(1);
             self.publish_slots();
             return Ok(());
         }
@@ -6831,7 +6828,7 @@ mod tests {
             pending_open_ids: HashSet::new(),
             global_replies: ReplyQueue::default(),
             openings: HashMap::new(),
-            channel_gens: HashMap::new(),
+            next_channel_gen: 1,
             conn_budget: None,
             channel_global_held: HashMap::new(),
             channel_window_covered: HashMap::new(),
@@ -9877,6 +9874,24 @@ mod tests {
                 .confirmed,
             "the channel must end up established"
         );
+    }
+
+    #[test]
+    fn f2_open_gen_globally_unique() {
+        let mut session = authenticated_session();
+        let same = ChannelId(1);
+        let mut gens = vec![
+            session.next_open_gen(same),
+            session.next_open_gen(same),
+            session.next_open_gen(same),
+            session.next_open_gen(ChannelId(2)),
+            session.next_open_gen(ChannelId(3)),
+            session.next_open_gen(ChannelId(4)),
+        ];
+        assert!(gens.iter().all(|&g| g != 0), "gens must be non-zero: {gens:?}");
+        gens.sort_unstable();
+        gens.dedup();
+        assert_eq!(gens.len(), 6, "3 same-id + 3 other-id gens must all be distinct");
     }
 
     /// Zero-byte DATA / dup EOF/CLOSE are dropped at the lane (`DroppedZero` /
