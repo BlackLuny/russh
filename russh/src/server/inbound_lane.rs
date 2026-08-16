@@ -66,6 +66,20 @@ pub enum ExpandCap {
     GenMismatch,
 }
 
+/// Occupancy DoS bound for a committed inbound window.
+/// `byte = window + maxpkt`, `count = window / min(8, min_packet) + slack`.
+pub fn occupancy_caps(
+    window: u32,
+    max_packet: u32,
+    min_packet: usize,
+    slack: usize,
+) -> (usize, usize) {
+    let min_p = min_packet.min(8).max(1);
+    let byte_cap = (window as usize).saturating_add(max_packet as usize);
+    let count_cap = (window as usize / min_p).saturating_add(slack).max(1);
+    (byte_cap, count_cap)
+}
+
 #[derive(Debug)]
 pub struct ChannelLane {
     pub generation: u64,
@@ -93,20 +107,19 @@ impl ChannelLane {
         slack: usize,
         confirmed: bool,
     ) -> Self {
-        // Config contract: denominator is `min(8, configured).max(1)`.
-        let min_p = min_packet.min(8).max(1);
-        // Occupancy DoS bound (this slice), not granted-window authority
-        // (S3c). Extra data beyond the advertised window is ignored per
-        // RFC 4254 §5.2 / `consume_recv_window`; this cap only stops
-        // Reader RAM from growing without bound.
-        let byte_cap = (granted_window as usize).saturating_add(max_packet as usize);
-        let count_cap = (granted_window as usize / min_p).saturating_add(slack);
+        // Occupancy DoS bound, not granted-window authority (S3c).
+        // Extra data beyond the advertised window is ignored per
+        // RFC 4254 §5.2; this cap only stops Reader RAM from growing
+        // without bound. Raised when the committed target grows
+        // (`raise_occupancy_to`); never raised on refill grants.
+        let (byte_cap, count_cap) =
+            occupancy_caps(granted_window, max_packet, min_packet, slack);
         Self {
             generation,
             items: VecDeque::new(),
             bytes: 0,
             byte_cap,
-            count_cap: count_cap.max(1),
+            count_cap,
             window_remaining: granted_window,
             eof_queued: false,
             close_queued: false,
@@ -148,12 +161,26 @@ impl ChannelLane {
     }
 
     /// Grant only tops up the inbound-window ledger. Occupancy bounds
-    /// (`byte_cap` / `count_cap`) are construction-time constants
-    /// (`granted_window + maxpkt`, `window/min(8)+K`) — a compliant
-    /// peer satisfies `lane_bytes + window_remaining ≤ target`, so
-    /// raising the DoS cap on each grant would let RAM grow without bound.
+    /// stay put on refill: a compliant peer satisfies
+    /// `lane_bytes + window_remaining ≤ committed_target`, so raising
+    /// the DoS cap on each ADJUST Δ would let RAM grow without bound
+    /// (S3c). When `Handler::adjust_window` commits a *larger* target,
+    /// `raise_occupancy_to` lifts the bound to the new target + maxpkt.
     fn expand(&mut self, add: u32) {
         self.window_remaining = self.window_remaining.saturating_add(add);
+    }
+
+    /// Lift occupancy DoS bounds to cover `window` (never shrink).
+    fn raise_occupancy_to(
+        &mut self,
+        window: u32,
+        max_packet: u32,
+        min_packet: usize,
+        slack: usize,
+    ) {
+        let (byte_cap, count_cap) = occupancy_caps(window, max_packet, min_packet, slack);
+        self.byte_cap = self.byte_cap.max(byte_cap);
+        self.count_cap = self.count_cap.max(count_cap);
     }
 
     #[cfg(feature = "_test_hooks")]
@@ -471,6 +498,25 @@ impl LaneTable {
             return ExpandCap::GenMismatch;
         }
         lane.expand(add);
+        ExpandCap::Expanded
+    }
+
+    /// Raise occupancy DoS bounds to cover `window`. Never shrinks.
+    /// Never awaits.
+    pub fn try_raise_occupancy(
+        &mut self,
+        id: ChannelId,
+        generation: u64,
+        window: u32,
+        max_packet: u32,
+    ) -> ExpandCap {
+        let Some(lane) = self.lanes.get_mut(&id) else {
+            return ExpandCap::NoLane;
+        };
+        if generation != 0 && lane.generation != generation {
+            return ExpandCap::GenMismatch;
+        }
+        lane.raise_occupancy_to(window, max_packet, self.min_packet, self.slack);
         ExpandCap::Expanded
     }
 }

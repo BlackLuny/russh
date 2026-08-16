@@ -667,6 +667,22 @@ impl ReaderHandle {
             .unwrap_or(ExpandCap::NoLane)
     }
 
+    /// Raise occupancy DoS bounds to a larger committed target.
+    /// Never awaits. No-op (Expanded) when the new bound is not bigger.
+    pub fn try_raise_inbound_caps(
+        &self,
+        id: ChannelId,
+        generation: u64,
+        window: u32,
+        max_packet: u32,
+    ) -> ExpandCap {
+        self.lanes
+            .lock()
+            .ok()
+            .map(|mut g| g.try_raise_occupancy(id, generation, window, max_packet))
+            .unwrap_or(ExpandCap::NoLane)
+    }
+
     pub fn release_ctrl(&self, n: usize) {
         let _ = self
             .ctrl_bytes

@@ -2070,11 +2070,15 @@ impl Session {
                 if let Some(ref s) = self.common.config.deferred_grant {
                     s.note_emitted();
                 }
+                let old_target = self.target_window_size;
                 let w = self
-                    .dispatch_adjust_window(handler, id, self.target_window_size)
+                    .dispatch_adjust_window(handler, id, old_target)
                     .await;
                 if w > 0 {
                     self.target_window_size = w;
+                }
+                if w > old_target {
+                    self.align_lane_occupancy_caps(id, w);
                 }
                 let _ = self.flush();
             } else if !granted {
@@ -2125,11 +2129,15 @@ impl Session {
             if let Some(ref s) = self.common.config.deferred_grant {
                 s.note_emitted();
             }
+            let old_target = self.target_window_size;
             let w = self
-                .dispatch_adjust_window(handler, id, self.target_window_size)
+                .dispatch_adjust_window(handler, id, old_target)
                 .await;
             if w > 0 {
                 self.target_window_size = w;
+            }
+            if w > old_target {
+                self.align_lane_occupancy_caps(id, w);
             }
             // Move the 97B WINDOW_ADJUST into Writer/pending before any
             // subsequent CHANNEL_DATA budget snapshot. Leaving it only in
@@ -2212,6 +2220,21 @@ impl Session {
             ExpandCap::NoLane | ExpandCap::GenMismatch => return Ok(false),
         }
         self.emit_inbound_adjust(id, delta, ceiling)
+    }
+
+    /// Lift this channel's occupancy DoS bound to `window + maxpkt`.
+    /// No-op when the bound already covers `window` (default refill).
+    fn align_lane_occupancy_caps(&self, id: ChannelId, window: u32) {
+        let Some(r) = self.reader.as_ref() else {
+            return;
+        };
+        let lane_gen = r.lane_gen(id).unwrap_or(0);
+        let _ = r.try_raise_inbound_caps(
+            id,
+            lane_gen,
+            window,
+            self.common.config.maximum_packet_size,
+        );
     }
 
     fn expand_inbound_cap(
