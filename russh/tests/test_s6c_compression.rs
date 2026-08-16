@@ -386,6 +386,7 @@ async fn invert_c4_skip_reset_is_red() -> Result<(), anyhow::Error> {
 #[cfg(feature = "flate2")]
 #[test]
 fn c6_newkeys_writes_back_enums() {
+    let _g = SERIAL.blocking_lock();
     use russh::compression::Compression;
     let (c, s) = newkeys_rewrites_compression_enums(
         Compression::None,
@@ -405,6 +406,7 @@ fn c6_newkeys_writes_back_enums() {
 #[cfg(feature = "flate2")]
 #[test]
 fn invert_c6_skip_writeback_is_red() {
+    let _g = SERIAL.blocking_lock();
     use russh::compression::Compression;
     let _skip = SkipNewkeysWriteback::arm();
     let (c, s) = newkeys_rewrites_compression_enums(
