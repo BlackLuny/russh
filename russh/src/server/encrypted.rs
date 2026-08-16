@@ -613,6 +613,7 @@ mod tests {
             pending_outbound: crate::server::session::PendingOutbound::default(),
             pending_kex_install: None,
             deferred_window_grants: std::collections::HashSet::new(),
+            deferred_grant_budget: false,
             #[cfg(feature = "_test_hooks")]
             full_ledger: None,
             #[cfg(feature = "_test_hooks")]

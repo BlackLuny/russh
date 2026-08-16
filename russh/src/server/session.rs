@@ -202,6 +202,9 @@ pub struct Session {
     /// Monotonic generation for CHANNEL_OPEN leases (ABA guard).
     /// Global uniqueness is stronger than per-id; ids are not reused.
     pub(crate) next_channel_gen: u64,
+    /// Inbound WINDOW_ADJUST deferred by global-budget exhaust.
+    /// Local 50 ms poll (not a cross-connection Notify — D30).
+    pub(crate) deferred_grant_budget: bool,
     /// This connection's slice of the process-level ledger (S4d).
     /// `None` on object-test sessions that never went through `run_stream`.
     pub(crate) conn_budget: Option<crate::server::global_budget::ConnAccount>,
@@ -2048,6 +2051,7 @@ impl Session {
                                 s.note_insert();
                             }
                         }
+                        self.deferred_grant_budget = true;
                     }
                 } else {
                     #[cfg(feature = "_test_hooks")]
@@ -2065,6 +2069,9 @@ impl Session {
             }
             if granted && reserved_ok {
                 self.deferred_window_grants.remove(&id);
+                if self.deferred_window_grants.is_empty() {
+                    self.deferred_grant_budget = false;
+                }
                 #[cfg(feature = "_test_hooks")]
                 if let Some(ref s) = self.common.config.deferred_grant {
                     s.note_emitted();
@@ -2099,6 +2106,7 @@ impl Session {
                     s.note_insert();
                 }
             }
+            self.deferred_grant_budget = true;
             return Ok(());
         }
         #[cfg(feature = "_test_hooks")]
@@ -2124,6 +2132,9 @@ impl Session {
         }
         if granted {
             self.deferred_window_grants.remove(&id);
+            if self.deferred_window_grants.is_empty() {
+                self.deferred_grant_budget = false;
+            }
             #[cfg(feature = "_test_hooks")]
             if let Some(ref s) = self.common.config.deferred_grant {
                 s.note_emitted();
@@ -2357,6 +2368,7 @@ impl Session {
         mut handler: Option<&mut H>,
     ) -> Result<(), crate::Error> {
         if self.deferred_window_grants.is_empty() {
+            self.deferred_grant_budget = false;
             return Ok(());
         }
         let ids: Vec<ChannelId> = self.deferred_window_grants.iter().copied().collect();
@@ -3414,6 +3426,21 @@ impl Session {
             } else {
                 std::time::Duration::from_secs(3600)
             };
+            // D30: poll, not a GlobalBudget Notify. release() is on the
+            // hot path; only sessions already starved (deferred set
+            // non-empty) wake every 50 ms. No cross-connection herd.
+            #[cfg(feature = "_test_hooks")]
+            let deferred_grant_timer_off = self.common.config.deferred_grant_timer_disable;
+            #[cfg(not(feature = "_test_hooks"))]
+            let deferred_grant_timer_off = false;
+            let deferred_grant_sleep = if !deferred_grant_timer_off
+                && self.deferred_grant_budget
+                && !self.deferred_window_grants.is_empty()
+            {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_secs(3600)
+            };
             let open_deadline_sleep = self
                 .next_opening_deadline()
                 .map(|t| t.saturating_duration_since(tokio::time::Instant::now()))
@@ -3423,6 +3450,7 @@ impl Session {
                 .min(rekey_sleep)
                 .min(hs_sleep)
                 .min(need_submit_sleep)
+                .min(deferred_grant_sleep)
                 .min(open_deadline_sleep)
                 .max(std::time::Duration::from_millis(1));
 
@@ -6811,6 +6839,7 @@ mod tests {
             pending_outbound: PendingOutbound::default(),
             pending_kex_install: None,
             deferred_window_grants: HashSet::new(),
+            deferred_grant_budget: false,
             #[cfg(feature = "_test_hooks")]
             full_ledger: None,
             #[cfg(feature = "_test_hooks")]

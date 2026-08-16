@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use russh::keys::PrivateKeyWithHashAlg;
 use russh::server::{
-    self, AdmitSplitGate, Auth, GlobalBudget, Handler, Msg, Session, WindowObserveSlot,
-    DEFAULT_GLOBAL_BYTE_BUDGET,
+    self, AdmitSplitGate, Auth, DeferredGrantSlot, GlobalBudget, Handler, Msg, Session,
+    WindowObserveSlot, DEFAULT_GLOBAL_BYTE_BUDGET,
 };
 use russh::{client, Channel, ChannelMsg, ChannelOpenFailure, Error};
 use ssh_key::PrivateKey;
@@ -143,6 +143,11 @@ enum LedgerFail {
     GrantStarved { round: usize },
     SecondOpenRefused,
     NoResumeAfterRelease,
+    UnexpectedResume,
+    BAdjustTimeout { used: u64, budget: u64 },
+    BTookNoRemainder { used: u64, want: u64 },
+    AGrantDidNotFail { fail: u64, used: u64, inserts: u64 },
+    ReleaseTimeout { rel0: u64 },
 }
 
 // ── G1 ──────────────────────────────────────────────────────────────────────
@@ -817,5 +822,171 @@ fn g6_split_admit_is_red() {
             "G6 HARD: split admit must fail with enumerated class \
              (stolen_floor|b_rejected|used_over_cap), got {other:?}"
         ),
+    }
+}
+
+// ── S9 F3: cross-connection release resumes deferred grant via 50 ms poll ──
+//
+// `wobs` is per-config (shared by A and B). Snapshot `adjust_emitted_seq`
+// *before* B closes so A's 50 ms replay cannot land in the release→snapshot
+// gap (B emits no ADJUST on close; B's growth ADJUST is asserted via `BAdjustTimeout`).
+
+async fn cross_conn_round(timer_off: bool) -> Result<(), LedgerFail> {
+    let mut cfg = server_cfg();
+    cfg.window_size = 64;
+    cfg.maximum_packet_size = 32;
+    cfg.max_channels = 1;
+    cfg.max_connections = 2;
+    cfg.inactivity_timeout = None;
+    cfg.keepalive_interval = None;
+    let floor = fixed_plus_opening(&cfg);
+    // One growth reserve = grant_target 128 − window 64.
+    cfg.per_connection_floor = Some(floor);
+    cfg.global_byte_budget = 2 * floor + 64;
+    cfg.deferred_grant_timer_disable = timer_off;
+    let wobs = WindowObserveSlot::new();
+    cfg.window_observe = Some(wobs.clone());
+    let dslot = DeferredGrantSlot::new();
+    cfg.deferred_grant = Some(dslot.clone());
+    let raise = Arc::new(AtomicU32::new(128));
+    cfg.grant_target_override = Some(raise);
+    let cfg = Arc::new(cfg);
+    let gb = cfg.shared_budget();
+    let bytes = Arc::new(AtomicU64::new(0));
+    let addr = spawn_listener(cfg, {
+        let bytes = bytes.clone();
+        move || AcceptCount {
+            bytes: bytes.clone(),
+        }
+    })
+    .await;
+
+    let session_b = timeout(DEADLINE, connect(addr))
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    let ch_b = timeout(DEADLINE, session_b.channel_open_session())
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+
+    let adj_b0 = wobs.adjust_emitted_seq();
+    // One max-packet so the post-delivery grant sees an empty lane
+    // (undelivered=0, remaining=32, target=128) → growth need = 64.
+    timeout(DEADLINE, ch_b.data_bytes(vec![2u8; 32]))
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    wait_delivered(bytes.as_ref(), 32, 1)
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    let want_used = floor + 64;
+    let drive = std::time::Instant::now() + DEADLINE;
+    while gb.used() < want_used {
+        if std::time::Instant::now() > drive {
+            return Err(LedgerFail::BTookNoRemainder {
+                used: gb.used(),
+                want: want_used,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    if wobs.adjust_emitted_seq() == adj_b0 {
+        return Err(LedgerFail::BAdjustTimeout {
+            used: gb.used(),
+            budget: gb.budget(),
+        });
+    }
+    if gb.grant_reserve_fail() != 0 {
+        return Err(LedgerFail::NoResumeAfterRelease);
+    }
+
+    let session_a = timeout(DEADLINE, connect(addr))
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    let ch_a = timeout(DEADLINE, session_a.channel_open_session())
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    timeout(DEADLINE, ch_a.data_bytes(vec![1u8; 32]))
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    wait_delivered(bytes.as_ref(), 64, 2)
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    let drive = std::time::Instant::now() + DEADLINE;
+    while gb.grant_reserve_fail() == 0 {
+        if std::time::Instant::now() > drive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    if gb.grant_reserve_fail() == 0 {
+        return Err(LedgerFail::AGrantDidNotFail {
+            fail: gb.grant_reserve_fail(),
+            used: gb.used(),
+            inserts: dslot.inserts(),
+        });
+    }
+    let drive = std::time::Instant::now() + DEADLINE;
+    while dslot.inserts() == 0 {
+        if std::time::Instant::now() > drive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Let A's run-loop settle into supervisor sleep before B releases.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let adj0 = wobs.adjust_emitted_seq();
+    let rel0 = gb.release_count();
+    let _ = ch_b.close().await;
+    drop(ch_b);
+    let drive = std::time::Instant::now() + DEADLINE;
+    while gb.release_count() == rel0 {
+        if std::time::Instant::now() > drive {
+            return Err(LedgerFail::ReleaseTimeout { rel0 });
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wobs.adjust_emitted_seq() == adj0 {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let advanced = wobs.adjust_emitted_seq() != adj0;
+    let _ = ch_a;
+    let _ = session_a;
+    let _ = session_b;
+    if timer_off {
+        if advanced {
+            Err(LedgerFail::UnexpectedResume)
+        } else {
+            Ok(())
+        }
+    } else if advanced {
+        Ok(())
+    } else {
+        Err(LedgerFail::NoResumeAfterRelease)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s9_cross_conn_release_resumes_grant() {
+    match cross_conn_round(false).await {
+        Ok(()) => {}
+        Err(e) => panic!("S9 HARD: {e:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s9_invert_cross_conn_no_timer_is_red() {
+    match cross_conn_round(true).await {
+        Ok(()) => {}
+        Err(e) => panic!("S9 invert HARD: expected stall without timer, got {e:?}"),
     }
 }

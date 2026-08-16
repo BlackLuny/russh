@@ -199,6 +199,11 @@ pub struct Config {
     /// source for a parked KEX install is the Writer capacity notify (R3).
     #[cfg(feature = "_test_hooks")]
     pub need_submit_timer_disable: bool,
+    /// Test-only: disable the 50ms deferred-grant poll so a connection
+    /// starved by global-budget exhaust is only replayed on its own
+    /// loop events (F3 invert / D30).
+    #[cfg(feature = "_test_hooks")]
+    pub deferred_grant_timer_disable: bool,
     /// Test-only: R3 liveness chain counters (dequeue notify → capacity arm →
     /// install advance).
     #[cfg(feature = "_test_hooks")]
@@ -512,6 +517,8 @@ impl Default for Config {
             fail_next_socket_write: None,
             #[cfg(feature = "_test_hooks")]
             need_submit_timer_disable: false,
+            #[cfg(feature = "_test_hooks")]
+            deferred_grant_timer_disable: false,
             #[cfg(feature = "_test_hooks")]
             capacity_chain: None,
             #[cfg(feature = "_test_hooks")]
@@ -1699,6 +1706,7 @@ where
         pending_outbound: crate::server::session::PendingOutbound::default(),
         pending_kex_install: None,
         deferred_window_grants: std::collections::HashSet::new(),
+        deferred_grant_budget: false,
         #[cfg(feature = "_test_hooks")]
         full_ledger: None,
         #[cfg(feature = "_test_hooks")]
