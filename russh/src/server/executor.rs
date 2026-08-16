@@ -1073,6 +1073,7 @@ impl Session {
             channel_gens: HashMap::new(),
             conn_budget: None,
             channel_global_held: HashMap::new(),
+            channel_window_covered: HashMap::new(),
         }
     }
 

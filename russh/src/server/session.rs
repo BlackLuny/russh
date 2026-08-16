@@ -205,9 +205,15 @@ pub struct Session {
     /// `None` on object-test sessions that never went through `run_stream`.
     pub(crate) conn_budget: Option<crate::server::global_budget::ConnAccount>,
     /// Per-channel bytes reserved from `conn_budget` (opening estimate
-    /// + subsequent grant Δ). Refunded exactly once at the S4c release
-    /// point for that channel.
+    /// + ceiling-growth only). Refunded exactly once at the S4c release
+    /// point for that channel. Occupancy is the committed inbound-window
+    /// ceiling + outbound estimate, not the sum of every ADJUST Δ
+    /// (impl-S4-plan.md L244 / L520; S8c restore).
     pub(crate) channel_global_held: HashMap<ChannelId, u64>,
+    /// Inbound-window + outcap already covered by `channel_global_held`.
+    /// Opening writes `window_size + OUTBOUND_CAP_ESTIMATE`. Grant path
+    /// reserves only when `ceiling + outcap` exceeds this.
+    pub(crate) channel_window_covered: HashMap<ChannelId, u64>,
 }
 
 /// One reserved peer-initiated CHANNEL_OPEN (S4c).
@@ -1023,9 +1029,37 @@ impl Session {
         *self.channel_global_held.entry(id).or_insert(0) += n;
     }
 
+    fn mark_window_covered(&mut self, id: ChannelId, covered: u64) {
+        let prev = self.window_covered(id);
+        if covered > prev {
+            self.channel_window_covered.insert(id, covered);
+        }
+    }
+
+    fn window_covered(&self, id: ChannelId) -> u64 {
+        self.channel_window_covered
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.channel_global_held.get(&id).copied().unwrap_or(0))
+    }
+
+    /// Extra global bytes needed so `held` covers `ceiling + outcap`.
+    /// Zero when the opening estimate (or a previous raise) already does.
+    fn grant_reserve_need(&self, id: ChannelId, ceiling: u32) -> u64 {
+        let want = (ceiling as u64)
+            .saturating_add(crate::server::global_budget::OUTBOUND_CAP_ESTIMATE);
+        want.saturating_sub(self.window_covered(id))
+    }
+
+    fn hold_opening(&mut self, id: ChannelId, need: u64) {
+        self.add_channel_held(id, need);
+        self.mark_window_covered(id, need);
+    }
+
     /// Refund this channel's global reservation. Exactly-once: the map
     /// entry is taken. Hung on S4c release points only.
     pub(crate) fn release_channel_global(&mut self, id: ChannelId) {
+        self.channel_window_covered.remove(&id);
         if let Some(n) = self.channel_global_held.remove(&id) {
             self.release_global_inbound_credit(n);
         }
@@ -1176,7 +1210,7 @@ impl Session {
                 reserved: need,
             },
         );
-        self.add_channel_held(id, need);
+        self.hold_opening(id, need);
         self.publish_slots();
         Some((id, lease))
     }
@@ -1222,6 +1256,7 @@ impl Session {
         if let Some(r) = &self.reader {
             r.close_lane(id, r.lane_gen(id).unwrap_or(0));
         }
+        self.channel_window_covered.remove(&id);
         self.channel_global_held.remove(&id);
         self.release_global_inbound_credit(slot.reserved);
         self.write_open_failure(slot.recipient_channel, reason)?;
@@ -1924,7 +1959,22 @@ impl Session {
         id: ChannelId,
         handler: Option<&mut H>,
     ) -> Result<(), crate::Error> {
-        let target = self.target_window_size;
+        let target = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common
+                    .config
+                    .grant_target_override
+                    .as_ref()
+                    .map(|a| a.load(std::sync::atomic::Ordering::SeqCst))
+                    .filter(|&t| t > 0)
+                    .unwrap_or(self.target_window_size)
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                self.target_window_size
+            }
+        };
         // Bytes still sitting in the Reader lane keep occupying the advertised
         // window. Scheme C is gone: undelivered is lane-only. Invert
         // `invert_omit_lane_from_undelivered` restores the over-grant so Q8
@@ -1974,24 +2024,47 @@ impl Session {
             return Ok(());
         }
         let delta = self.planned_grant_delta(id, target, undelivered);
+        let ceiling = target.saturating_sub(undelivered);
+        let need = if delta > 0 {
+            self.grant_reserve_need(id, ceiling)
+        } else {
+            0
+        };
+        let need_u32 = need.min(u32::MAX as u64) as u32;
         if self.invert_global_before_expand() {
             // G4 invert: same two production operations, swapped.
             let granted = self.grant_expand_then_adjust(id, target, undelivered, delta)?;
+            let mut reserved_ok = true;
             if granted && delta > 0 {
-                if self.reserve_global_inbound_credit(delta).is_err() {
+                if self.reserve_global_inbound_credit(need_u32).is_err() {
+                    reserved_ok = false;
                     #[cfg(feature = "_test_hooks")]
                     if let Some(acc) = self.conn_budget.as_ref() {
                         acc.budget().note_expand_before_global();
+                    }
+                    if need > 0 {
+                        if self.deferred_window_grants.insert(id) {
+                            #[cfg(feature = "_test_hooks")]
+                            if let Some(ref s) = self.common.config.deferred_grant {
+                                s.note_insert();
+                            }
+                        }
                     }
                 } else {
                     #[cfg(feature = "_test_hooks")]
                     if let Some(acc) = self.conn_budget.as_ref() {
                         acc.budget().note_expand_before_global();
                     }
-                    self.add_channel_held(id, delta as u64);
+                    self.add_channel_held(id, need);
+                    self.mark_window_covered(
+                        id,
+                        (ceiling as u64).saturating_add(
+                            crate::server::global_budget::OUTBOUND_CAP_ESTIMATE,
+                        ),
+                    );
                 }
             }
-            if granted {
+            if granted && reserved_ok {
                 self.deferred_window_grants.remove(&id);
                 #[cfg(feature = "_test_hooks")]
                 if let Some(ref s) = self.common.config.deferred_grant {
@@ -2004,17 +2077,24 @@ impl Session {
                     self.target_window_size = w;
                 }
                 let _ = self.flush();
-            } else {
+            } else if !granted {
                 self.deferred_window_grants.remove(&id);
             }
             return Ok(());
         }
         // Production order: global reserve, then expand, then ADJUST.
-        if delta > 0 && self.reserve_global_inbound_credit(delta).is_err() {
+        // `need` is ceiling-growth only (0 when opening already covers).
+        if delta > 0 && self.reserve_global_inbound_credit(need_u32).is_err() {
             log::debug!("global inbound credit exhausted; skip grant");
             #[cfg(feature = "_test_hooks")]
             if let Some(acc) = self.conn_budget.as_ref() {
                 acc.budget().note_grant_reserve_fail();
+            }
+            if self.deferred_window_grants.insert(id) {
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref s) = self.common.config.deferred_grant {
+                    s.note_insert();
+                }
             }
             return Ok(());
         }
@@ -2026,11 +2106,18 @@ impl Session {
         }
         let granted = self.grant_expand_then_adjust(id, target, undelivered, delta)?;
         if granted {
-            if delta > 0 {
-                self.add_channel_held(id, delta as u64);
+            if need > 0 {
+                self.add_channel_held(id, need);
             }
-        } else if delta > 0 {
-            self.release_global_inbound_credit(delta as u64);
+            if delta > 0 {
+                self.mark_window_covered(
+                    id,
+                    (ceiling as u64)
+                        .saturating_add(crate::server::global_budget::OUTBOUND_CAP_ESTIMATE),
+                );
+            }
+        } else if need > 0 {
+            self.release_global_inbound_credit(need);
         }
         if granted {
             self.deferred_window_grants.remove(&id);
@@ -5651,6 +5738,7 @@ impl Session {
             if let Some(r) = &self.reader {
                 r.close_lane(id, r.lane_gen(id).unwrap_or(0));
             }
+            self.channel_window_covered.remove(&id);
             self.channel_global_held.remove(&id);
             self.release_global_inbound_credit(reserved);
             self.write_open_failure(pending.recipient_channel, reason)?;
@@ -6401,7 +6489,7 @@ impl Session {
             });
             sender_channel
         };
-        self.add_channel_held(sender_channel, opening_need);
+        self.hold_opening(sender_channel, opening_need);
         // CHANNEL_OPEN is only buffered in enc.write. The caller
         // (`dispatch_msg` ChannelOpen*) registers the inbound lane in
         // the same turn: no await and no Writer submit between this
@@ -6723,6 +6811,7 @@ mod tests {
             channel_gens: HashMap::new(),
             conn_budget: None,
             channel_global_held: HashMap::new(),
+            channel_window_covered: HashMap::new(),
         }
     }
 

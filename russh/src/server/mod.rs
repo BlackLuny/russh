@@ -342,6 +342,11 @@ pub struct Config {
     /// credit (same two production operations, swapped). G4 must go red.
     #[cfg(feature = "_test_hooks")]
     pub invert_global_before_expand: bool,
+    /// Test-only: if `Some` and the atomic is > 0, `maybe_grant_after_delivery`
+    /// uses that value as the inbound grant target (ceiling growth without
+    /// going through `Handler::adjust_window` nest-wait).
+    #[cfg(feature = "_test_hooks")]
+    pub grant_target_override: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
     /// Test-only G7 invert: `grant_expand_then_adjust` rereads the
     /// window and recomputes Δ (S4d r1 P1-1). G7 must go red.
     #[cfg(feature = "_test_hooks")]
@@ -583,6 +588,8 @@ impl Default for Config {
             budget_cell: std::sync::OnceLock::new(),
             #[cfg(feature = "_test_hooks")]
             invert_global_before_expand: false,
+            #[cfg(feature = "_test_hooks")]
+            grant_target_override: None,
             #[cfg(feature = "_test_hooks")]
             invert_recompute_grant_delta: false,
             #[cfg(feature = "_test_hooks")]
@@ -1712,6 +1719,7 @@ where
         channel_gens: std::collections::HashMap::new(),
         conn_budget,
         channel_global_held: HashMap::new(),
+        channel_window_covered: HashMap::new(),
     };
 
     session.begin_rekey()?;

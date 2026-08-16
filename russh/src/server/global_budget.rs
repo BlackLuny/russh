@@ -1,8 +1,10 @@
 //! Process-level byte + connection ledger (S4d).
 //!
 //! One `used` counter covers three categories on the same book:
-//! 1. inbound grant credit (each ADJUST Δ; the initial window is reserved
-//!    with the opening estimate)
+//! 1. inbound grant credit: the committed window ceiling + outcap
+//!    (opening estimate covers the initial window; refill ADJUST Δ
+//!    reserves 0 unless the handler raised the target). Not the sum
+//!    of every historical ADJUST Δ (impl-S4-plan.md L244 / L520).
 //! 2. opening reservation (`window_size + OUTBOUND_CAP_ESTIMATE`)
 //! 3. per-connection fixed protocol (`inbound_ctrl_budget + WRITER_KEX_BUDGET`)
 //!

@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use russh::server::{
     self, AdmitSplitGate, Auth, GlobalBudget, Handler, Msg, Session, WindowObserveSlot,
     DEFAULT_GLOBAL_BYTE_BUDGET,
 };
-use russh::{client, Channel, ChannelMsg};
+use russh::{client, Channel, ChannelMsg, ChannelOpenFailure, Error};
 use ssh_key::PrivateKey;
 use tokio::time::timeout;
 
@@ -136,6 +136,15 @@ impl Handler for AcceptCount {
     }
 }
 
+/// Enumerated failure classes for S8c ledger gates. No Timeout class —
+/// a wait that expires maps onto the invariant it failed to observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerFail {
+    GrantStarved { round: usize },
+    SecondOpenRefused,
+    NoResumeAfterRelease,
+}
+
 // ── G1 ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -220,6 +229,20 @@ async fn g1_global_budget_n_connections() {
 }
 
 // ── G2 ──────────────────────────────────────────────────────────────────────
+//
+// Old G2 (budget = fixed+opening, first refill Δ must freshly reserve)
+// pinned S4d's implementation deviation: each WINDOW_ADJUST Δ consumed
+// process budget. That contradicts
+//   impl-S4-plan.md L244 — inbound grant credit reserved before grant;
+//     refund on consume / close / teardown
+//   impl-S4-plan.md L520 — book "granted-not-refunded", not the sum of
+//     every ADJUST Δ
+//   global_budget.rs header — fully loaded connection =
+//     max_channels × (window_size + OUTBOUND_CAP_ESTIMATE)
+// After the S8c ledger fix a refill that does not raise the committed
+// ceiling reserves 0, so the old construction would go green without
+// ever testing true exhaust. Exhaust now comes from ceiling growth
+// (handler adjust_window → 2×window) against budget = fixed+opening.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g2_grant_reserve_fail_no_adjust() {
@@ -231,6 +254,8 @@ async fn g2_grant_reserve_fail_no_adjust() {
     cfg.global_byte_budget = fixed_plus_opening(&cfg);
     let wobs = WindowObserveSlot::new();
     cfg.window_observe = Some(wobs.clone());
+    let raise = Arc::new(AtomicU32::new(128));
+    cfg.grant_target_override = Some(raise);
     let cfg = Arc::new(cfg);
     let gb = cfg.shared_budget();
     let bytes = Arc::new(AtomicU64::new(0));
@@ -252,16 +277,24 @@ async fn g2_grant_reserve_fail_no_adjust() {
 
     let expand0 = wobs.expand_ok();
     let adj0 = wobs.adjust_emitted_seq();
-    ch.data_bytes(vec![3u8; 64]).await.expect("G2 HARD: data");
-
+    timeout(DEADLINE, ch.data_bytes(vec![3u8; 64]))
+        .await
+        .expect("G2 HARD: data1 timeout")
+        .expect("G2 HARD: data1");
     let deadline = std::time::Instant::now() + DEADLINE;
     while bytes.load(Ordering::SeqCst) < 64 {
         if std::time::Instant::now() > deadline {
-            panic!("G2 HARD: DATA not delivered");
+            panic!("G2 HARD: DATA1 not delivered");
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // Give the grant path a turn to (not) fire.
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while gb.grant_reserve_fail() == 0 {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     assert_eq!(
@@ -286,6 +319,166 @@ async fn g2_grant_reserve_fail_no_adjust() {
         closed.is_err(),
         "G2 HARD: channel must stay open (not Overflow-closed)"
     );
+}
+
+// ── S8c ledger: refill does not accumulate (must-red on unfixed tree) ────────
+
+async fn wait_delivered(bytes: &AtomicU64, want: u64, round: usize) -> Result<(), LedgerFail> {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while bytes.load(Ordering::SeqCst) < want {
+        if std::time::Instant::now() > deadline {
+            return Err(LedgerFail::GrantStarved { round });
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+async fn grant_refill_does_not_accumulate_round() -> Result<(), LedgerFail> {
+    let mut cfg = server_cfg();
+    cfg.window_size = 64;
+    cfg.maximum_packet_size = 32;
+    cfg.max_channels = 2;
+    cfg.max_connections = 1;
+    cfg.global_byte_budget = fixed_plus_opening(&cfg);
+    let wobs = WindowObserveSlot::new();
+    cfg.window_observe = Some(wobs.clone());
+    let cfg = Arc::new(cfg);
+    let gb = cfg.shared_budget();
+    let bytes = Arc::new(AtomicU64::new(0));
+    let addr = spawn_one(
+        cfg,
+        AcceptCount {
+            bytes: bytes.clone(),
+        },
+    )
+    .await;
+    let session = timeout(DEADLINE, connect(addr))
+        .await
+        .map_err(|_| LedgerFail::GrantStarved { round: 0 })?
+        .map_err(|_| LedgerFail::GrantStarved { round: 0 })?;
+    let ch = timeout(DEADLINE, session.channel_open_session())
+        .await
+        .map_err(|_| LedgerFail::GrantStarved { round: 0 })?
+        .map_err(|_| LedgerFail::GrantStarved { round: 0 })?;
+
+    for round in 1..=8 {
+        let adj0 = wobs.adjust_emitted_seq();
+        let want = 64u64 * round as u64;
+        ch.data_bytes(vec![round as u8; 64])
+            .await
+            .map_err(|_| LedgerFail::GrantStarved { round })?;
+        wait_delivered(bytes.as_ref(), want, round).await?;
+        let deadline = std::time::Instant::now() + DEADLINE;
+        while wobs.adjust_emitted_seq() == adj0 {
+            if gb.grant_reserve_fail() >= 1 {
+                return Err(LedgerFail::GrantStarved { round });
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(LedgerFail::GrantStarved { round });
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    if gb.grant_reserve_fail() != 0 {
+        return Err(LedgerFail::GrantStarved { round: 8 });
+    }
+    match timeout(DEADLINE, session.channel_open_session()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(Error::ChannelOpenFailure(ChannelOpenFailure::ResourceShortage)))
+        | Ok(Err(Error::ChannelOpenFailure(_))) => Err(LedgerFail::SecondOpenRefused),
+        Ok(Err(_)) | Err(_) => Err(LedgerFail::SecondOpenRefused),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s8c_grant_refill_does_not_accumulate() {
+    match grant_refill_does_not_accumulate_round().await {
+        Ok(()) => {}
+        Err(e) => panic!("S8c HARD: {e:?}"),
+    }
+}
+
+// ── S8c ledger: exhaust then release resumes (must-red on unfixed tree) ──────
+
+async fn grant_resumes_after_release_round() -> Result<(), LedgerFail> {
+    let mut cfg = server_cfg();
+    cfg.window_size = 64;
+    cfg.maximum_packet_size = 32;
+    cfg.max_channels = 2;
+    cfg.max_connections = 1;
+    cfg.global_byte_budget = fixed_plus_opening(&cfg);
+    let wobs = WindowObserveSlot::new();
+    cfg.window_observe = Some(wobs.clone());
+    let raise = Arc::new(AtomicU32::new(128));
+    cfg.grant_target_override = Some(raise);
+    let cfg = Arc::new(cfg);
+    let gb = cfg.shared_budget();
+    let bytes = Arc::new(AtomicU64::new(0));
+    let addr = spawn_one(
+        cfg,
+        AcceptCount {
+            bytes: bytes.clone(),
+        },
+    )
+    .await;
+    let session = timeout(DEADLINE, connect(addr))
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    let ch1 = timeout(DEADLINE, session.channel_open_session())
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    let ch2 = timeout(DEADLINE, session.channel_open_session())
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+
+    timeout(DEADLINE, ch1.data_bytes(vec![1u8; 64]))
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+    wait_delivered(bytes.as_ref(), 64, 1)
+        .await
+        .map_err(|_| LedgerFail::NoResumeAfterRelease)?;
+
+    // Ceiling already 2×window via grant_target_override. The first
+    // grant after delivery is a growth reserve and must fail while
+    // ch2 occupies the rest of the floor.
+    let drive = std::time::Instant::now() + DEADLINE;
+    while gb.grant_reserve_fail() == 0 {
+        if std::time::Instant::now() > drive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    if gb.grant_reserve_fail() == 0 {
+        return Err(LedgerFail::NoResumeAfterRelease);
+    }
+
+    let adj0 = wobs.adjust_emitted_seq();
+    let _ = ch2.close().await;
+    drop(ch2);
+
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while wobs.adjust_emitted_seq() == adj0 {
+        if std::time::Instant::now() > deadline {
+            return Err(LedgerFail::NoResumeAfterRelease);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = ch1;
+    let _ = session;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s8c_grant_resumes_after_release() {
+    match grant_resumes_after_release_round().await {
+        Ok(()) => {}
+        Err(e) => panic!("S8c HARD: {e:?}"),
+    }
 }
 
 // ── G3 ──────────────────────────────────────────────────────────────────────
