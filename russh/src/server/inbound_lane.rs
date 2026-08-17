@@ -3,7 +3,7 @@
 //! After S5a this is the only server inbound backlog: Session does not pop a
 //! channel's head until the app buffer has a permit (`try_reserve`). Grant
 //! `undelivered` is lane occupancy only (`bytes`, not control payload).
-//! Invariant: `bytes ≤ byte_cap ∧ ctrl_bytes ≤ byte_cap ∧ items ≤ count_cap`.
+//! Invariant: `bytes ≤ byte_cap ∧ ctrl_bytes ≤ max(byte_cap, INBOUND_LANE_CTRL_FLOOR) ∧ items ≤ count_cap`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -22,6 +22,9 @@ pub const INBOUND_LANE_COUNT_SLACK: usize = 32;
 pub const INBOUND_LANE_MIN_PACKET: usize = 8;
 /// Ctrl byte budget (kex / OPEN / GLOBAL / ADJUST / unknown). Full → Cancelling.
 pub const INBOUND_CTRL_BUDGET: usize = 2 * 1024 * 1024;
+/// One transport-legal packet always fits an empty control ledger.
+/// Per-lane bound is `max(window + maxpkt, this)`.
+pub const INBOUND_LANE_CTRL_FLOOR: usize = crate::cipher::MAXIMUM_PACKET_LEN;
 
 #[derive(Debug, Clone)]
 pub enum LaneItem {
@@ -87,8 +90,8 @@ pub struct ChannelLane {
     items: VecDeque<LaneItem>,
     bytes: usize,
     /// Control payload (`Request`/`Success`/`Failure`) ledger. Checked
-    /// against the same `byte_cap` as `bytes`, but kept separate so
-    /// window-grant `undelivered` stays data-only.
+    /// against `max(byte_cap, INBOUND_LANE_CTRL_FLOOR)`, kept separate
+    /// from `bytes` so window-grant `undelivered` stays data-only.
     ctrl_bytes: usize,
     byte_cap: usize,
     count_cap: usize,
@@ -204,6 +207,11 @@ impl ChannelLane {
         self.ctrl_bytes
     }
 
+    #[cfg(feature = "_test_hooks")]
+    pub fn ctrl_cap(&self) -> usize {
+        self.byte_cap.max(INBOUND_LANE_CTRL_FLOOR)
+    }
+
     fn try_push(&mut self, item: LaneItem) -> LanePush {
         match &item {
             LaneItem::Data(d) if d.is_empty() => return LanePush::DroppedZero,
@@ -214,11 +222,11 @@ impl ChannelLane {
             LaneItem::Close if self.close_queued => return LanePush::DroppedDup,
             _ => {}
         }
-        // Brief §4.2: `bytes ≤ byte_cap ∧ ctrl_bytes ≤ byte_cap ∧ items ≤
-        // count_cap`. Control payload (`Request`/`Success`/`Failure`,
-        // including channel-id bytes) is a separate ledger against the
-        // same `byte_cap` — it does not fold into `bytes` (window
-        // `undelivered`) and is not exempt from the byte bound.
+        // Brief §4.2 / §0-A: `bytes ≤ byte_cap ∧ ctrl_bytes ≤
+        // max(byte_cap, INBOUND_LANE_CTRL_FLOOR) ∧ items ≤ count_cap`.
+        // Control payload is a separate ledger; it does not fold into
+        // `bytes` (window `undelivered`). The floor keeps a single
+        // transport-legal packet from overflowing a small-window lane.
         if self.items.len() >= self.count_cap {
             return LanePush::Overflow;
         }
@@ -240,7 +248,7 @@ impl ChannelLane {
                 | LaneItem::Failure { payload } => payload.len(),
                 _ => 0,
             };
-            if self.ctrl_bytes.saturating_add(add) > self.byte_cap {
+            if self.ctrl_bytes.saturating_add(add) > self.byte_cap.max(INBOUND_LANE_CTRL_FLOOR) {
                 return LanePush::Overflow;
             }
             self.ctrl_bytes += add;
@@ -512,6 +520,11 @@ impl LaneTable {
     #[cfg(feature = "_test_hooks")]
     pub fn ctrl_occupancy_bytes(&self, id: ChannelId) -> usize {
         self.lanes.get(&id).map(|l| l.ctrl_bytes()).unwrap_or(0)
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    pub fn ctrl_cap(&self, id: ChannelId) -> Option<usize> {
+        self.lanes.get(&id).map(|l| l.ctrl_cap())
     }
 
     #[cfg(feature = "_test_hooks")]
@@ -926,5 +939,61 @@ mod tests {
 
         while t.pop_channel(id).is_some() {}
         assert_eq!(t.try_push(id, large()), LanePush::Accepted);
+    }
+
+    #[test]
+    fn f1b_control_floor_independent_of_small_window() {
+        let mut t = LaneTable::new(8, 32);
+        let id = ChannelId(1);
+        t.open(id, 0, 1024, 1024, true);
+
+        let first = LaneItem::Request {
+            payload: Bytes::from(vec![0u8; 200 * 1024]),
+        };
+        assert_eq!(t.try_push(id, first), LanePush::Accepted);
+        assert_eq!(t.occupancy_bytes(id), 0);
+
+        let chunk = 32 * 1024;
+        let mut accepted = 200 * 1024;
+        let mut overflowed = false;
+        for i in 0..32 {
+            match t.try_push(
+                id,
+                LaneItem::Request {
+                    payload: Bytes::from(vec![0u8; chunk]),
+                },
+            ) {
+                LanePush::Accepted => {
+                    accepted += chunk;
+                    assert_eq!(t.occupancy_bytes(id), 0, "data occupancy leaked at {i}");
+                }
+                LanePush::Overflow => {
+                    overflowed = true;
+                    break;
+                }
+                other => panic!("unexpected push result {other:?} at {i}"),
+            }
+        }
+        assert!(overflowed, "32 KiB Requests must Overflow at the control floor");
+        assert!(
+            accepted <= INBOUND_LANE_CTRL_FLOOR,
+            "accepted control bytes {accepted} exceed floor {INBOUND_LANE_CTRL_FLOOR}"
+        );
+        assert!(
+            INBOUND_LANE_CTRL_FLOOR - accepted < chunk,
+            "leftover {} ≥ 32 KiB — Overflow too late",
+            INBOUND_LANE_CTRL_FLOOR - accepted
+        );
+        assert_eq!(t.occupancy_bytes(id), 0);
+
+        #[cfg(feature = "_test_hooks")]
+        {
+            assert_eq!(t.ctrl_cap(id), Some(INBOUND_LANE_CTRL_FLOOR));
+            assert_eq!(t.ctrl_occupancy_bytes(id), accepted);
+        }
+
+        // Data bound is still byte_cap = 2 KiB; the floor does not leak.
+        let data = LaneItem::Data(Bytes::from(vec![0u8; 4 * 1024]));
+        assert_eq!(t.try_push(id, data), LanePush::Overflow);
     }
 }
