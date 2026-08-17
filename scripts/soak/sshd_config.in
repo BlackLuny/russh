@@ -1,0 +1,23 @@
+# OpenSSH sshd config for unprivileged localhost soak.
+Port 2223
+ListenAddress 127.0.0.1
+HostKey __HOSTKEY__
+PidFile __PIDFILE__
+AuthorizedKeysFile __AUTHKEYS__
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+StrictModes no
+PermitRootLogin no
+AllowTcpForwarding yes
+GatewayPorts no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+ClientAliveInterval 30
+ClientAliveCountMax 6
+RekeyLimit __REKEY__
+LogLevel VERBOSE
+Subsystem sftp /usr/lib/openssh/sftp-server
