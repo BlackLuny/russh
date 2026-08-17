@@ -619,6 +619,8 @@ pub fn s8b_object_ack_before_register_round(bound2: bool) -> S8bObjectClass {
 /// stale-permit early Ok must survive the `known_dead` check.
 #[cfg(feature = "_test_hooks")]
 pub fn s8c_object_known_dead_round(remove: bool) -> S8bObjectClass {
+    // Shares INVERT_BUSY with the S8b rounds so parallel siblings cannot arm an invert under this round.
+    let _guard = acquire_invert_park_before_register(false);
     let (tx, mut rx) = mpsc::channel::<ProbeMsg>(1);
     if tx.try_send(ProbeMsg).is_err() {
         return S8bObjectClass::Unexpected;
