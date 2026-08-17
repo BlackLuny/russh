@@ -27,3 +27,9 @@ Confirmed by `over_window_data_is_ignored_not_queued` (was: extra packet queued;
 2. Session no longer `continue`s past `select!` when `more_lanes`; an immediately-ready select arm keeps pumping without starving ctrl.
 3. `CtrlMsg::Overflow` now `release_channel_global` (GlobalBudget leak).
 4. I5 rekey no longer `enc.exchange.take()` before `begin_rekey`.
+
+## Verification
+
+- Unit: `over_window_data_is_ignored_not_queued` — extra DATA is `DroppedOverWindow`; occupancy stays at the window. Q5 inject still Overflows.
+- Integration: `q5_wire_over_window_is_ignored` — 4×32B on a 64B window → occupancy=64, overflows=0. `q5_occupancy_bound_closes_only_victim` still Overflows via inject. `test_s6a_rekey` 12/12 pass.
+- Live: 3-channel OpenSSH freeze 15s + catch-up (8 MiB/s × down/up/echo, 40s). `channels_live=3`, `io_errors=0`, no `inbound lane overflow` in server logs, `disconnects=0`, `rekey_triggers=2`.
