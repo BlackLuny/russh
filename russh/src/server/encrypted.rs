@@ -1174,6 +1174,10 @@ impl Session {
             msg::CHANNEL_CLOSE => {
                 let channel_num = map_err!(ChannelId::decode(r))?;
                 map_err!(ensure_end(r))?;
+                log::warn!(
+                    "peer CHANNEL_CLOSE {channel_num:?} established={}",
+                    self.is_established_channel(channel_num)
+                );
                 if !self.is_established_channel(channel_num) {
                     // We may have closed this channel ourselves: `Encrypted::close` drops the
                     // protocol entry as soon as it writes CHANNEL_CLOSE, so the peer's mandatory

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use log::warn;
 use tokio::sync::Notify;
 
 use crate::ChannelId;
@@ -370,7 +371,27 @@ impl LaneTable {
         let Some(lane) = self.lanes.get_mut(&id) else {
             return LanePush::NoLane;
         };
-        lane.try_push(item)
+        let add = item.byte_len();
+        let occ = lane.bytes;
+        let cap = lane.byte_cap;
+        let cnt = lane.items.len();
+        let ccap = lane.count_cap;
+        let win = lane.window_remaining;
+        let ctrl = lane.ctrl_bytes;
+        let r = lane.try_push(item);
+        if r == LanePush::Overflow {
+            let why = if cnt >= ccap {
+                "count_cap"
+            } else if occ.saturating_add(add) > cap {
+                "byte_cap"
+            } else {
+                "ctrl_cap"
+            };
+            warn!(
+                "inbound lane overflow id={id:?} why={why} add={add} occ_bytes={occ}/{cap} occ_count={cnt}/{ccap} window_remaining={win} ctrl_bytes={ctrl}"
+            );
+        }
+        r
     }
 
     pub fn pop_any(&mut self) -> Option<(ChannelId, LaneItem)> {
@@ -535,6 +556,12 @@ impl LaneTable {
     /// I1 consume. No-op if the lane is gone (ghost channel).
     pub fn consume_window(&mut self, id: ChannelId, len: usize) {
         if let Some(lane) = self.lanes.get_mut(&id) {
+            if (len as u32) > lane.window_remaining {
+                warn!(
+                    "inbound DATA exceeds remaining window id={id:?} len={len} remaining={} (packet still queued)",
+                    lane.window_remaining
+                );
+            }
             lane.consume_window(len);
         }
     }

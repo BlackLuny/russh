@@ -1766,7 +1766,9 @@ impl Session {
                 Ok(true)
             }
             CtrlMsg::Overflow { id, .. } => {
-                log::warn!("reader lane overflow on {id:?}; StopDiscard");
+                log::warn!(
+                    "reader lane overflow on {id:?}; StopDiscard (session will close this channel only)"
+                );
                 self.discard_channel_outbound(id).map_err(|e| e.into())?;
                 self.teardown_inbound_channel(id);
                 // App-known channel: this is the unique Handler close

@@ -113,6 +113,7 @@ async def pump_down(host: str, port: int, c: Counters, stop: asyncio.Event, rate
             while not stop.is_set():
                 data = await asyncio.wait_for(reader.read(CHUNK), timeout=30)
                 if not data:
+                    print("SOAK_PUMP_DOWN_EOF", flush=True)
                     c.io_errors += 1
                     break
                 if any(b != SOURCE_FILL for b in data):
@@ -127,7 +128,8 @@ async def pump_down(host: str, port: int, c: Counters, stop: asyncio.Event, rate
         finally:
             writer.close()
             await writer.wait_closed()
-    except Exception:
+    except Exception as e:
+        print(f"SOAK_PUMP_DOWN_ERR {type(e).__name__}: {e}", flush=True)
         c.io_errors += 1
     c.channels_live -= 1
     c.channels_closed += 1
@@ -155,7 +157,8 @@ async def pump_up(host: str, port: int, c: Counters, stop: asyncio.Event, rate_b
         finally:
             writer.close()
             await writer.wait_closed()
-    except Exception:
+    except Exception as e:
+        print(f"SOAK_PUMP_UP_ERR {type(e).__name__}: {e}", flush=True)
         c.io_errors += 1
     c.channels_live -= 1
     c.channels_closed += 1
@@ -197,7 +200,8 @@ async def pump_echo(host: str, port: int, c: Counters, stop: asyncio.Event, rate
         finally:
             writer.close()
             await writer.wait_closed()
-    except Exception:
+    except Exception as e:
+        print(f"SOAK_PUMP_ECHO_ERR {type(e).__name__}: {e}", flush=True)
         c.io_errors += 1
     finally:
         c.channels_live -= 1
