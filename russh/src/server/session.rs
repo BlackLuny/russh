@@ -1782,6 +1782,8 @@ impl Session {
                 if let Some(r) = &self.reader {
                     r.close_lane(id, r.lane_gen(id).unwrap_or(0));
                 }
+                // discard_channel_outbound does not refund GlobalBudget.
+                self.release_channel_global(id);
                 Ok(true)
             }
             CtrlMsg::CloseDropped { id, generation } => {
@@ -3231,9 +3233,11 @@ impl Session {
                     return Err(e.into());
                 }
             }
-            if more_lanes && !self.common.disconnected {
-                continue;
-            }
+            // Do not `continue` here. A lane quantum still ready means we
+            // should pump again, but skipping select starves ctrl (KEXINIT),
+            // Writer acks, apply_pending_peer_credit, and the write/rekey
+            // watchdogs. The `more_lanes` select arm below is immediately
+            // ready so we do not block waiting for a second notify.
             // Aggregation board drain: always here (or, under the pin hook,
             // after the batch drain). Never in the notify arm.
             #[cfg(feature = "_test_hooks")]
@@ -3930,6 +3934,9 @@ impl Session {
                         }
                     }
                 }
+                // Remaining inbound items: wake immediately so we pump again
+                // without skipping the arms above (ctrl / Writer / credit).
+                () = std::future::ready(()), if more_lanes => {}
                 // S1 supervisor poll (write watchdog / min-drain / rekey / handshake).
                 () = tokio::time::sleep(supervisor_sleep) => {
                     // Re-check on wake; the top-of-loop checks also run.
@@ -5347,10 +5354,11 @@ impl Session {
             .rekey_i6
             .triggers
             .fetch_add(1, Ordering::SeqCst);
-        if let Some(ref mut enc) = self.common.encrypted {
-            if enc.exchange.take().is_some() {
-                self.begin_rekey()?;
-            }
+        // Do not `exchange.take()`: that drops the post-kex Exchange
+        // `maybe_send_ext_info` / a later I5 still need, and if
+        // `begin_rekey` fails the connection can never volume-rekey again.
+        if self.common.encrypted.is_some() {
+            self.begin_rekey()?;
         }
         Ok(())
     }

@@ -58,6 +58,10 @@ pub enum LanePush {
     Accepted,
     DroppedZero,
     DroppedDup,
+    /// DATA/EXT exceeded `window_remaining`. Ignored per RFC 4254 §5.2
+    /// instead of occupying the DoS cap (which would Overflow-close a
+    /// slightly over-window peer such as OpenSSH with in-flight packets).
+    DroppedOverWindow,
     /// No lane (channel not opened). Caller counts `unknown_drops`.
     NoLane,
     Overflow,
@@ -162,7 +166,8 @@ impl ChannelLane {
     }
 
     /// I1: bytes are off the wire. Extra data past the advertised window
-    /// is ignored (RFC 4254 §5.2) — occupancy Overflow is a different gate.
+    /// is not deducted (RFC 4254 §5.2). Callers must not queue that extra
+    /// payload — see [`LaneTable::ingest`].
     fn consume_window(&mut self, len: usize) {
         let n = len as u32;
         if n <= self.window_remaining {
@@ -394,6 +399,52 @@ impl LaneTable {
         r
     }
 
+    /// Reader ingest: consume the inbound window, then queue.
+    ///
+    /// DATA/EXT that exceeds `window_remaining` is ignored (RFC 4254 §5.2)
+    /// and must not be queued. Queuing it let occupancy grow past
+    /// `window + maxpkt` and StopDiscarded a live channel (OpenSSH soak
+    /// upload close). Occupancy Overflow remains the DoS gate for a
+    /// window-ignoring flood that is injected without going through here.
+    pub fn ingest(&mut self, id: ChannelId, item: LaneItem) -> LanePush {
+        match &item {
+            LaneItem::Data(d) => {
+                let n = d.len();
+                let over = self
+                    .window_remaining(id)
+                    .is_some_and(|w| (n as u32) > w);
+                if over {
+                    warn!(
+                        "inbound DATA exceeds remaining window id={id:?} len={n} remaining={} (ignored, not queued)",
+                        self.window_remaining(id).unwrap_or(0)
+                    );
+                }
+                self.consume_window(id, n);
+                if over {
+                    return LanePush::DroppedOverWindow;
+                }
+            }
+            LaneItem::ExtendedData { data, .. } => {
+                let n = data.len();
+                let over = self
+                    .window_remaining(id)
+                    .is_some_and(|w| (n as u32) > w);
+                if over {
+                    warn!(
+                        "inbound EXTDATA exceeds remaining window id={id:?} len={n} remaining={} (ignored, not queued)",
+                        self.window_remaining(id).unwrap_or(0)
+                    );
+                }
+                self.consume_window(id, n);
+                if over {
+                    return LanePush::DroppedOverWindow;
+                }
+            }
+            _ => {}
+        }
+        self.try_push(id, item)
+    }
+
     pub fn pop_any(&mut self) -> Option<(ChannelId, LaneItem)> {
         self.pop_any_except(&HashSet::new())
     }
@@ -556,12 +607,6 @@ impl LaneTable {
     /// I1 consume. No-op if the lane is gone (ghost channel).
     pub fn consume_window(&mut self, id: ChannelId, len: usize) {
         if let Some(lane) = self.lanes.get_mut(&id) {
-            if (len as u32) > lane.window_remaining {
-                warn!(
-                    "inbound DATA exceeds remaining window id={id:?} len={len} remaining={} (packet still queued)",
-                    lane.window_remaining
-                );
-            }
             lane.consume_window(len);
         }
     }
@@ -1022,5 +1067,36 @@ mod tests {
         // Data bound is still byte_cap = 2 KiB; the floor does not leak.
         let data = LaneItem::Data(Bytes::from(vec![0u8; 4 * 1024]));
         assert_eq!(t.try_push(id, data), LanePush::Overflow);
+    }
+
+    /// Over-window DATA must not be queued. The old path consumed nothing
+    /// (len > remaining) then still `try_push`ed, so occupancy grew past
+    /// `window + maxpkt` and Overflow-closed a live channel.
+    #[test]
+    fn over_window_data_is_ignored_not_queued() {
+        let mut t = LaneTable::new(8, 32);
+        let id = ChannelId(1);
+        t.open(id, 0, 100, 50, true);
+
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 100]))),
+            LanePush::Accepted
+        );
+        assert_eq!(t.window_remaining(id), Some(0));
+        assert_eq!(t.occupancy_bytes(id), 100);
+
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 50]))),
+            LanePush::DroppedOverWindow
+        );
+        assert_eq!(t.window_remaining(id), Some(0));
+        assert_eq!(t.occupancy_bytes(id), 100);
+        assert_eq!(t.occupancy_count(id), 1);
+
+        // Direct try_push (Q5 inject, no ingest) still Overflows at the cap.
+        assert_eq!(
+            t.try_push(id, LaneItem::Data(Bytes::from(vec![0u8; 51]))),
+            LanePush::Overflow
+        );
     }
 }

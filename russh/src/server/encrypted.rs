@@ -1174,7 +1174,7 @@ impl Session {
             msg::CHANNEL_CLOSE => {
                 let channel_num = map_err!(ChannelId::decode(r))?;
                 map_err!(ensure_end(r))?;
-                log::warn!(
+                log::debug!(
                     "peer CHANNEL_CLOSE {channel_num:?} established={}",
                     self.is_established_channel(channel_num)
                 );
