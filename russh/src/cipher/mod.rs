@@ -265,6 +265,14 @@ pub(crate) trait SealingKey {
         // Maximum packet length:
         // https://tools.ietf.org/html/rfc4253#section-6.1
         assert!(packet_length <= u32::MAX as usize);
+        // One allocation for the whole wire packet. Without it the three
+        // growth steps below (length+padding byte, payload, padding, tag)
+        // realloc a buffer that the Writer path hands away as `Bytes` after
+        // every packet — i.e. starts empty again — costing two full-packet
+        // memcpys per packet. No-op when the buffer already has capacity.
+        buffer
+            .buffer
+            .reserve(PACKET_LENGTH_LEN + packet_length + self.tag_len());
         buffer
             .buffer
             .extend_from_slice(&(packet_length as u32).to_be_bytes());
