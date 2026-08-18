@@ -531,6 +531,11 @@ impl ReaderHandle {
             .unwrap_or(0)
     }
 
+    /// Occupancy and window remaining in one lock (grant planning).
+    pub fn grant_plan(&self, id: ChannelId) -> Option<(usize, u32)> {
+        self.lanes.lock().ok().and_then(|g| g.grant_plan(id))
+    }
+
     pub fn occupancy_count(&self, id: ChannelId) -> usize {
         self.lanes
             .lock()
@@ -1232,7 +1237,8 @@ fn note_push(hooks: &ReaderHooks, push: &LanePush, is_close: bool) {
     #[cfg(feature = "_test_hooks")]
     if let Some(ref o) = hooks.lane_observe {
         match push {
-            LanePush::DroppedZero | LanePush::DroppedOverWindow => o.note_zero(),
+            LanePush::DroppedZero => o.note_zero(),
+            LanePush::DroppedOverWindow => o.note_over_window(),
             LanePush::DroppedDup => o.note_dup(),
             LanePush::NoLane if is_close => o.note_close_dropped(),
             LanePush::NoLane => o.note_unknown(),

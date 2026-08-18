@@ -382,6 +382,10 @@ pub struct Config {
     /// Q8 must go red with an enumerated failure class.
     #[cfg(feature = "_test_hooks")]
     pub invert_omit_lane_from_undelivered: bool,
+    /// Test-only: read occupancy and remaining on two separate lane
+    /// locks (the production bug). Must-red vs `grant_plan`.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_torn_grant_reads: bool,
     /// Test-only S5a invert: pop the lane before `try_reserve` and
     /// `send().await` (old session-loop stall). Isolation must go red.
     #[cfg(feature = "_test_hooks")]
@@ -615,6 +619,8 @@ impl Default for Config {
             invert_open_confirm_before_lane: false,
             #[cfg(feature = "_test_hooks")]
             invert_omit_lane_from_undelivered: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_torn_grant_reads: false,
             #[cfg(feature = "_test_hooks")]
             invert_eager_lane_pop: false,
             #[cfg(feature = "_test_hooks")]

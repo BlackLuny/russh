@@ -20,3 +20,16 @@ Stacks:
 Each stack runs 1 download + 1 upload + 1 echo at 8 MiB/s (override `RATE_BPS`).
 `monitor.py` samples RSS / CPU / fds / threads every 10s. Judge writes
 `soak-results/SOAK_REPORT.md`.
+
+`run_24h.sh` sets `RUST_LOG=russh=warn` for `s8_matrix_server` (override
+the env var to change it). Without that, overflow / over-window warns
+are silent and a stall cannot be classified. See
+`soak-results/CHANNEL_CLOSE.md`.
+
+Short freeze-catchup against a russh server only:
+
+```bash
+# unlimited catch-up (soak-class burst), 15s SIGSTOP, 3 channels
+DOWN=1 UP=1 ECHO=1 RATE_BPS=0 FREEZE_SECS=15 SECONDS_RUN=45 \
+  ./scripts/soak/repro_upload_close.sh
+```

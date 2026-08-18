@@ -1784,6 +1784,7 @@ impl Session {
                 }
                 // discard_channel_outbound does not refund GlobalBudget.
                 self.release_channel_global(id);
+                self.publish_slots();
                 Ok(true)
             }
             CtrlMsg::CloseDropped { id, generation } => {
@@ -1981,30 +1982,6 @@ impl Session {
                 self.target_window_size
             }
         };
-        // Bytes still sitting in the Reader lane keep occupying the advertised
-        // window. Scheme C is gone: undelivered is lane-only. Invert
-        // `invert_omit_lane_from_undelivered` restores the over-grant so Q8
-        // goes red (enumerated class, not bare is_err).
-        let lane_bytes = self
-            .reader
-            .as_ref()
-            .map(|r| r.occupancy_bytes(id))
-            .unwrap_or(0);
-        let omit_lane = {
-            #[cfg(feature = "_test_hooks")]
-            {
-                self.common.config.invert_omit_lane_from_undelivered
-            }
-            #[cfg(not(feature = "_test_hooks"))]
-            {
-                false
-            }
-        };
-        let undelivered = if omit_lane {
-            0
-        } else {
-            lane_bytes.try_into().unwrap_or(u32::MAX)
-        };
         // StopDiscard latch: CLOSE already framed or channel gone —
         // never register / emit a WINDOW_ADJUST for it.
         if !self.outbound_channel_accepts_ctrl(id) {
@@ -2029,7 +2006,30 @@ impl Session {
             }
             return Ok(());
         }
-        let delta = self.planned_grant_delta(id, target, undelivered);
+        // Occupancy and remaining MUST come from one lock: a torn pair
+        // (stale occ + fresh remaining) over-grants by the raced ingest N
+        // and a compliant peer can then fill past `window + maxpkt`.
+        let (lane_bytes, remaining) = self.snapshot_grant_plan(id).await;
+        let omit_lane = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                self.common.config.invert_omit_lane_from_undelivered
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                false
+            }
+        };
+        let undelivered = if omit_lane {
+            0
+        } else {
+            lane_bytes.try_into().unwrap_or(u32::MAX)
+        };
+        let delta = crate::server::inbound_lane::LaneTable::grant_delta(
+            target,
+            undelivered,
+            remaining,
+        );
         let ceiling = target.saturating_sub(undelivered);
         let need = if delta > 0 {
             self.grant_reserve_need(id, ceiling)
@@ -2164,21 +2164,54 @@ impl Session {
         Ok(())
     }
 
-    fn planned_grant_delta(&self, id: ChannelId, target: u32, undelivered: u32) -> u32 {
-        let ceiling = target.saturating_sub(undelivered);
-        let remaining = if let Some(r) = self.reader.as_ref() {
-            r.sender_window(id).unwrap_or(0)
-        } else {
-            self.common
-                .encrypted
+    /// One-lock occupancy + remaining. The two-lock invert restores the
+    /// soak-class over-grant (stale occ, fresh remaining).
+    async fn snapshot_grant_plan(&self, id: ChannelId) -> (usize, u32) {
+        let fallback_remaining = self
+            .common
+            .encrypted
+            .as_ref()
+            .map(|enc| enc.sender_window_size(id) as u32)
+            .unwrap_or(0);
+        #[cfg(feature = "_test_hooks")]
+        if self.common.config.invert_torn_grant_reads {
+            let occ = self
+                .reader
                 .as_ref()
-                .map(|enc| enc.sender_window_size(id) as u32)
-                .unwrap_or(0)
-        };
-        if remaining >= ceiling / 2 {
-            return 0;
+                .map(|r| r.occupancy_bytes(id))
+                .unwrap_or(0);
+            // Yield so Reader can ingest N between the two locks.
+            tokio::task::yield_now().await;
+            let rem = self
+                .reader
+                .as_ref()
+                .and_then(|r| r.sender_window(id))
+                .unwrap_or(fallback_remaining);
+            return (occ, rem);
         }
-        ceiling.saturating_sub(remaining)
+        if let Some(r) = self.reader.as_ref() {
+            if let Some(plan) = r.grant_plan(id) {
+                return plan;
+            }
+        }
+        (0, fallback_remaining)
+    }
+
+    fn planned_grant_delta(&self, id: ChannelId, target: u32, undelivered: u32) -> u32 {
+        // Remaining only. Callers that already snapshotted occupancy
+        // must not use this for `undelivered` — that re-tears the pair.
+        let remaining = self
+            .reader
+            .as_ref()
+            .and_then(|r| r.sender_window(id))
+            .unwrap_or_else(|| {
+                self.common
+                    .encrypted
+                    .as_ref()
+                    .map(|enc| enc.sender_window_size(id) as u32)
+                    .unwrap_or(0)
+            });
+        crate::server::inbound_lane::LaneTable::grant_delta(target, undelivered, remaining)
     }
 
     /// Hard grant order: expand Reader cap first, then seal ADJUST.

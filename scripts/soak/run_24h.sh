@@ -53,7 +53,9 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-"$ROOT/target/release/examples/s8_matrix_server" \
+# env_logger is silent unless RUST_LOG is set. Overflow / over-window
+# warns must be on or a 46-minute stall cannot be classified.
+RUST_LOG="${RUST_LOG:-russh=warn}" "$ROOT/target/release/examples/s8_matrix_server" \
   --listen 127.0.0.1:2222 \
   --control 127.0.0.1:18080 \
   --user s8 --password s8pass \

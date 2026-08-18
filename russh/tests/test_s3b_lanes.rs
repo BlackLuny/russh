@@ -331,8 +331,9 @@ async fn q5_occupancy_bound_closes_only_victim() -> Result<(), anyhow::Error> {
     let (session, _) = connect_faulty(addr, ccfg, Progress::new()).await?;
     let mut victim = session.channel_open_session().await?;
     let mut other = session.channel_open_session().await?;
-    // One legal packet; the window-ignoring flood is injected on the
-    // Reader (a compliant russh client will never exceed byte_cap).
+    // Wire over-window DATA is ignored (see q5_wire_over_window_is_ignored).
+    // This test is the remaining production-adjacent byte_cap DoS gate:
+    // inject_until_overflow bypasses ingest and try_push()es until Overflow.
     victim.data_bytes(vec![0u8; 64]).await?;
     wait_for("Q5 overflow", Duration::from_secs(5), || {
         observe.overflows() > 0 || discard.discarded_items() > 0
@@ -755,8 +756,9 @@ async fn trailing_bytes_data_eof_close_rejected() -> Result<(), anyhow::Error> {
 }
 
 /// Wire over-window DATA is ignored (RFC 4254 §5.2), not Overflow-queued.
-/// A window-ignoring peer used to fill occupancy past `window+maxpkt` and
-/// StopDiscard the channel; ingest now drops the extra frames.
+/// This is unproven-hardening vs a window-ignoring peer — not the soak close
+/// root cause. The byte_cap DoS gate is still `q5_occupancy_bound_closes_only_victim`
+/// (inject, not ingest). DroppedOverWindow is counted separately from zero-byte drops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn q5_wire_over_window_is_ignored() -> Result<(), anyhow::Error> {
     let rec = Rec::default();
@@ -794,12 +796,13 @@ async fn q5_wire_over_window_is_ignored() -> Result<(), anyhow::Error> {
             .await?;
     }
     wait_for("over-window ignored", Duration::from_secs(5), || {
-        observe.last_bytes() == 64 && observe.overflows() == 0
+        observe.last_bytes() == 64 && observe.overflows() == 0 && observe.over_window_drops() > 0
     })
     .await?;
     let occ_bytes = observe.last_bytes();
     let overflows = observe.overflows();
     let discarded = discard.discarded_items();
+    let over_window = observe.over_window_drops();
     hold.store(false, Ordering::SeqCst);
     other.data_bytes(&b"ok"[..]).await?;
     wait_for("other lives", Duration::from_secs(3), || {
@@ -807,7 +810,7 @@ async fn q5_wire_over_window_is_ignored() -> Result<(), anyhow::Error> {
     })
     .await?;
     eprintln!(
-        "q5_wire bytes={occ_bytes} overflows={overflows} discarded={discarded}"
+        "q5_wire bytes={occ_bytes} overflows={overflows} discarded={discarded} over_window={over_window}"
     );
     assert_eq!(
         occ_bytes, 64,
@@ -820,6 +823,10 @@ async fn q5_wire_over_window_is_ignored() -> Result<(), anyhow::Error> {
     assert_eq!(
         discarded, 0,
         "Q5-wire HARD: over-window DATA must not StopDiscard"
+    );
+    assert!(
+        over_window > 0,
+        "Q5-wire HARD: extra frames must count as DroppedOverWindow, not zero-byte drops"
     );
     let _ = victim;
     Ok(())

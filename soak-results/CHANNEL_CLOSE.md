@@ -1,35 +1,99 @@
-# OpenSSH→russh upload channel close (12h soak)
+# OpenSSH→russh upload channel close (12.7h soak)
 
-Measured on the 12.7h localhost soak (not inferred).
+Measured on the 12.7h localhost soak, then re-read against the code.
+The first write-up treated over-window DATA as the close root cause.
+That is **not** what the ledger supports. This note records the
+corrected chain.
 
-## What happened
+## What happened (measured)
 
 - Stack: OpenSSH 9.6 `-L` → russh `s8_matrix_server` (3 channels: down/up/echo).
 - At `t=37066.6s` (~10.3h) the **upload** channel died (`channels_live` 3→2, `io_errors=1`).
 - Session stayed up (`disconnects=0`). Download kept running.
-- Last 10s before close: `bytes_out` jumped ~400 MB/s (rate-limiter catch-up), then dropped to ~0.
+- Stats gap `t=34296.9` → `t=37056.6` (~46 min, ~60 MiB progress), then ~400 MB/s catch-up, then close.
+- russh server RSS 8.2→51.7 MiB then plateau; fds/threads 13/5; `rekey_triggers≈5854`.
 
-## Stats gap immediately before the burst
+The original soak did **not** set `RUST_LOG`. `s8_matrix_server` only
+initializes `env_logger` when that var is present, so overflow /
+over-window `warn!` would not have printed. Those logs neither confirm
+nor exclude `CtrlMsg::Overflow`. Raw jsonl is not in git
+(`soak-results/run-12h/` is local-only).
 
-`traffic_openssh_to_russh.jsonl` jumps from `t=34296.9` to `t=37056.6` (~46 min) with almost no byte progress (~60 MiB). Then a 10s catch-up flood, then the upload channel close.
+## Main cause of the 46 min stall + 400 MB/s burst
 
-That pattern matches Session skipping `select!` while inbound lanes still had work (`more_lanes` `continue`): KEXINIT / Writer acks / window credit / watchdogs starve, traffic crawls, then a burst when the loop runs again. Occupancy then Overflow-closes only the upload channel.
+`pump_reader_lanes` returning `more_lanes` used to `continue` the
+session loop and skip `select!`. That skipped:
 
-## Root cause (code + unit test)
+- ctrl (peer `CHANNEL_WINDOW_ADJUST`, KEXINIT)
+- writer_events (`InstallAck`)
+- capacity_notify (`retry_deferred_window_grants`)
+- `apply_pending_peer_credit` and write/rekey watchdog `observe_eligible`
 
-`Reader` consumed the inbound window but still **queued** DATA that exceeded `window_remaining`. RFC 4254 §5.2 says extra data SHOULD be ignored. Queuing it let lane occupancy grow past `window + maxpkt`, which is `CtrlMsg::Overflow` → StopDiscard **that channel only**.
+`more_lanes` is true while inbound lanes still have a quantum of work.
+Self-lock: inbound flood → forever `continue` → no peer ADJUST →
+downlink stops → no writer ack → `sealed_backlog ≥ HWM` → every local
+`WINDOW_ADJUST` goes into `deferred_window_grants` and the retry is
+also skipped → uplink window exhausted → ~0 traffic (~46 min) → lanes
+drain, `more_lanes=false` → one dump → 400 MB/s burst.
 
-Confirmed by `over_window_data_is_ignored_not_queued` (was: extra packet queued; occupancy could Overflow).
+Fix: do not `continue`. Keep pumping via an immediately-ready
+`select!` arm placed last-but-one (`biased`, before supervisor sleep)
+so ctrl / writer / lane_notified / receiver stay higher priority.
 
-## Fix
+## Over-window DATA is not a proven soak close
 
-1. `LaneTable::ingest`: over-window DATA/EXT is `DroppedOverWindow`, not queued.
-2. Session no longer `continue`s past `select!` when `more_lanes`; an immediately-ready select arm keeps pumping without starving ctrl.
-3. `CtrlMsg::Overflow` now `release_channel_global` (GlobalBudget leak).
-4. I5 rekey no longer `enc.exchange.take()` before `begin_rekey`.
+`grant_expand_then_adjust` uses the same `delta` for
+`expand_inbound_cap` then `emit_window_adjust`. For a compliant peer,
+`lane.window_remaining ≥` peer's idea of the window plus in-flight
+bytes. `LaneTable::ingest`'s over-window branch is therefore dead
+against OpenSSH.
 
-## Verification
+`over_window_data_is_ignored_not_queued` and
+`q5_wire_over_window_is_ignored` prove the RFC-ignore behaviour when
+the extra bytes are forced. They do not prove the soak over-windowed.
 
-- Unit: `over_window_data_is_ignored_not_queued` — extra DATA is `DroppedOverWindow`; occupancy stays at the window. Q5 inject still Overflows.
-- Integration: `q5_wire_over_window_is_ignored` — 4×32B on a 64B window → occupancy=64, overflows=0. `q5_occupancy_bound_closes_only_victim` still Overflows via inject. `test_s6a_rekey` 12/12 pass.
-- Live: 3-channel OpenSSH freeze 15s + catch-up (8 MiB/s × down/up/echo, 40s). `channels_live=3`, `io_errors=0`, no `inbound lane overflow` in server logs, `disconnects=0`, `rekey_triggers=2`.
+The ingest change is **unproven hardening** (RFC 4254 §5.2). On drop,
+`window_remaining` is cleared so the ledger does not keep advertising
+credit the peer already spent. Warns are once-per-lane.
+`DroppedOverWindow` has its own observe counter (not `note_zero`).
+
+A window-ignoring flood used to be the Q5 **wire** byte_cap path.
+That path now ignores. The remaining production-adjacent byte_cap
+DoS gate is `q5_occupancy_bound_closes_only_victim` (inject
+`try_push`, not ingest).
+
+## Real Overflow path for a compliant peer: torn grant reads
+
+`maybe_grant_after_delivery` used to take the lane lock twice:
+
+1. `occupancy_bytes(id)` → L
+2. `sender_window(id)` → R'  (Reader can ingest N in between)
+
+Then `delta = (target - L) - R'`, expand sets `window_remaining =
+target - L`, actual occupancy is `L + N`, so
+`lane_bytes + window_remaining = target + N`.
+`byte_cap = target + maxpkt` (2 MiB + 32 KiB). N > 32 KiB Overflows
+a compliant peer. At 400 MB/s that gap is ~82 µs.
+
+Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
+`maybe_grant_after_delivery` uses that pair. Unit:
+`grant_plan_is_atomic_against_ingest`.
+
+## Other fixes in this PR
+
+- `CtrlMsg::Overflow` now `release_channel_global` (was a real leak:
+  this arm `channels.remove`s and never hits `finalize_close`) and
+  `publish_slots()`.
+- I5 rekey no longer `enc.exchange.take()` before `begin_rekey`
+  (unrelated leftover; `begin_rekey` does not use `enc.exchange`).
+
+## Verification so far
+
+- Unit: over-window drop + remaining cleared; torn vs atomic grant Δ.
+- Integration: Q5 inject still Overflows; Q5-wire over-window is
+  ignored and counted on `over_window_drops`.
+- Live (pre-torn-grant): 15s freeze + 8 MiB/s × 3 streams, 40s —
+  "did not break", not a soak-class catch-up proof.
+- A later unlimited (`RATE_BPS=0`) freeze-catchup with
+  `RUST_LOG=russh=warn` is the log that can actually show
+  `why=byte_cap|count_cap|ctrl_cap occ_bytes=… window_remaining=…`.
