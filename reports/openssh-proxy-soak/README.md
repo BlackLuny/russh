@@ -24,4 +24,4 @@ python3 scripts/openssh_loopback_soak.py \
 - Server `inactivity_timeout` is disabled so `-N` is not killed at 10 minutes;
   rekey stays at library defaults (1 GiB / 1 h).
 
-Results land in `reports/openssh-proxy-soak/` after the 2-hour run.
+Results of the 2-hour run on this branch: [RESULTS.md](RESULTS.md).

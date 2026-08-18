@@ -1,0 +1,60 @@
+[1stream] start streams=1 duration=7200.0s sample=300.0s ssh=127.0.0.1:43447 echo=46049 locals=[59695]
+[8stream] start streams=8 duration=7200.0s sample=300.0s ssh=127.0.0.1:40227 echo=52959 locals=[44395, 38025, 39581, 33841, 52497, 55685, 39809, 35321]
+[1stream] t=5.0min sample=1 tx=483.75 MiB rx=481.69 MiB rate_tx=13.53 Mbit/s rate_rx=13.47 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=5.0min sample=1 tx=3870.19 MiB rx=3854.44 MiB rate_tx=108.22 Mbit/s rate_rx=107.78 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=10.0min sample=2 tx=959.25 MiB rx=957.19 MiB rate_tx=13.30 Mbit/s rate_rx=13.30 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=10.0min sample=2 tx=7674.19 MiB rx=7658.44 MiB rate_tx=106.37 Mbit/s rate_rx=106.37 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=15.0min sample=3 tx=1430.00 MiB rx=1427.94 MiB rate_tx=13.16 Mbit/s rate_rx=13.16 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=15.0min sample=3 tx=11440.19 MiB rx=11424.44 MiB rate_tx=105.30 Mbit/s rate_rx=105.30 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=20.0min sample=4 tx=1905.25 MiB rx=1903.19 MiB rate_tx=13.29 Mbit/s rate_rx=13.29 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=20.0min sample=4 tx=15242.19 MiB rx=15226.44 MiB rate_tx=106.31 Mbit/s rate_rx=106.31 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=25.0min sample=5 tx=2379.00 MiB rx=2376.94 MiB rate_tx=13.25 Mbit/s rate_rx=13.25 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=25.0min sample=5 tx=19032.19 MiB rx=19016.44 MiB rate_tx=105.98 Mbit/s rate_rx=105.98 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=30.0min sample=6 tx=2859.50 MiB rx=2857.44 MiB rate_tx=13.44 Mbit/s rate_rx=13.44 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=30.0min sample=6 tx=22876.19 MiB rx=22860.44 MiB rate_tx=107.49 Mbit/s rate_rx=107.49 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=35.0min sample=7 tx=3334.75 MiB rx=3332.69 MiB rate_tx=13.29 Mbit/s rate_rx=13.29 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=35.0min sample=7 tx=26678.19 MiB rx=26662.44 MiB rate_tx=106.31 Mbit/s rate_rx=106.31 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=40.0min sample=8 tx=3804.50 MiB rx=3802.44 MiB rate_tx=13.14 Mbit/s rate_rx=13.14 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=40.0min sample=8 tx=30436.19 MiB rx=30420.44 MiB rate_tx=105.08 Mbit/s rate_rx=105.08 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=45.0min sample=9 tx=4287.25 MiB rx=4285.19 MiB rate_tx=13.50 Mbit/s rate_rx=13.50 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=45.0min sample=9 tx=34298.19 MiB rx=34282.44 MiB rate_tx=107.99 Mbit/s rate_rx=107.99 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=50.0min sample=10 tx=4770.25 MiB rx=4768.19 MiB rate_tx=13.51 Mbit/s rate_rx=13.51 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=50.0min sample=10 tx=38162.19 MiB rx=38146.44 MiB rate_tx=108.05 Mbit/s rate_rx=108.05 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=55.0min sample=11 tx=5246.00 MiB rx=5243.94 MiB rate_tx=13.30 Mbit/s rate_rx=13.30 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=55.0min sample=11 tx=41968.19 MiB rx=41952.44 MiB rate_tx=106.42 Mbit/s rate_rx=106.42 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=60.0min sample=12 tx=5720.50 MiB rx=5718.44 MiB rate_tx=13.27 Mbit/s rate_rx=13.27 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=60.0min sample=12 tx=45764.19 MiB rx=45748.44 MiB rate_tx=106.14 Mbit/s rate_rx=106.14 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=65.0min sample=13 tx=6199.75 MiB rx=6197.69 MiB rate_tx=13.40 Mbit/s rate_rx=13.40 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=65.0min sample=13 tx=49598.19 MiB rx=49582.44 MiB rate_tx=107.21 Mbit/s rate_rx=107.21 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=70.0min sample=14 tx=6683.00 MiB rx=6681.19 MiB rate_tx=13.51 Mbit/s rate_rx=13.52 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=70.0min sample=14 tx=53464.94 MiB rx=53449.69 MiB rate_tx=108.12 Mbit/s rate_rx=108.14 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=75.1min sample=15 tx=7159.50 MiB rx=7157.44 MiB rate_tx=13.32 Mbit/s rate_rx=13.32 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=75.1min sample=15 tx=57276.19 MiB rx=57260.44 MiB rate_tx=106.57 Mbit/s rate_rx=106.56 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=80.1min sample=16 tx=7637.50 MiB rx=7635.44 MiB rate_tx=13.37 Mbit/s rate_rx=13.37 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=80.1min sample=16 tx=61100.19 MiB rx=61084.44 MiB rate_tx=106.93 Mbit/s rate_rx=106.93 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=85.1min sample=17 tx=8111.00 MiB rx=8108.94 MiB rate_tx=13.24 Mbit/s rate_rx=13.24 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=85.1min sample=17 tx=64888.19 MiB rx=64872.44 MiB rate_tx=105.92 Mbit/s rate_rx=105.92 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=90.1min sample=18 tx=8592.00 MiB rx=8590.19 MiB rate_tx=13.45 Mbit/s rate_rx=13.46 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=90.1min sample=18 tx=68736.94 MiB rx=68721.69 MiB rate_tx=107.62 Mbit/s rate_rx=107.63 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=95.1min sample=19 tx=9077.00 MiB rx=9074.94 MiB rate_tx=13.56 Mbit/s rate_rx=13.55 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=95.1min sample=19 tx=72616.19 MiB rx=72600.44 MiB rate_tx=108.47 Mbit/s rate_rx=108.46 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=100.1min sample=20 tx=9561.75 MiB rx=9559.69 MiB rate_tx=13.55 Mbit/s rate_rx=13.55 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=100.1min sample=20 tx=76494.19 MiB rx=76478.44 MiB rate_tx=108.44 Mbit/s rate_rx=108.44 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=105.1min sample=21 tx=10031.00 MiB rx=10028.94 MiB rate_tx=13.12 Mbit/s rate_rx=13.12 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=105.1min sample=21 tx=80248.19 MiB rx=80232.44 MiB rate_tx=104.97 Mbit/s rate_rx=104.97 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=110.1min sample=22 tx=10508.50 MiB rx=10506.44 MiB rate_tx=13.35 Mbit/s rate_rx=13.35 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=110.1min sample=22 tx=84068.19 MiB rx=84052.44 MiB rate_tx=106.81 Mbit/s rate_rx=106.81 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=115.1min sample=23 tx=10992.50 MiB rx=10990.44 MiB rate_tx=13.53 Mbit/s rate_rx=13.53 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=115.1min sample=23 tx=87940.19 MiB rx=87924.44 MiB rate_tx=108.27 Mbit/s rate_rx=108.27 Mbit/s proxy=up ssh=up flags=ok
+[1stream] t=120.0min sample=24 tx=11458.75 MiB rx=11456.69 MiB rate_tx=13.04 Mbit/s rate_rx=13.04 Mbit/s proxy=up ssh=up flags=ok
+[8stream] t=120.0min sample=24 tx=91668.94 MiB rx=91653.69 MiB rate_tx=104.26 Mbit/s rate_rx=104.28 Mbit/s proxy=up ssh=up flags=ok
+[1stream] done ok=True anomalies=0 tx=11458.75 MiB rx=11456.75 MiB avg=13.35 Mbit/s
+[8stream] done ok=True anomalies=0 tx=91669.25 MiB rx=91654.19 MiB avg=106.80 Mbit/s
+{
+  "all_ok": true,
+  "scenarios": [
+    "1stream",
+    "8stream"
+  ]
+}
+SOAK_EXIT:0

@@ -1,0 +1,32 @@
+{
+  "scenario": "1stream",
+  "streams": 1,
+  "elapsed_secs": 7200.3290021419525,
+  "duration_requested_secs": 7200.0,
+  "sample_secs": 300.0,
+  "stall_secs": 30.0,
+  "bytes_tx": 12015370240,
+  "bytes_rx": 12013273088,
+  "avg_mbps_tx": 13.349801362049616,
+  "avg_mbps_rx": 13.34747129963233,
+  "mismatches": 0,
+  "stream_errors": 0,
+  "anomaly_samples": 0,
+  "proxy_exit": -15,
+  "ssh_exit": 0,
+  "ok": true,
+  "per_stream": [
+    {
+      "idx": 0,
+      "bytes_tx": 12015370240,
+      "bytes_rx": 12013273088,
+      "idle_secs": 0.02,
+      "mismatches": 0,
+      "stalled": false,
+      "dead": false,
+      "error_count": 0,
+      "last_error": null
+    }
+  ],
+  "error_excerpts": []
+}

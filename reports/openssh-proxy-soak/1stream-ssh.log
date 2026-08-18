@@ -1,0 +1,320 @@
+OpenSSH_9.6p1 Ubuntu-3ubuntu13.16, OpenSSL 3.0.13 30 Jan 2024
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: /etc/ssh/ssh_config line 19: include /etc/ssh/ssh_config.d/*.conf matched no files
+debug1: /etc/ssh/ssh_config line 21: Applying options for *
+debug1: Connecting to 127.0.0.1 [127.0.0.1] port 43447.
+debug1: Connection established.
+debug1: identity file /tmp/russh-soak-1stream-d341r4jb/id_ed25519 type 3
+debug1: identity file /tmp/russh-soak-1stream-d341r4jb/id_ed25519-cert type -1
+debug1: Local version string SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.16
+debug1: Remote protocol version 2.0, remote software version russh_0.62.5
+debug1: compat_banner: no match: russh_0.62.5
+debug1: Authenticating to 127.0.0.1:43447 as 'soak'
+debug1: SSH2_MSG_KEXINIT sent
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: checking without port identifier
+Warning: Permanently added '[127.0.0.1]:43447' (ED25519) to the list of known hosts.
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 3
+debug1: rekey out after 134217728 blocks
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: Sending SSH2_MSG_EXT_INFO
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 3
+debug1: SSH2_MSG_NEWKEYS received
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_EXT_INFO received
+debug1: kex_ext_info_client_parse: server-sig-algs=<ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa>
+debug1: SSH2_MSG_SERVICE_ACCEPT received
+debug1: Authentications that can continue: password,publickey,hostbased,keyboard-interactive
+debug1: Next authentication method: publickey
+debug1: Will attempt key: /tmp/russh-soak-1stream-d341r4jb/id_ed25519 ED25519 SHA256:RNSy6/4/R1LY5akiEs6gGQtGD97NKIS1BKhsLg0JTKk explicit
+debug1: Offering public key: /tmp/russh-soak-1stream-d341r4jb/id_ed25519 ED25519 SHA256:RNSy6/4/R1LY5akiEs6gGQtGD97NKIS1BKhsLg0JTKk explicit
+debug1: Server accepts key: /tmp/russh-soak-1stream-d341r4jb/id_ed25519 ED25519 SHA256:RNSy6/4/R1LY5akiEs6gGQtGD97NKIS1BKhsLg0JTKk explicit
+Authenticated to 127.0.0.1 ([127.0.0.1]:43447) using "publickey".
+debug1: Local connections to 127.0.0.1:59695 forwarded to remote address 127.0.0.1:46049
+debug1: Local forwarding listening on 127.0.0.1 port 59695.
+debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)
+debug1: Entering interactive session.
+debug1: pledge: network
+debug1: pledge: network
+debug1: Connection to port 59695 forwarding to 127.0.0.1 port 46049 requested.
+debug1: channel 1: new direct-tcpip [direct-tcpip] (inactive timeout: 0)
+debug1: Connection to port 59695 forwarding to 127.0.0.1 port 46049 requested.
+debug1: channel 2: new direct-tcpip [direct-tcpip] (inactive timeout: 0)
+debug1: channel 1: free: direct-tcpip: listening port 59695 for 127.0.0.1 port 46049, connect from 127.0.0.1 port 53726 to 127.0.0.1 port 59695, nchannels 3
+debug1: enqueue packet: 94
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37225
+debug1: ssh_set_newkeys: rekeying out, input 1073864436 bytes 134167047 blocks, output 1073637932 bytes 134185929 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 94
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131770
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 1073864456 bytes 134167049 blocks, output 1073670720 bytes 4098 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37141
+debug1: ssh_set_newkeys: rekeying out, input 2148146236 bytes 134219318 blocks, output 2145830320 bytes 134005478 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 2148146256 bytes 134219320 blocks, output 2145830340 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37162
+debug1: ssh_set_newkeys: rekeying out, input 3222428036 bytes 134219318 blocks, output 3218219736 bytes 134030096 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 3222428056 bytes 134219320 blocks, output 3218219756 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37137
+debug1: ssh_set_newkeys: rekeying out, input 4296709836 bytes 134219318 blocks, output 4290608652 bytes 134030046 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 4296709856 bytes 134219320 blocks, output 4290608672 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37162
+debug1: ssh_set_newkeys: rekeying out, input 5370991636 bytes 134219318 blocks, output 5362998068 bytes 134030096 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 5370991656 bytes 134219320 blocks, output 5362998088 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37187
+debug1: ssh_set_newkeys: rekeying out, input 6445273436 bytes 134219318 blocks, output 6435387984 bytes 134030146 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 6445273456 bytes 134219320 blocks, output 6435388004 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37164
+debug1: ssh_set_newkeys: rekeying out, input 7519555236 bytes 134219318 blocks, output 7507777440 bytes 134030100 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 7519555256 bytes 134219320 blocks, output 7507777460 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37176
+debug1: ssh_set_newkeys: rekeying out, input 8593837036 bytes 134219318 blocks, output 8580167136 bytes 134030124 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 8593837056 bytes 134219320 blocks, output 8580167156 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37176
+debug1: ssh_set_newkeys: rekeying out, input 9668118864 bytes 134219321 blocks, output 9652556832 bytes 134030124 blocks
+debug1: rekey out after 134217728 blocks
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131811
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 9668118884 bytes 134219323 blocks, output 9652556832 bytes 0 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37130
+debug1: ssh_set_newkeys: rekeying out, input 10742400664 bytes 134219318 blocks, output 10724945608 bytes 134030032 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 10742400684 bytes 134219320 blocks, output 10724945628 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_KEXINIT sent
+debug1: rekeying in progress
+debug1: enqueue packet: 93
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: rekeying in progress
+debug1: rekeying in progress
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 SHA256:pD9P6mKkDBBBjiMatGCXcDxgY5741xIuf5P15Rrf6v0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 37155
+debug1: ssh_set_newkeys: rekeying out, input 11816682464 bytes 134219318 blocks, output 11797334884 bytes 134030082 blocks
+debug1: rekey out after 134217728 blocks
+debug1: dequeue packet: 93
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: ssh_packet_read_poll2: resetting read seqnr 131810
+debug1: SSH2_MSG_NEWKEYS received
+debug1: ssh_set_newkeys: rekeying in, input 11816682484 bytes 134219320 blocks, output 11797334904 bytes 2 blocks
+debug1: rekey in after 134217728 blocks
+debug1: channel 2: free: direct-tcpip: listening port 59695 for 127.0.0.1 port 46049, connect from 127.0.0.1 port 53730 to 127.0.0.1 port 59695, nchannels 2
+debug1: channel 0: free: port listener, nchannels 1
+Transferred: sent 12023722400, received 12043732060 bytes, in 7200.4 seconds
+Bytes per second: sent 1669875.7, received 1672654.7
+debug1: Exit status 0
