@@ -70,6 +70,12 @@ def main() -> int:
         help="fail if 1s-class samples stay under 1 MB/s for this long (more_lanes lock)",
     )
     p.add_argument("--min-rekey-triggers", type=int, default=0)
+    p.add_argument(
+        "--min-rekey-completes",
+        type=int,
+        default=0,
+        help="min apply_kex_after_install(RekeyComplete); covers peer-driven kex, unlike --min-rekey-triggers (I5 only)",
+    )
     p.add_argument("--control-json", default="")
     p.add_argument("--out", default="")
     args = p.parse_args()
@@ -206,12 +212,18 @@ def main() -> int:
         )
 
     rekey_triggers = None
+    rekey_completes = None
+    rekey_begins = None
+    rekey_peer_starts = None
     if args.control_json:
         cp = Path(args.control_json)
         if cp.is_file():
             try:
                 ctl = json.loads(cp.read_text(encoding="utf-8"))
                 rekey_triggers = int(ctl.get("rekey_triggers") or 0)
+                rekey_completes = int(ctl.get("rekey_completes") or 0)
+                rekey_begins = int(ctl.get("rekey_begins") or 0)
+                rekey_peer_starts = int(ctl.get("rekey_peer_starts") or 0)
             except json.JSONDecodeError:
                 fails.append(f"control json not parseable: {cp}")
         else:
@@ -222,7 +234,16 @@ def main() -> int:
             and rekey_triggers < args.min_rekey_triggers
         ):
             fails.append(
-                f"rekey_triggers={rekey_triggers} < {args.min_rekey_triggers}"
+                f"rekey_triggers={rekey_triggers} < {args.min_rekey_triggers} "
+                "(I5 server-initiated only; peer kex is rekey_completes/rekey_peer_starts)"
+            )
+        if (
+            args.min_rekey_completes
+            and rekey_completes is not None
+            and rekey_completes < args.min_rekey_completes
+        ):
+            fails.append(
+                f"rekey_completes={rekey_completes} < {args.min_rekey_completes}"
             )
 
     last = rows[-1] if rows else {}
@@ -242,6 +263,9 @@ def main() -> int:
         "peak_out_t": peak_out_t,
         "peak_in_t": peak_in_t,
         "rekey_triggers": rekey_triggers,
+        "rekey_completes": rekey_completes,
+        "rekey_begins": rekey_begins,
+        "rekey_peer_starts": rekey_peer_starts,
         "fails": fails,
     }
     text = json.dumps(report, indent=2)

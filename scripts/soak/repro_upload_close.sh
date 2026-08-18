@@ -22,6 +22,7 @@ CONTROL="${CONTROL:-127.0.0.1:18080}"
 SSH_VERBOSE="${SSH_VERBOSE:-0}"
 REKEY_LIMIT="${REKEY_LIMIT:-64M}"
 MIN_REKEY_TRIGGERS="${MIN_REKEY_TRIGGERS:-0}"
+MIN_REKEY_COMPLETES="${MIN_REKEY_COMPLETES:-0}"
 export PATH="/usr/sbin:/usr/bin:/usr/local/cargo/bin:$PATH"
 
 EXPECTED_LIVE=$((DOWN + UP + ECHO))
@@ -189,6 +190,7 @@ JUDGE_ARGS=(
   --min-peak-out-bps "$MIN_PEAK_OUT_BPS"
   --control-json "$WD/control.json"
   --min-rekey-triggers "$MIN_REKEY_TRIGGERS"
+  --min-rekey-completes "$MIN_REKEY_COMPLETES"
   --out "$WD/judge.json"
 )
 if [[ "${JUDGE:-1}" != "0" ]]; then

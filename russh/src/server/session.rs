@@ -58,6 +58,12 @@ use crate::{ChannelOpenFailure, ReplyQueue, ReplyVerdict, map_err, msg};
 
 /// I6: rekey trigger / merge / idle-drop counters. Always compiled
 /// (not `_test_hooks`-gated). Reason detail goes to `tracing`/`log`.
+///
+/// `triggers` / `merges` / `idle_drops` count **server I5** only.
+/// Peer-driven KEXINIT does not touch those three; use `begins` /
+/// `peer_starts` / `completes` for coverage (a `--min-rekey-triggers`
+/// gate on I5 alone can pass while the session rekeys thousands of
+/// times, or fail while I5 is idle because the peer won the race).
 #[derive(Debug, Default)]
 pub struct RekeyI6 {
     /// Times `flush` actually called `begin_rekey` from the I5 predicate.
@@ -66,6 +72,12 @@ pub struct RekeyI6 {
     merges: AtomicU64,
     /// Times the I5 predicate was true but `kex != Idle` (storm).
     idle_drops: AtomicU64,
+    /// Mid-session `begin_rekey` successes (I5 and peer KEXINIT).
+    begins: AtomicU64,
+    /// Peer KEXINIT that found `kex == Idle` and called `begin_rekey`.
+    peer_starts: AtomicU64,
+    /// `apply_kex_after_install(RekeyComplete)` (not initial kex).
+    completes: AtomicU64,
 }
 
 impl RekeyI6 {
@@ -80,6 +92,24 @@ impl RekeyI6 {
     }
     pub fn idle_drops(&self) -> u64 {
         self.idle_drops.load(Ordering::SeqCst)
+    }
+    pub fn begins(&self) -> u64 {
+        self.begins.load(Ordering::SeqCst)
+    }
+    pub fn peer_starts(&self) -> u64 {
+        self.peer_starts.load(Ordering::SeqCst)
+    }
+    pub fn completes(&self) -> u64 {
+        self.completes.load(Ordering::SeqCst)
+    }
+    pub(crate) fn note_begin(&self) {
+        self.begins.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn note_peer_start(&self) {
+        self.peer_starts.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn note_complete(&self) {
+        self.completes.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -1347,7 +1377,7 @@ impl Session {
     /// Items popped per `pump_reader_lanes` call. Hitting this returns
     /// to the outer loop so facade/result can drain; loop-top pumps
     /// again if the quantum was exhausted.
-    const LANE_PUMP_QUANTUM: usize = 64;
+    pub(crate) const LANE_PUMP_QUANTUM: usize = 64;
 
     /// Pop Reader lanes into the app buffer / REQUEST dispatch.
     /// App-bound items are reserved *before* pop: Full parks the channel
@@ -2404,10 +2434,25 @@ impl Session {
         self.dispatch_window_adjusted(handler, id, new_size).await
     }
 
+    /// Soak-era bug: `more_lanes { continue }` skipped `select!` and
+    /// this board drain. Production never skips. Invert restores it so
+    /// a session test can must-red "peer WINDOW_ADJUST is not applied".
+    pub(crate) fn skip_select_after_more_lanes(&self, more_lanes: bool) -> bool {
+        #[cfg(feature = "_test_hooks")]
+        {
+            more_lanes && self.common.config.invert_more_lanes_continue
+        }
+        #[cfg(not(feature = "_test_hooks"))]
+        {
+            let _ = more_lanes;
+            false
+        }
+    }
+
     /// Drain the aggregation board into `apply_peer_window_credit`. Shared by
     /// the production loop-top site and the `_test_hooks` pin that runs the
     /// same apply *after* the batch drain (data-msg-before-ADJUST).
-    async fn apply_pending_peer_credit<H: Handler + Send>(
+    pub(crate) async fn apply_pending_peer_credit<H: Handler + Send>(
         &mut self,
         mut handler: Option<&mut H>,
     ) -> Result<(), H::Error> {
@@ -3299,6 +3344,10 @@ impl Session {
             // Writer acks, apply_pending_peer_credit, and the write/rekey
             // watchdogs. The `more_lanes` select arm below is immediately
             // ready so we do not block waiting for a second notify.
+            // `_test_hooks` invert restores that continue (must-red).
+            if self.skip_select_after_more_lanes(more_lanes) {
+                continue;
+            }
             // Aggregation board drain: always here (or, under the pin hook,
             // after the batch drain). Never in the notify arm.
             #[cfg(feature = "_test_hooks")]
@@ -5078,6 +5127,7 @@ impl Session {
                 }
                 self.kex = SessionKexState::Idle;
                 self.clear_rekey_deadline();
+                self.common.config.rekey_i6.note_complete();
             }
             KexAfterInstall::InitialComplete => {
                 self.kex = SessionKexState::Idle;
@@ -6769,6 +6819,7 @@ impl Session {
             let kex_gen = self.rekey_gen;
             self.rekey_deadline
                 .register(kex_gen, self.common.config.rekey_deadline);
+            self.common.config.rekey_i6.note_begin();
             debug!("rekey deadline armed generation={kex_gen}");
         } else {
             debug!("initial KEX: rekey deadline not registered (handshake owns this clock)");
@@ -9332,7 +9383,8 @@ mod tests {
     }
 
     /// Production: occupancy+remaining from one lock. 80 queued / 20 remaining
-    /// is half-full so Δ=0; the invariant holds.
+    /// is half-full so Δ=0; the invariant holds but this is the no-expand
+    /// case. See `window_grant_atomic_expand_keeps_invariant` for Δ>0.
     #[cfg(feature = "_test_hooks")]
     #[tokio::test]
     async fn window_grant_atomic_reads_keep_invariant() {
@@ -9435,6 +9487,167 @@ mod tests {
             occ as u32 + rem > target,
             "HARD: torn grant must break occ+remaining ≤ target \
              (occ={occ} rem={rem} target={target})"
+        );
+    }
+
+    /// Production Δ>0: fill, pop so remaining < ceiling/2, expand, then
+    /// occ + rem ≤ target. This is the steady-state grant, not the
+    /// no-expand half-full snapshot.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn window_grant_atomic_expand_keeps_invariant() {
+        use crate::server::inbound_lane::LaneItem;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let target = 100u32;
+        let mut cfg = crate::server::Config::default();
+        cfg.grant_target_override = Some(Arc::new(AtomicU32::new(target)));
+        let mut session = authenticated_session_with(cfg);
+        session.target_window_size = target;
+        let id = insert_encrypted_channel(&mut session, target);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 8);
+        let lanes = attach_lane(&mut session, id, target, vec![]);
+        {
+            let mut g = lanes.lock().unwrap();
+            assert_eq!(
+                g.ingest(id, LaneItem::Data(bytes::Bytes::from(vec![0u8; 70]))),
+                crate::server::inbound_lane::LanePush::Accepted
+            );
+            assert_eq!(
+                g.ingest(id, LaneItem::Data(bytes::Bytes::from(vec![0u8; 30]))),
+                crate::server::inbound_lane::LanePush::Accepted
+            );
+        }
+        let popped = session.reader.as_ref().unwrap().pop_channel(id);
+        assert!(
+            matches!(popped, Some(LaneItem::Data(d)) if d.len() == 70),
+            "pop the filled head so occ drops while remaining stays 0"
+        );
+
+        let (occ_before, rem_before) = session.reader.as_ref().unwrap().grant_plan(id).unwrap();
+        assert_eq!(occ_before, 30);
+        assert_eq!(rem_before, 0);
+        let ceiling = target.saturating_sub(occ_before as u32);
+        assert!(
+            rem_before < ceiling / 2,
+            "precondition: remaining < ceiling/2 so grant_delta > 0 \
+             (occ={occ_before} rem={rem_before} ceiling={ceiling})"
+        );
+        assert!(
+            crate::server::inbound_lane::LaneTable::grant_delta(
+                target,
+                occ_before as u32,
+                rem_before
+            ) > 0
+        );
+
+        let mut handler = TestHandler;
+        session
+            .maybe_grant_after_delivery(id, Some(&mut handler))
+            .await
+            .expect("grant");
+
+        let (occ, rem) = session.reader.as_ref().unwrap().grant_plan(id).unwrap();
+        assert_eq!(occ, occ_before, "grant must not pop occupancy");
+        assert!(rem > rem_before, "Δ>0 expand must raise remaining");
+        assert!(
+            occ as u32 + rem <= target,
+            "production expand must keep occ+remaining ≤ target (occ={occ} rem={rem})"
+        );
+    }
+
+    #[cfg(feature = "_test_hooks")]
+    async fn more_lanes_credit_round(invert: bool) -> (usize, u32, u32) {
+        use crate::server::inbound_lane::{LaneItem, PeerCreditBoard};
+
+        let n = Session::LANE_PUMP_QUANTUM;
+        let items: Vec<LaneItem> = (0..n + 8)
+            .map(|_| LaneItem::Data(Bytes::from_static(&[0u8])))
+            .collect();
+        let board = PeerCreditBoard::new();
+        let mut cfg = crate::server::Config::default();
+        cfg.invert_more_lanes_continue = invert;
+        cfg.peer_credit = Some(board.clone());
+        let mut session = authenticated_session_with(cfg);
+        let id = insert_encrypted_channel(&mut session, 2048);
+        confirm_test_channel(&mut session, id, 4096);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, n + 16);
+        attach_lane(&mut session, id, 2048, items);
+        session.peer_credit = Some(board.clone());
+        let before = session
+            .common
+            .encrypted
+            .as_ref()
+            .unwrap()
+            .channels
+            .get(&id)
+            .unwrap()
+            .recipient_window_size;
+
+        let mut handler = TestHandler;
+        let more = session
+            .pump_reader_lanes(Some(&mut handler))
+            .await
+            .expect("pump");
+        assert!(
+            more,
+            "prefill ≥ LANE_PUMP_QUANTUM must return more_lanes=true"
+        );
+        board.post(id, 1000);
+        assert!(board.len() > 0, "posted peer WINDOW_ADJUST");
+
+        for _ in 0..8 {
+            if session.skip_select_after_more_lanes(more) {
+                continue;
+            }
+            session
+                .apply_pending_peer_credit(Some(&mut handler))
+                .await
+                .expect("apply credit");
+        }
+        let after = session
+            .common
+            .encrypted
+            .as_ref()
+            .unwrap()
+            .channels
+            .get(&id)
+            .unwrap()
+            .recipient_window_size;
+        (board.len(), before, after)
+    }
+
+    /// Invert: more_lanes continue skips apply_pending_peer_credit.
+    /// Posted WINDOW_ADJUST stays on the board (same class as torn-grant).
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn more_lanes_continue_starves_peer_credit_is_red() {
+        let (pending, before, after) = more_lanes_credit_round(true).await;
+        assert!(
+            pending > 0,
+            "HARD: more_lanes continue must leave peer WINDOW_ADJUST unapplied \
+             (pending={pending})"
+        );
+        assert_eq!(
+            after, before,
+            "HARD: starved credit must not move recipient_window \
+             (before={before} after={after})"
+        );
+    }
+
+    /// Production: more_lanes true still drains the board.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn more_lanes_does_not_skip_peer_credit() {
+        let (pending, before, after) = more_lanes_credit_round(false).await;
+        assert_eq!(
+            pending, 0,
+            "production must apply peer WINDOW_ADJUST even when more_lanes"
+        );
+        assert!(
+            after > before,
+            "applied credit must raise recipient_window (before={before} after={after})"
         );
     }
 

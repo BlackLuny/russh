@@ -89,7 +89,9 @@ Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
 
 ## Verification
 
-- Unit: over-window drop + remaining cleared; torn vs atomic grant Δ.
+- Unit: over-window drop + remaining cleared; torn vs atomic grant Δ
+  (including Δ>0 expand); `more_lanes` continue must-red vs production
+  peer-credit drain.
 - Integration: Q5 inject still Overflows (`overflows=1`); Q5-wire over-window is
   ignored (`occupancy=64`, `overflows=0`, `over_window_drops=2`).
   `window_grant_is_lane_only` / omit-lane red / G7 still pass.
@@ -97,10 +99,12 @@ Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
   and a pass/fail judge (`soak-results/REPEAT_VERIFY.md`, JSON in
   `soak-results/judges/`):
   - 15s freeze × 5, 3×15s on one connection, upload-only × 3, 30s freeze × 2,
-    180s unlimited, **180s with 8 MiB rekey** (`idle_drops=29`)
+    180s unlimited, **180s with 8 MiB rekey** (`idle_drops=29`; I5-only
+    counters — peer-driven completes are a later `/stats` field)
   - **Negative control:** putting `more_lanes { continue }` back did **not**
     fail 180s unlimited or 15s freeze-catchup. Fast sink drain keeps
     `more_lanes` from staying true; this harness does not nail that as the
-    soak root cause. The select-arm change is still the right code.
+    soak root cause. The select-arm change is still the right code, now
+    with a session must-red (`more_lanes_continue_starves_peer_credit_is_red`).
 
 

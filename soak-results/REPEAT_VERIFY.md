@@ -12,7 +12,8 @@ This is still not a 12.7h soak.
 | --- | --- |
 | `grant_plan_is_atomic_against_ingest` | pass |
 | `over_window_data_is_ignored_not_queued` | pass |
-| `window_grant_*` including **`window_grant_torn_reads_is_red`** | pass (5) |
+| `window_grant_*` including **`window_grant_torn_reads_is_red`** and **`window_grant_atomic_expand_keeps_invariant`** | pass (6) |
+| **`more_lanes_continue_starves_peer_credit_is_red`** / **`more_lanes_does_not_skip_peer_credit`** | pass |
 | `g7_*` (2) | pass |
 | `test_s3b_lanes` (17) | pass |
 | `test_s6a_rekey` (12) | pass |
@@ -20,10 +21,32 @@ This is still not a 12.7h soak.
 `window_grant_torn_reads_is_red` drives `maybe_grant_after_delivery` with
 `invert_torn_grant_reads` + a hold/mid gate. Reader ingest N=20 between
 the two locks; asserts `occ + remaining > target`. Production counterpart
-`window_grant_atomic_reads_keep_invariant` stays `≤ target`.
+`window_grant_atomic_reads_keep_invariant` is the no-expand half-full
+snapshot (Δ=0). `window_grant_atomic_expand_keeps_invariant` fills,
+pops occupancy so `remaining < ceiling/2`, expands, then asserts
+`occ + rem ≤ target`.
+
+`more_lanes_continue_starves_peer_credit_is_red` pre-fills ≥64 lane
+items (`pump_reader_lanes` returns true), posts a peer
+`WINDOW_ADJUST` on `PeerCreditBoard`, and restores `continue` via
+`invert_more_lanes_continue`. Eight loop turns leave the credit
+unapplied. Production `more_lanes_does_not_skip_peer_credit` drains
+the board even when `more_lanes` is true. Live 45–180s still does not
+hit the quantum∧HWM conjunction; this is the session-level nail.
 
 Judge ready-line: an s8 log without `S8_LISTEN`/`S8_READY` is FAIL (empty
 log is no longer a silent pass).
+
+`/stats` now exports `rekey_begins` / `rekey_peer_starts` /
+`rekey_completes` in addition to I5 `rekey_triggers` /
+`rekey_idle_drops` / `rekey_merges`. `--min-rekey-triggers` only
+counts server-initiated I5; `--min-rekey-completes` is the coverage
+gate. The 180s 8 MiB run predates those fields (`triggers=1`,
+`idle_drops=29`). That is **not** ~14000 I5 fires: either the peer
+won almost every 8 MiB race (then `rekey_completes` should be
+thousands) or `bytes_this_epoch` / I5 is nearly idle (then
+`rekey_completes` stays near 1). A short `SSH_VERBOSE=1` rerun
+records which.
 
 ## Live OpenSSH → `s8_matrix_server` (fixed binary)
 
@@ -55,15 +78,19 @@ HWM` so every `WINDOW_ADJUST` is deferred **and** the retry is skipped).
 
 The code change (do not skip `select!`) is still correct. The 180s
 zero-gap run on the **fixed** binary is not a differential proof against
-`continue`.
+`continue`. Session-level invert (`more_lanes_continue_starves_peer_credit_is_red`)
+is.
 
 ## What is nailed vs what is not
 
-- **Torn grant:** Session-level must-red on the invariant. Nailed.
+- **Torn grant:** Session-level must-red on the invariant, plus a Δ>0
+  atomic expand green. Nailed.
 - **Judge silent-log hole:** missing `S8_READY` fails. Nailed.
-- **Flood × volume rekey:** 8 MiB I5 + OpenSSH `RekeyLimit=8M` for 180s;
-  `idle_drops=29` (predicate true while `kex != Idle`); no stall/close.
-  Covered, not a 5854-trigger 10h soak.
-- **`more_lanes` as soak root cause:** code still matches the 46 min
-  timeline, but a live negative control in this harness did not FAIL.
-  Not nailed by 12/12.
+- **`more_lanes` skip-select:** session must-red (peer ADJUST starved).
+  Live 12/12 remains "healthy after fix", not causality. Nailed in
+  unit, not by this harness's negative control.
+- **Flood × volume rekey:** 8 MiB I5 + OpenSSH `RekeyLimit=8M` for 180s
+  did not stall/close. I5 counters (`triggers=1`, `idle_drops=29`) do
+  **not** count peer-driven kex; attribution of the ~14000 threshold
+  crossings is pending `rekey_completes` / `SSH_VERBOSE`. Not a
+  5854-trigger 10h soak.

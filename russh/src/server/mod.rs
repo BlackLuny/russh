@@ -386,6 +386,11 @@ pub struct Config {
     /// locks (the production bug). Must-red vs `grant_plan`.
     #[cfg(feature = "_test_hooks")]
     pub invert_torn_grant_reads: bool,
+    /// Test-only: restore soak-era `more_lanes { continue }` so a
+    /// posted peer `WINDOW_ADJUST` is not applied. Must-red vs the
+    /// production path that still reaches `apply_pending_peer_credit`.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_more_lanes_continue: bool,
     /// After the stale occupancy read, wait while true so a test can
     /// ingest before the remaining read. Paired with `torn_grant_mid`.
     #[cfg(feature = "_test_hooks")]
@@ -628,6 +633,8 @@ impl Default for Config {
             invert_omit_lane_from_undelivered: false,
             #[cfg(feature = "_test_hooks")]
             invert_torn_grant_reads: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_more_lanes_continue: false,
             #[cfg(feature = "_test_hooks")]
             torn_grant_hold: None,
             #[cfg(feature = "_test_hooks")]
@@ -1819,6 +1826,7 @@ async fn reply<H: Handler + Send>(
     {
         // Not currently in a rekey / pending install but received KEXINIT
         info!("Client has initiated re-key");
+        session.common.config.rekey_i6.note_peer_start();
         session.begin_rekey()?;
         // Kex will consume the packet right away
     }
