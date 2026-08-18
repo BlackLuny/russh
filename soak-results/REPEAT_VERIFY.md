@@ -31,8 +31,12 @@ items (`pump_reader_lanes` returns true), posts a peer
 `WINDOW_ADJUST` on `PeerCreditBoard`, and restores `continue` via
 `invert_more_lanes_continue`. Eight loop turns leave the credit
 unapplied. Production `more_lanes_does_not_skip_peer_credit` drains
-the board even when `more_lanes` is true. Live 45–180s still does not
-hit the quantum∧HWM conjunction; this is the session-level nail.
+the board even when `more_lanes` is true. The `for` around
+`skip_select_after_more_lanes` is a replica of the after-pump site,
+not of `select!`: these tests lock "credit still drains when
+`more_lanes=true`". They do not lock the immediately-ready arm's
+position or `biased` order. Live 45–180s still does not hit the
+quantum∧HWM conjunction; this is the session-level nail.
 
 Judge ready-line: an s8 log without `S8_LISTEN`/`S8_READY` is FAIL (empty
 log is no longer a silent pass).
@@ -61,6 +65,25 @@ only fired 30 times". That is stronger than the original soak's 5854
 I5 triggers. `triggers=1` on that run is I5 winning once; it is not
 the completion count.
 
+The matched 8 MiB race leaves `i5_volume_due` false (`triggers=0`,
+`idle_drops=0`): the peer KEXINIT arrives before the epoch counter
+crosses 8 MiB. That is the **peer** half. The original 12.7h soak's
+5854 triggers were the **server I5** half (`apply_i5_rekey` →
+`begin_rekey`, the `exchange.take()` fix).
+
+Confirmed (25s upload-only, `--max-bytes=4MiB`, OpenSSH
+`RekeyLimit=32M`, `soak-results/judges/rekey-i5win/`):
+
+- 11.56 GiB in, peak 514 MB/s, zero gaps, `disconnects=0`
+- `rekey_triggers=2557` `rekey_begins=2557` `rekey_completes=2557`
+- `rekey_peer_starts=0` `merges=0`
+- `rekey_idle_drops=101337` (~40 due-while-InKex per trigger; storm
+  counted, no stall/close)
+- ~4.63 MiB/complete (4 MiB threshold + in-flight during kex)
+
+Both halves of flood × rekey are now live: peer-driven (8M=8M) and
+server I5 (4M vs 32M).
+
 ## Live OpenSSH → `s8_matrix_server` (fixed binary)
 
 | case | n | result | notes |
@@ -72,6 +95,7 @@ the completion count.
 | 180s unlimited, no freeze | 1 | **pass** | 156.5 GiB; peak 933 MB/s; zero gaps |
 | 180s unlimited, **8 MiB rekey** | 1 | **pass** | 109.6 GiB; peak 662 MB/s; zero gaps; I5 `triggers=1` `idle_drops=29`; peer-driven completes not exported yet |
 | 25s upload, **8 MiB rekey** + verbose | 1 | **pass** | 14.2 GiB; peak 585 MB/s; `completes=1749` `peer_starts=1749` `triggers=0` |
+| 25s upload, **4 MiB I5 vs OpenSSH 32M** | 1 | **pass** | 11.56 GiB; peak 514 MB/s; `triggers=2557` `completes=2557` `peer_starts=0` `idle_drops=101337` |
 
 ## Negative control (`more_lanes { continue }` restored, then reverted)
 
@@ -101,11 +125,16 @@ is.
   atomic expand green. Nailed.
 - **Judge silent-log hole:** missing `S8_READY` fails. Nailed.
 - **`more_lanes` skip-select:** session must-red (peer ADJUST starved).
-  Live 12/12 remains "healthy after fix", not causality. Nailed in
-  unit, not by this harness's negative control.
-- **Flood × volume rekey:** 25s verbose run completed **1749** peer-driven
-  rekeys at ~585 MB/s with zero gaps (`triggers=0`). The 180s 109.6 GiB
-  run is the same race (OpenSSH `RekeyLimit=8M` wins; I5 `triggers=1`
-  is not the completion count). Stronger than the original soak's 5854
-  I5 triggers. Nailed as "peer-driven volume rekey under flood does
-  not stall/close"; not a 10h soak.
+  Locks the after-pump `continue` invariant, not the `select!`
+  ready-arm / `biased` order. Live 12/12 remains "healthy after fix",
+  not causality. Nailed in unit, not by this harness's negative control.
+- **Flood × volume rekey, peer half:** 25s verbose, matched 8 MiB:
+  **1749** peer-driven completes, `triggers=0`. The 180s 109.6 GiB run
+  is the same race (~13500 completes). Nailed as "peer-driven volume
+  rekey under flood does not stall/close".
+- **Flood × volume rekey, server I5 half:** 25s, `--max-bytes=4MiB`
+  vs OpenSSH `RekeyLimit=32M`: **2557** I5 `begin_rekey` + completes,
+  `peer_starts=0`, `idle_drops=101337`, zero gaps. This is the
+  `exchange.take()` fix path the 12.7h soak actually ran (5854
+  triggers). Nailed as "server I5 volume rekey under flood does not
+  stall/close"; not a 10h soak.

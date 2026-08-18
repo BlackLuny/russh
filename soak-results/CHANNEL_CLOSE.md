@@ -100,7 +100,8 @@ Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
   `soak-results/judges/`):
   - 15s freeze × 5, 3×15s on one connection, upload-only × 3, 30s freeze × 2,
     180s unlimited, **180s with 8 MiB rekey** (I5 `idle_drops=29`;
-    later 25s verbose run: `rekey_completes=1749`, peer-driven)
+    later 25s verbose: `rekey_completes=1749` peer-driven; 25s I5-wins
+    4MiB vs OpenSSH 32M: `rekey_triggers=2557` `completes=2557`)
   - **Negative control:** putting `more_lanes { continue }` back did **not**
     fail 180s unlimited or 15s freeze-catchup. Fast sink drain keeps
     `more_lanes` from staying true; this harness does not nail that as the

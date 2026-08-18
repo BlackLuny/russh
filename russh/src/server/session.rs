@@ -9597,6 +9597,11 @@ mod tests {
         board.post(id, 1000);
         assert!(board.len() > 0, "posted peer WINDOW_ADJUST");
 
+        // Replica of the after-pump site, not of `select!`. These
+        // tests lock "more_lanes=true still drains credit" (the
+        // soak-era `continue`). They do not lock the immediately-ready
+        // arm's position or `biased` order; moving that arm first
+        // would still pass.
         for _ in 0..8 {
             if session.skip_select_after_more_lanes(more) {
                 continue;
@@ -9620,6 +9625,7 @@ mod tests {
 
     /// Invert: more_lanes continue skips apply_pending_peer_credit.
     /// Posted WINDOW_ADJUST stays on the board (same class as torn-grant).
+    /// Does not pin the `select!` ready-arm / `biased` order.
     #[cfg(feature = "_test_hooks")]
     #[tokio::test]
     async fn more_lanes_continue_starves_peer_credit_is_red() {
@@ -9637,6 +9643,7 @@ mod tests {
     }
 
     /// Production: more_lanes true still drains the board.
+    /// Same limit as the invert: credit drain, not select-arm order.
     #[cfg(feature = "_test_hooks")]
     #[tokio::test]
     async fn more_lanes_does_not_skip_peer_credit() {
