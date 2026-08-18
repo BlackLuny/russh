@@ -48,6 +48,7 @@ struct Cli {
 #[derive(Clone, Default)]
 struct ProxyServer {
     channels_opened: Arc<AtomicU64>,
+    channels_closed: Arc<AtomicU64>,
     bytes_relayed: Arc<AtomicU64>,
 }
 
@@ -58,6 +59,7 @@ impl russh::server::Server for ProxyServer {
         eprintln!("ssh client connected from {peer:?}");
         ProxyHandler {
             channels_opened: self.channels_opened.clone(),
+            channels_closed: self.channels_closed.clone(),
             bytes_relayed: self.bytes_relayed.clone(),
         }
     }
@@ -69,6 +71,7 @@ impl russh::server::Server for ProxyServer {
 
 struct ProxyHandler {
     channels_opened: Arc<AtomicU64>,
+    channels_closed: Arc<AtomicU64>,
     bytes_relayed: Arc<AtomicU64>,
 }
 
@@ -112,15 +115,18 @@ impl russh::server::Handler for ProxyHandler {
     ) -> Result<(), Self::Error> {
         let dest = format!("{host_to_connect}:{port_to_connect}");
         let n = self.channels_opened.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!(
-            "direct-tcpip #{n} {originator_address}:{originator_port} -> {dest} chan={:?}",
-            channel.id()
-        );
+        if n <= 3 || n % 200 == 0 {
+            eprintln!(
+                "direct-tcpip opened total={n} {originator_address}:{originator_port} -> {dest} chan={:?}",
+                channel.id()
+            );
+        }
 
         match TcpStream::connect((host_to_connect, port_to_connect as u16)).await {
             Ok(tcp) => {
                 reply.accept().await;
                 let bytes_relayed = self.bytes_relayed.clone();
+                let channels_closed = self.channels_closed.clone();
                 tokio::spawn(async move {
                     if let Err(e) = tcp.set_nodelay(true) {
                         eprintln!("upstream nodelay failed: {e}");
@@ -130,11 +136,15 @@ impl russh::server::Handler for ProxyHandler {
                     match tokio::io::copy_bidirectional(&mut ssh, &mut tcp).await {
                         Ok((a, b)) => {
                             bytes_relayed.fetch_add(a.saturating_add(b), Ordering::Relaxed);
-                            eprintln!(
-                                "direct-tcpip closed dest={dest} ssh->tcp={a} tcp->ssh={b}"
-                            );
+                            let c = channels_closed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if c <= 3 || c % 200 == 0 {
+                                eprintln!(
+                                    "direct-tcpip closed total={c} dest={dest} ssh->tcp={a} tcp->ssh={b}"
+                                );
+                            }
                         }
                         Err(e) => {
+                            channels_closed.fetch_add(1, Ordering::Relaxed);
                             eprintln!("direct-tcpip copy error dest={dest}: {e}");
                         }
                     }

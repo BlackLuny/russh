@@ -24,4 +24,12 @@ python3 scripts/openssh_loopback_soak.py \
 - Server `inactivity_timeout` is disabled so `-N` is not killed at 10 minutes;
   rekey stays at library defaults (1 GiB / 1 h).
 
-Results of the 2-hour run on this branch: [RESULTS.md](RESULTS.md).
+Results of the 2-hour long-lived stream run: [RESULTS.md](RESULTS.md).
+Short-connection churn: [CHURN.md](CHURN.md) (filled after that soak).
+
+```bash
+python3 scripts/openssh_loopback_soak.py \
+  --scenarios churn --inflight 100 \
+  --duration-secs 7200 --sample-secs 300 \
+  --out reports/openssh-proxy-soak
+```
