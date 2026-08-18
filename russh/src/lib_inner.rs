@@ -65,8 +65,9 @@ mod channels;
 #[cfg(feature = "_test_hooks")]
 pub use channels::io::{
     acquire_invert_bound2_discard_ready, acquire_invert_park_before_register,
-    s8b_object_ack_before_register_round, s8b_object_register_round,
-    s8c_object_known_dead_round, InvertParkGuard, S8bObjectClass,
+    acquire_lockstep_round, s8b_object_ack_before_register_round, s8b_object_register_round,
+    s8c_object_known_dead_round, s9_object_credit_release_round, s9_object_credit_round,
+    InvertParkGuard, S8bObjectClass, S9CreditClass,
 };
 pub use channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf};
 

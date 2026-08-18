@@ -361,9 +361,16 @@ async fn dual_writer_both_complete() -> Result<(), anyhow::Error> {
     }
 }
 
+/// `invert_single_wake` perturbs `wake_parked_writers`: one `notify_one`
+/// for N parked writers on the shared per-channel `Notify`. That is a
+/// property of the **lockstep** ack protocol, so the round pins it on
+/// (`acquire_lockstep_round`). S9's production path waits on each packet's
+/// own oneshot, where there is no shared permit to under-issue — the class
+/// is structurally absent there, which is why this must-red needs the pin.
 #[cfg(feature = "_test_hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dual_writer_single_wake_is_red() -> Result<(), anyhow::Error> {
+    let _lockstep = russh::acquire_lockstep_round(false, false);
     match run_dual_writers(DualHooks {
         invert_single_wake: true,
         orderly_close: false,

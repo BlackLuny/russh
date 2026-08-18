@@ -1,8 +1,16 @@
-//! S8b ChannelTx register-before-park (D2).
+//! S8b ChannelTx register-before-park (D2) + S9 P1 credit window.
 //!
-//! Object gate: two acked writers, manual poll, no tokio scheduling.
-//! Production: both Ready(Ok). Invert `invert_park_before_register`:
-//! exactly one Ready, one Pending → `LostWake` (names who was lost).
+//! S8b object gate: two acked writers, manual poll, no tokio scheduling.
+//! Those rounds pin the pre-S9 **lockstep** protocol (`_test_hooks`
+//! `invert_lockstep_ack`), which is the code D2 perturbs. Production:
+//! both Ready(Ok). Invert `invert_park_before_register`: exactly one
+//! Ready, one Pending → `LostWake` (names who was lost).
+//!
+//! S9 rounds gate what production actually runs: a credit window of K
+//! un-acked packets, each waited on through its own oneshot. There is no
+//! shared permit to steal, so the D2 class cannot recur there; what has
+//! to be gated instead is that the window stays *bounded* and that a
+//! dropped ack still surfaces BrokenPipe.
 //!
 //! E2E reuses the S5b dual-writer shape. Invert E2E is frequency-only;
 //! the object gate is the must-red carrier.
@@ -85,6 +93,55 @@ fn known_dead_check_does_not_break_live_early_ok() {
     match russh::s8c_object_known_dead_round(false) {
         russh::S8bObjectClass::AckReady => {}
         other => panic!("live channel must still early-Ok, got {other:?}"),
+    }
+}
+
+/// S9 P1: the credit window must be a *window* — a writer that is never
+/// acked parks after exactly K packets. Invert (unbounded credit) lets a
+/// producer outrun the authority forever, which is what
+/// `max_pending_outbound_bytes` then has to StopDiscard.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn credit_window_is_bounded() {
+    match russh::s9_object_credit_round(false) {
+        russh::S9CreditClass::ParkedAtCredit { credit } => assert!(credit >= 1),
+        other => panic!("production must park at credit, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn unbounded_credit_invert_never_parks() {
+    match russh::s9_object_credit_round(true) {
+        russh::S9CreditClass::Unbounded { accepted } => assert!(accepted > 8),
+        other => panic!("invert must be Unbounded, got {other:?}"),
+    }
+}
+
+/// S9 P1: a resolved ack releases the parked writer. This is the
+/// lost-wake gate for the credit path — the oneshot is the only wake
+/// source, so a regression here is a hang, not a slowdown.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn resolved_ack_releases_parked_writer() {
+    match russh::s9_object_credit_release_round(false) {
+        russh::S9CreditClass::Resumed => {}
+        other => panic!("resolved ack must resume the writer, got {other:?}"),
+    }
+}
+
+/// S9 P1: a *dropped* ack (discard / finalize_close) must surface
+/// BrokenPipe, never a fake Ok for bytes that were thrown away — the
+/// credit-path counterpart of `known_dead_after_discard_is_broken_pipe`.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn dropped_ack_is_broken_pipe() {
+    match russh::s9_object_credit_release_round(true) {
+        russh::S9CreditClass::DeadBrokenPipe => {}
+        russh::S9CreditClass::DroppedAckReportedOk => {
+            panic!("DroppedAckReportedOk: discarded bytes reported as written")
+        }
+        other => panic!("dropped ack must be BrokenPipe, got {other:?}"),
     }
 }
 
