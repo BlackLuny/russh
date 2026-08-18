@@ -1521,14 +1521,32 @@ async fn drain_writes<W: AsyncWrite + Unpin>(
             *flush_cursor = 0;
             continue;
         }
-        let n = w.write(&buf[*flush_cursor..]).await?;
+        // Gather: one syscall for the head packet plus everything already
+        // queued behind it. With the S9 credit window a producer keeps
+        // several packets in flight, so `out_q` is routinely non-empty and
+        // a per-packet `write` would spend a syscall on each 32 KiB.
+        let n = if out_q.is_empty() || !w.is_write_vectored() {
+            w.write(&buf[*flush_cursor..]).await?
+        } else {
+            const EMPTY: &[u8] = &[];
+            let mut iov = [std::io::IoSlice::new(EMPTY); MAX_GATHER_SEGMENTS];
+            let mut k = 0;
+            for (slot, seg) in iov.iter_mut().zip(
+                std::iter::once(buf.get(*flush_cursor..).unwrap_or(&[]))
+                    .chain(out_q.iter().map(|b| b.as_ref()))
+                    .take(MAX_GATHER_SEGMENTS),
+            ) {
+                *slot = std::io::IoSlice::new(seg);
+                k += 1;
+            }
+            w.write_vectored(iov.get(..k).unwrap_or(&[])).await?
+        };
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "write zero",
             ));
         }
-        *flush_cursor += n;
         progress.note_write(n);
         let ok = pending_bytes.fetch_update(Ordering::Release, Ordering::Acquire, |cur| {
             cur.checked_sub(n)
@@ -1550,17 +1568,32 @@ async fn drain_writes<W: AsyncWrite + Unpin>(
         }
         capacity.notify_one();
 
-        if *flush_cursor >= buf.len() {
-            *current = None;
-            *flush_cursor = 0;
-            if out_q.is_empty() {
-                w.flush().await?;
-                capacity.notify_one();
-                return Ok(());
+        // Spend `n` across the head packet and any gathered followers.
+        let mut left = n;
+        loop {
+            let Some(head) = current.as_ref() else { break };
+            let remaining = head.len().saturating_sub(*flush_cursor);
+            if left < remaining {
+                *flush_cursor += left;
+                break;
             }
+            left -= remaining;
+            *current = out_q.pop_front();
+            *flush_cursor = 0;
+            if left == 0 {
+                break;
+            }
+        }
+        if current.is_none() && out_q.is_empty() {
+            w.flush().await?;
+            capacity.notify_one();
+            return Ok(());
         }
     }
 }
+
+/// Upper bound on `writev` segments per socket write.
+const MAX_GATHER_SEGMENTS: usize = 16;
 
 #[cfg(test)]
 mod tests {
