@@ -1,32 +1,34 @@
 # rewrite vs main：大流量传输 CPU / 内存开销评估
 
-- 日期: 2026-08-18
-- 对比: `origin/main` (`1c013cd`, S0+S1 已合入) vs `origin/russh-s2a-writer-task` (`5cb1f8a`, PR #3 S2–S8)
-- 环境: 4 vCPU / 16 GiB，loopback，`release` + `RUSTFLAGS=-Ctarget-cpu=native`，AES-256-GCM，window 4 MiB，maxpkt 32 KiB，`nodelay=true`，**关闭 volume rekey**（只量热路径）
-- 口径: 同一进程内 russh server + russh client；CPU 为 `CLOCK_PROCESS_CPUTIME_ID`（含两端加解密）；RSS 为进程 `VmRSS`。每个场景独立进程、warmup 8 MiB 后 3×1 GiB，取中位数。
+- 日期: 2026-08-18（第二轮复测）
+- 对比:
+  - `origin/main` `1c013cd`（S0+S1）
+  - rewrite 优化前 `5cb1f8a`（PR #3 当时 HEAD）
+  - rewrite 优化后 `a483cc2`（S9 P1–P6：acked credit window / seal reserve / gather fast path / writev）
+- 环境: 4 vCPU / 16 GiB，loopback，`release` + `RUSTFLAGS=-Ctarget-cpu=native`，AES-256-GCM，window 4 MiB，maxpkt 32 KiB，`nodelay=true`，**关闭 volume rekey**
+- 口径: 同一进程 russh server + russh client；CPU = `CLOCK_PROCESS_CPUTIME_ID`；RSS = `VmRSS`。每场景独立进程、warmup 8 MiB 后 3×1 GiB，取中位数。第二轮 main 与 `a483cc2` 同一会话连跑。
 
 ---
 
-## 结论（先看这个）
+## 结论（`a483cc2` vs `main`，同一会话）
 
-**内存：rewrite 不差，单连接峰值与 main 同量级，多 channel 下行甚至更省。** 长稳态由窗口/队列上界主导，不是任务数主导。PR #4 的 12.7h soak 也显示 RSS 升到约 52 MiB 后平台，无泄漏斜率。
+S9 优化**有效，但没有抹平 1ch 下行 Path B 对 main 的差距。**
 
-**CPU：rewrite 在「服务端往对端灌大流」这条 zfc 热路径上更贵。** loopback CPU-bound 时：
+| 场景 | main 吞吐 | rewrite `a483cc2` | vs 优化前 `5cb1f8a` | vs main CPU |
+|---|---:|---:|---:|---:|
+| 下行 1ch Path B（zfc） | 3054 MiB/s / **0.70** CPU·s/GiB | 1667 / **1.34** | CPU **−20%**，吞吐持平 | **+92%**（此前 +136%） |
+| 下行 1ch Path A | 1570 / 1.00 | 1683 / 1.37 | CPU −13%，吞吐 +4% | +37% |
+| 下行 8ch | 2821 / 0.83 | 2523 / 1.07 | CPU −17%，吞吐 **+24%** | +29% |
+| 上行 1ch | 3163 / 0.67 | 3117 / 0.74 | CPU −4%，吞吐 +4% | +12% |
+| 上行 8ch | 2932 / 1.00 | 3051 / 0.89 | CPU −10%，吞吐 +4% | **−11%**（rewrite 更省） |
 
-| 场景 | main 吞吐 | rewrite 吞吐 | main CPU·s/GiB | rewrite CPU·s/GiB | CPU 相对 main |
-|---|---:|---:|---:|---:|---:|
-| 下行 1ch `ChannelStream`（zfc Path B） | 2948 MiB/s | 1677 MiB/s | 0.713 | 1.682 | **+136%** |
-| 下行 1ch `Handle::data`（Path A） | 1566 MiB/s | 1625 MiB/s | 1.057 | 1.565 | **+48%** |
-| 下行 8ch × 128 MiB | 2931 MiB/s | 2039 MiB/s | 0.843 | 1.289 | **+53%** |
-| 上行 1ch `ChannelStream` | 2912 MiB/s | 3010 MiB/s | 0.658 | 0.771 | **+17%** |
-| 上行 8ch × 128 MiB | 2873 MiB/s | 2927 MiB/s | 1.021 | 0.985 | **−3.5%** |
+怎么读：
 
-要点：
-
-1. **回归集中在服务端推流（下行 Path B）。** rewrite 的 `ChannelStream` 不再快过 `Handle::data`（1677 ≈ 1625 MiB/s），而 main 上 Path B 几乎是 Path A 的 1.9 倍。这正好是代理场景 YouTube / speedtest 的方向。
-2. **上行（客户端推、ReaderTask 拆包）几乎打平。** +17% CPU，吞吐还略高。三任务拆分没有在解密路径上变成负担。
-3. **这不否定 PR #3 写的「P1 吞吐差 <1%」。** 那是对照 `e814204` 的 soak / 链路受限数字。10–100 MiB/s 的真机链路上，1.68 vs 0.71 CPU·s/GiB 只相当于 **0.07–0.17 核**，会被 RTT/窗口挡住，看不出。loopback 把 AES-GCM + 任务调度放到前台，才暴露出 Path B 的调度税。
-4. **内存不是这条 rewrite 的风险面。** 单连接握手后 RSS ~10–28 MiB；8 条 4 MiB 窗下行峰值 main 204 MiB vs rewrite 104 MiB（首 trial）。OS 线程两边都是 6（tokio 4 worker + sampler 等），多出来的 Reader/Writer/Session/Executor 是任务不是线程。
+1. **P1 credit window 打中了上次指出的 lockstep。** 每 channel 允许最多 K=8 包（256 KiB）未 ack，session 不再每 32 KiB 空转一轮。1ch 下行 CPU 从 1.68 降到 1.34；8ch 下行吞吐从 2039 拉到 2523（−11% vs main，此前 −30%）。
+2. **1ch Path B 吞吐几乎没动（1677 → 1667）。** lockstep 烧掉的是空转 CPU，不是墙钟。墙钟仍约 0.61 s/GiB（main 0.33 s）。CPU/wall 从 2.8 核降到 2.2 核，说明更闲了，但每字节有效功仍约 main 的 1.9 倍（1.34 / 0.70），所以吞吐仍是 main 的 ~55%。
+3. **上行已经可以视为打平**（1ch +12% CPU / 吞吐 −1.5%；8ch rewrite 还更省）。ReaderTask 不是问题。
+4. **内存仍不是风险。** 1ch 峰值 ~20 MiB vs main ~26 MiB。8ch 下行因填窗更快，峰值从 145 升到 209，靠近 main 的 240——这是优化成功的副作用，不是泄漏。
+5. **现网代理仍然感觉不到。** 1.34 CPU·s/GiB 在 100–500 Mbps 上是 0.016–0.078 核。差距只在 loopback / 高带宽 LAN 上变成吞吐墙。
 
 ---
 
@@ -47,51 +49,55 @@ CPU 分辨率：1 GiB × 3 trial，`clock_gettime(PROCESS_CPUTIME)` 纳秒级（
 
 ## 2. 原始中位数
 
-### main `1c013cd`
+### 第二轮（同一会话）main `1c013cd`
 
 | 场景 | MiB/s | CPU·s/GiB | 握手 RSS MiB | 峰值 RSS MiB |
 |---|---:|---:|---:|---:|
-| down_stream_1x1g | 2948.0 | 0.713 | 28.28 | 28.35 |
-| down_handle_1x1g | 1565.7 | 1.057 | 18.39 | 18.51 |
-| down_stream_8x128m | 2931.0 | 0.843 | 221.01¹ | 239.16¹ |
-| up_stream_1x1g | 2911.8 | 0.658 | 13.25 | 15.05 |
-| up_stream_8x128m | 2873.2 | 1.021 | 14.59 | 15.04 |
+| down_stream_1x1g | 3054.0 | 0.697 | 24.91 | 26.44 |
+| down_handle_1x1g | 1569.5 | 0.996 | 18.41 | 18.47 |
+| down_stream_8x128m | 2821.4 | 0.828 | 215.95 | 240.04 |
+| up_stream_1x1g | 3163.0 | 0.665 | 14.32 | 16.25 |
+| up_stream_8x128m | 2931.6 | 0.996 | 15.27 | 16.62 |
 
-¹ 8ch 下行握手 RSS 已被 50 ms 预填窗口污染；**首 trial** 更干净：hs 157.6 / peak 203.5。
-
-### rewrite `5cb1f8a`
+### 第二轮 rewrite `a483cc2`（S9 P1–P6）
 
 | 场景 | MiB/s | CPU·s/GiB | 握手 RSS MiB | 峰值 RSS MiB |
 |---|---:|---:|---:|---:|
-| down_stream_1x1g | 1676.9 | 1.682 | 19.54 | 19.54 |
-| down_handle_1x1g | 1624.8 | 1.565 | 21.64 | 21.64 |
-| down_stream_8x128m | 2038.9 | 1.289 | 144.98¹ | 145.05¹ |
-| up_stream_1x1g | 3010.3 | 0.771 | 19.38 | 19.43 |
-| up_stream_8x128m | 2926.7 | 0.985 | 17.66 | 22.34 |
+| down_stream_1x1g | 1667.1 | 1.339 | 19.88 | 19.88 |
+| down_handle_1x1g | 1683.4 | 1.368 | 20.50 | 20.50 |
+| down_stream_8x128m | 2522.8 | 1.068 | 209.16 | 209.20 |
+| up_stream_1x1g | 3117.0 | 0.743 | 18.66 | 20.04 |
+| up_stream_8x128m | 3051.2 | 0.886 | 18.08 | 21.62 |
 
-¹ 首 trial：hs 104.3 / peak 104.4。
+### 第一轮 rewrite `5cb1f8a`（对照，同机器不同会话）
+
+| 场景 | MiB/s | CPU·s/GiB | 峰值 RSS MiB |
+|---|---:|---:|---:|
+| down_stream_1x1g | 1676.9 | 1.682 | 19.54 |
+| down_handle_1x1g | 1624.8 | 1.565 | 21.64 |
+| down_stream_8x128m | 2038.9 | 1.289 | 145.05 |
+| up_stream_1x1g | 3010.3 | 0.771 | 19.43 |
+| up_stream_8x128m | 2926.7 | 0.985 | 22.34 |
+
+第一轮 main 与第二轮相差 <5%（down Path B 2948 vs 3054），机器噪声可接受。
 
 ---
 
-## 3. 为什么下行 Path B 变贵
+## 3. 热路径还差在哪
 
-main 的 `ChannelTx`（`channels/io/tx.rs`）是 **本地预扣 window + fire-and-forget 进 session mpsc**。`poll_write` 返回即入队；加密/写 socket 在**同一个** session `select!` 任务里做。Path B 因此能把 32 KiB 块直接灌进 loop，几乎不跟控制面 ping-pong。Path A（`Handle::data`）每块还要 `oneshot` ack，所以 main 上 Path A 已经慢一截（1566 vs 2948）。
+main Path B：本地预扣 window，fire-and-forget 进 **同一个** session 任务加密。可以把窗口（4 MiB）都堆在 loop 里。
 
-rewrite 的 server `ChannelTx` 打开了 `use_acked`：
+`5cb1f8a` rewrite Path B：`use_acked` + 共享 `Notify`，每 32 KiB 一次 producer → Session → Writer → producer。Session 无法 batch，Writer 永远只有 1 包。
 
-- `start_acked_send` 每包 `Bytes::copy_from_slice` + `oneshot`
-- `poll_write` 在 `acked_waiting` 上停，等 Session 侧 `window_size` notify
-- SessionTask `dispatch_msg(ChannelDataAcked)` → `data()` → WriterTask `try_seal_payload` → 再 ack/wake
+`a483cc2`（S9 P1）：每 channel 最多 K=`clamp(256KiB/maxpkt, 1, 8)` 个未 ack 包，每个包自己的 oneshot。P4 整包 reserve 少两次 memcpy；P5 单 chunk 聚包快路径；P6 `writev` 一次吐多包。这解释了 **CPU −20% 和 8ch 吞吐 +24%**。
 
-热路径从「1 个任务内加密」变成 **producer → SessionTask → WriterTask** 两跳，外加每 32 KiB 一次 ack 唤醒。结果是 Path B 退化成和 Path A 一类的开销（1677 ≈ 1625），相对 main Path B 多出约 **1.0 CPU·s/GiB**。
+1ch 下行吞吐仍卡住，是因为 K=8 只允许超前 256 KiB，而 main 可以超前整个 peer window。跨任务两跳（SessionTask 仍在数据面）和每包 ack 对象还在。剩下的 0.64 CPU·s/GiB 差额主要是：
 
-其余固定税（相对 AES-GCM 本体都是小头，但叠在 Path B 上）：
+- 数据面仍经 SessionTask，不是 producer → Writer
+- 每包 oneshot + `Bytes::copy_from_slice`
+- 三任务调度 / 公平 1-packet 轮转相对 main 单 loop gather
 
-- 每连接 4 个任务（Reader / Writer / Session / HandlerExecutor）+ Supervisor 定时器
-- 出站 1-packet ready-set 轮转（公平，但 loopback 上不如 main 的 gather/批量 flush）
-- GlobalBudget / lane occupancy 原子账本（默认 4 TiB 预算，热路径是原子加减，不是分配）
-
-上行不走这条 ack 链：client 仍是单 loop 加密，server 只是 Reader 解密 → inbound lane `Bytes`（payload 零拷贝切片）→ app 读。所以 CPU 只 +17%。
+上行不走这条链，所以已经打平。
 
 ---
 
@@ -112,7 +118,7 @@ core 接管 ≤ Σ_chan(w_in + out_cap) + ctrl/kex 队列预算 + staging + 半�
 | 全局 | 无 | `GlobalBudget` 默认 4 TiB / 4096 连接（部署要自己收紧） |
 | rekey 暂存 | `pending_data` 在 `kex.active()` 时无限堆（事故源） | KEX 停 seal bulk；deadline 30s 拆连 |
 
-实测与公式一致：**大流量峰值由 window×channel×两端 决定，不由任务拓扑决定。** 1ch 下行 ~20–28 MiB；8×4 MiB 窗可以把进程顶到一两百 MiB。rewrite 多 channel 下行更低，一部分是 Path B 更慢、50 ms 预填窗口填不满，一部分是 lane 不再另做 16 MB 级 Scheme C 缓冲。
+实测与公式一致：**大流量峰值由 window×channel×两端 决定，不由任务拓扑决定。** 1ch 下行 ~20–28 MiB。8ch 下行在 `a483cc2` 填窗更快后峰值从 145 升到 209 MiB，靠近 main 的 240——窗口被填满了，不是泄漏。
 
 长期：PR #3 2h soak RSS 斜率 0.66 MiB/h；PR #4 12.7h russh server 8.2→51.7 MiB 后平台。这是泄漏/碎片，不是每 GiB 线性涨。
 
@@ -124,18 +130,18 @@ core 接管 ≤ Σ_chan(w_in + out_cap) + ctrl/kex 队列预算 + staging + 半�
 
 粗算（只用下行 Path B CPU·s/GiB）：
 
-| 链路 | main 核占用 | rewrite 核占用 | 差额 |
+| 链路 | main 核占用 | rewrite `a483cc2` | 差额 |
 |---|---:|---:|---:|
-| 100 Mbps ≈ 12 MiB/s | 0.008 | 0.020 | 0.012 核 |
-| 500 Mbps ≈ 60 MiB/s | 0.042 | 0.098 | 0.056 核 |
-| 1 Gbps ≈ 119 MiB/s | 0.083 | 0.195 | 0.11 核 |
-| loopback 3 GiB/s | 把 4 核打满前 main 先到 ~2.9 GiB/s，rewrite ~1.7 GiB/s | | **吞吐墙** |
+| 100 Mbps ≈ 12 MiB/s | 0.008 | 0.016 | 0.008 核 |
+| 500 Mbps ≈ 60 MiB/s | 0.041 | 0.078 | 0.037 核 |
+| 1 Gbps ≈ 119 MiB/s | 0.081 | 0.156 | 0.075 核 |
+| loopback | main ~3.0 GiB/s，rewrite 1ch ~1.7 / 8ch ~2.5 | | **1ch 仍是墙；8ch 已接近** |
 
 所以：
 
-- **现网代理：CPU 开销可忽略，内存更可预期。** rewrite 的价值是 rekey/反压/拆连有界，不是打满万兆。
-- **本机/LAN/测速环回：Path B 会先碰到 CPU 墙，吞吐少约 40%。** 若 zfc 要在高带宽 localhost 或同机 relay 上跑满，需要给 Path B 一条「入队即返回、窗口预扣」的快路径，接近 main 的 unacked `ChannelTx`。
-- **不要用 Handle::data 灌大流。** 两边都比 Stream 贵；rewrite 上两者已经一样慢。
+- **现网代理：CPU 开销可忽略。** S9 之后差额更小。
+- **本机/LAN：1ch Path B 仍少约 45% 吞吐；8 条大流已经只少 ~11%。** 代理多 `direct-tcpip` 时，S9 的收益比单流测速更明显。
+- **不要用 Handle::data 灌大流。** rewrite 上 Path A/B 仍然差不多；main 上 Path B 才是快路径。
 
 ---
 
@@ -149,13 +155,12 @@ core 接管 ≤ Σ_chan(w_in + out_cap) + ctrl/kex 队列预算 + staging + 半�
 
 ---
 
-## 7. 建议（若要压 CPU）
+## 7. 建议（若还要压 1ch Path B）
 
-按收益排序，都不否定 G1–G4：
+S9 P1/P4/P5/P6 已经把 lockstep、多余 memcpy、writev 收掉。下一档才是逼近 main 的 0.70 CPU·s/GiB：
 
-1. **Path B 快路径：** server `ChannelTx` 在 Confirmed 且 Writer 有容量时，允许 unacked 入队（本地预扣 window，像 main），ack 只用于 Handle::data / 反压饱和。这是 1.68→~0.7 CPU·s/GiB 的主要杠杆。
-2. **跨任务 gather：** Writer 已经有 1-packet 轮转；loopback 上连续 seal 多包再 `write` 能少几次任务切换（公平调度仍可按 quantum 切）。
-3. **少一次 `Bytes::copy_from_slice`：** `poll_write` 的 `&[u8]` 来自 `vec![FILL;32K]`，可以让 `AsyncWrite` 上层直接交 `Bytes`。
-4. 部署侧：`global_byte_budget` / `max_connections` 收紧到真实主机；默认 4 TiB 只是「测试不被误杀」，不是 DoS 上界。
+1. **数据面旁路 SessionTask：** Confirmed channel 的 DATA 从 ChannelTx 直接进 Writer 出站车道（窗口仍由 Writer 权威记账）。ack/反压留给 Handle::data 和饱和情况。K=8 不够吃满 4 MiB 窗。
+2. 或把 K 从 256 KiB 提到与 `channel_out_cap` / peer window 同阶——内存上界仍在 G4 里，但 1ch 可以超前得像 main。
+3. `poll_write(&[u8])` 仍 `Bytes::copy_from_slice`；上层交 `Bytes` 能再削一刀。
 
-非目标：为了 CPU 把 Reader/Writer 再并回单 loop——那正是这次 rewrite 要拆掉的死锁面。
+非目标：为了 CPU 把 Reader/Writer 并回单 loop。
