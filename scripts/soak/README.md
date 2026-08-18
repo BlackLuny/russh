@@ -26,10 +26,19 @@ the env var to change it). Without that, overflow / over-window warns
 are silent and a stall cannot be classified. See
 `soak-results/CHANNEL_CLOSE.md`.
 
-Short freeze-catchup against a russh server only:
+Short freeze-catchup against a russh server only. The script now **exits
+non-zero** unless `judge_repro.py` sees no overflow warn, no mid-run
+channel drop, SIGSTOP-shaped jsonl gaps only, and soak-class catch-up:
 
 ```bash
-# unlimited catch-up (soak-class burst), 15s SIGSTOP, 3 channels
+# one unlimited 15s freeze, 3 channels
 DOWN=1 UP=1 ECHO=1 RATE_BPS=0 FREEZE_SECS=15 SECONDS_RUN=45 \
   ./scripts/soak/repro_upload_close.sh
+
+# five independent sessions
+N=5 LABEL=freeze15 ./scripts/soak/repeat_repro.sh
+
+# three freezes on one connection
+DOWN=1 UP=1 ECHO=1 RATE_BPS=0 FREEZE_SECS=15 FREEZE_CYCLES=3 \
+  FREEZE_GAP=8 SECONDS_RUN=100 ./scripts/soak/repro_upload_close.sh
 ```
