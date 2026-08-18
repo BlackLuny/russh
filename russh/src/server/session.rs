@@ -2017,7 +2017,16 @@ impl Session {
                     .as_ref()
                     .map(|r| r.occupancy_bytes(id))
                     .unwrap_or(0);
-                tokio::task::yield_now().await;
+                if let Some(ref mid) = self.common.config.torn_grant_mid {
+                    mid.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if let Some(ref hold) = self.common.config.torn_grant_hold {
+                    while hold.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                } else {
+                    tokio::task::yield_now().await;
+                }
                 let rem = self
                     .reader
                     .as_ref()
@@ -2195,6 +2204,12 @@ impl Session {
     /// One-lock occupancy + remaining. The two-lock invert lives in
     /// `maybe_grant_after_delivery` (must not be an `async fn(&self)` —
     /// `Session` is `!Sync`, and a `&self` future would make `run` `!Send`).
+    ///
+    /// No live lane → fall back to `enc.sender_window_size` (the encrypted
+    /// mirror), not 0. Remaining=0 would compute a full-ceiling Δ; expand
+    /// then returns `NoLane` and the caller refunds global credit. The
+    /// mirror path yields Δ=0 and skips both emit and the refund dance.
+    /// Neither emits WINDOW_ADJUST nor leaks credit.
     fn snapshot_grant_plan(&self, id: ChannelId) -> (usize, u32) {
         let fallback_remaining = self
             .common
@@ -9313,6 +9328,113 @@ mod tests {
         assert_eq!(
             got, target,
             "Q8 HARD: omit-lane invert class is lane_omitted (got {got}, target {target})"
+        );
+    }
+
+    /// Production: occupancy+remaining from one lock. 80 queued / 20 remaining
+    /// is half-full so Δ=0; the invariant holds.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test]
+    async fn window_grant_atomic_reads_keep_invariant() {
+        use crate::server::inbound_lane::LaneItem;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let target = 100u32;
+        let queued = 80usize;
+        let mut cfg = crate::server::Config::default();
+        cfg.grant_target_override = Some(Arc::new(AtomicU32::new(target)));
+        let mut session = authenticated_session_with(cfg);
+        session.target_window_size = target;
+        let id = insert_encrypted_channel(&mut session, target);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
+        let lanes = attach_lane(&mut session, id, target, vec![]);
+        assert_eq!(
+            lanes.lock().unwrap().ingest(
+                id,
+                LaneItem::Data(bytes::Bytes::from(vec![0u8; queued]))
+            ),
+            crate::server::inbound_lane::LanePush::Accepted
+        );
+
+        let mut handler = TestHandler;
+        session
+            .maybe_grant_after_delivery(id, Some(&mut handler))
+            .await
+            .expect("grant");
+
+        let (occ, rem) = session.reader.as_ref().unwrap().grant_plan(id).unwrap();
+        assert_eq!(occ, queued);
+        assert_eq!(rem, target - queued as u32);
+        assert!(
+            occ as u32 + rem <= target,
+            "production grant_plan must keep occ+remaining ≤ target (occ={occ} rem={rem})"
+        );
+    }
+
+    /// Invert: two-lock read with ingest N=20 between them over-grants.
+    /// Must-red on the invariant, not on Overflow.
+    #[cfg(feature = "_test_hooks")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_grant_torn_reads_is_red() {
+        use crate::server::inbound_lane::LaneItem;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let target = 100u32;
+        let queued = 80usize;
+        let raced = 20usize;
+        let hold = Arc::new(AtomicBool::new(true));
+        let mid = Arc::new(AtomicBool::new(false));
+        let mut cfg = crate::server::Config::default();
+        cfg.invert_torn_grant_reads = true;
+        cfg.torn_grant_hold = Some(hold.clone());
+        cfg.torn_grant_mid = Some(mid.clone());
+        cfg.grant_target_override = Some(Arc::new(AtomicU32::new(target)));
+        let mut session = authenticated_session_with(cfg);
+        session.target_window_size = target;
+        let id = insert_encrypted_channel(&mut session, target);
+        let (_tx, _rx) = insert_test_channel(&mut session, id, 1);
+        let lanes = attach_lane(&mut session, id, target, vec![]);
+        assert_eq!(
+            lanes.lock().unwrap().ingest(
+                id,
+                LaneItem::Data(bytes::Bytes::from(vec![0u8; queued]))
+            ),
+            crate::server::inbound_lane::LanePush::Accepted
+        );
+
+        let lanes_feed = lanes.clone();
+        let mid_c = mid.clone();
+        let hold_c = hold.clone();
+        let feeder = tokio::spawn(async move {
+            while !mid_c.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let mut g = lanes_feed.lock().unwrap();
+            assert_eq!(
+                g.ingest(
+                    id,
+                    LaneItem::Data(bytes::Bytes::from(vec![0u8; raced]))
+                ),
+                crate::server::inbound_lane::LanePush::Accepted
+            );
+            hold_c.store(false, Ordering::SeqCst);
+        });
+
+        let mut handler = TestHandler;
+        session
+            .maybe_grant_after_delivery(id, Some(&mut handler))
+            .await
+            .expect("grant");
+        feeder.await.expect("feeder");
+
+        let (occ, rem) = session.reader.as_ref().unwrap().grant_plan(id).unwrap();
+        assert_eq!(occ, queued + raced, "feeder must have ingested N=20");
+        assert!(
+            occ as u32 + rem > target,
+            "HARD: torn grant must break occ+remaining ≤ target \
+             (occ={occ} rem={rem} target={target})"
         );
     }
 

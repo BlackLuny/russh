@@ -138,7 +138,7 @@ async def pump_down(
 
 
 async def pump_up(
-    host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int, io_timeout: float
+    host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int, _io_timeout: float
 ) -> None:
     c.channels_opened += 1
     c.channels_live += 1

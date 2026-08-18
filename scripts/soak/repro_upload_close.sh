@@ -20,6 +20,8 @@ ECHO_PORT="${ECHO_PORT:-10000}"
 LISTEN="${LISTEN:-127.0.0.1:2222}"
 CONTROL="${CONTROL:-127.0.0.1:18080}"
 SSH_VERBOSE="${SSH_VERBOSE:-0}"
+REKEY_LIMIT="${REKEY_LIMIT:-64M}"
+MIN_REKEY_TRIGGERS="${MIN_REKEY_TRIGGERS:-0}"
 export PATH="/usr/sbin:/usr/bin:/usr/local/cargo/bin:$PATH"
 
 EXPECTED_LIVE=$((DOWN + UP + ECHO))
@@ -109,7 +111,7 @@ ssh "${SSH_V[@]}" \
   -o PreferredAuthentications=publickey \
   -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 \
-  -o RekeyLimit=64M \
+  -o RekeyLimit="$REKEY_LIMIT" \
   -o IPQoS=throughput \
   -N -p "${LISTEN##*:}" -l s8 \
   -L 127.0.0.1:${DOWN_PORT}:source:1 \
@@ -185,6 +187,8 @@ JUDGE_ARGS=(
   --freeze-secs "$FREEZE_SECS"
   --freeze-cycles "$FREEZE_CYCLES"
   --min-peak-out-bps "$MIN_PEAK_OUT_BPS"
+  --control-json "$WD/control.json"
+  --min-rekey-triggers "$MIN_REKEY_TRIGGERS"
   --out "$WD/judge.json"
 )
 if [[ "${JUDGE:-1}" != "0" ]]; then

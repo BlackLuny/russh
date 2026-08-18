@@ -19,6 +19,7 @@ WARN_RE = re.compile(
     r"overflow|StopDiscard|exceeds remaining|SESSION_ERROR",
     re.IGNORECASE,
 )
+READY_RE = re.compile(r"^S8_(LISTEN|CONTROL|READY)\b")
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -43,6 +44,15 @@ def warn_hits(log: Path) -> list[str]:
     return hits
 
 
+def has_ready_line(log: Path) -> bool:
+    if not log.is_file():
+        return False
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        if READY_RE.search(line.strip()):
+            return True
+    return False
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--jsonl", required=True)
@@ -53,6 +63,14 @@ def main() -> int:
     p.add_argument("--gap-floor", type=float, default=2.5)
     p.add_argument("--min-peak-out-bps", type=float, default=80e6)
     p.add_argument("--min-peak-in-bps", type=float, default=0)
+    p.add_argument(
+        "--max-crawl-secs",
+        type=float,
+        default=5.0,
+        help="fail if 1s-class samples stay under 1 MB/s for this long (more_lanes lock)",
+    )
+    p.add_argument("--min-rekey-triggers", type=int, default=0)
+    p.add_argument("--control-json", default="")
     p.add_argument("--out", default="")
     args = p.parse_args()
 
@@ -108,6 +126,34 @@ def main() -> int:
                 if ri > peak_in:
                     peak_in, peak_in_t = ri, (a["t"], b["t"])
 
+        # more_lanes continue does not skip the 1s stats loop — it crawls.
+        if args.max_crawl_secs > 0:
+            crawl_t0 = None
+            crawl_spans = []
+            for a, b in zip(rows, rows[1:]):
+                dt = float(b["t"]) - float(a["t"])
+                if dt >= args.gap_floor:
+                    crawl_t0 = None
+                    continue
+                progress = (int(b["bytes_out"]) - int(a["bytes_out"])) + (
+                    int(b["bytes_in"]) - int(a["bytes_in"])
+                )
+                rate = progress / dt if dt else 0.0
+                if rate < 1e6:
+                    if crawl_t0 is None:
+                        crawl_t0 = float(a["t"])
+                    if float(b["t"]) - crawl_t0 >= args.max_crawl_secs:
+                        crawl_spans.append(
+                            {"t0": crawl_t0, "t1": b["t"], "dt": round(float(b["t"]) - crawl_t0, 3)}
+                        )
+                        crawl_t0 = None
+                else:
+                    crawl_t0 = None
+            if crawl_spans:
+                fails.append(
+                    f"progress crawl <1 MB/s for ≥{args.max_crawl_secs}s (more_lanes-class): {crawl_spans}"
+                )
+
         want_gaps = args.freeze_cycles if args.freeze_secs > 0 else 0
         if want_gaps:
             lo = max(args.freeze_secs - 1.0, args.gap_floor)
@@ -153,6 +199,31 @@ def main() -> int:
     hits = warn_hits(Path(args.s8_log))
     if hits:
         fails.append("s8 warn/error:\n  " + "\n  ".join(hits[:20]))
+    if not has_ready_line(Path(args.s8_log)):
+        fails.append(
+            "s8 log has no S8_LISTEN/S8_CONTROL/S8_READY line "
+            "(RUST_LOG unset or server never started — overflow warns would also be silent)"
+        )
+
+    rekey_triggers = None
+    if args.control_json:
+        cp = Path(args.control_json)
+        if cp.is_file():
+            try:
+                ctl = json.loads(cp.read_text(encoding="utf-8"))
+                rekey_triggers = int(ctl.get("rekey_triggers") or 0)
+            except json.JSONDecodeError:
+                fails.append(f"control json not parseable: {cp}")
+        else:
+            fails.append(f"missing control json: {cp}")
+        if (
+            args.min_rekey_triggers
+            and rekey_triggers is not None
+            and rekey_triggers < args.min_rekey_triggers
+        ):
+            fails.append(
+                f"rekey_triggers={rekey_triggers} < {args.min_rekey_triggers}"
+            )
 
     last = rows[-1] if rows else {}
     report = {
@@ -170,6 +241,7 @@ def main() -> int:
         "peak_in_bps": peak_in,
         "peak_out_t": peak_out_t,
         "peak_in_t": peak_in_t,
+        "rekey_triggers": rekey_triggers,
         "fails": fails,
     }
     text = json.dumps(report, indent=2)
