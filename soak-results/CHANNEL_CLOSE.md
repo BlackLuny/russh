@@ -93,13 +93,12 @@ Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
 - Integration: Q5 inject still Overflows (`overflows=1`); Q5-wire over-window is
   ignored (`occupancy=64`, `overflows=0`, `over_window_drops=2`).
   `window_grant_is_lane_only` / omit-lane red / G7 still pass.
-- Live, **unlimited** OpenSSH freeze-catchup (`RATE_BPS=0`, `DOWN=UP=ECHO=1`,
-  `FREEZE_SECS=15`, `SECONDS_RUN=45`, `RUST_LOG=russh=warn`):
-  - jsonl gap `t=4.029` → `t=19.963` (15.9s SIGSTOP), `channels_live=3`
-  - after CONT, 1s samples with no extra stall; peak `bytes_out` **794.5 MB/s**
-    (soak-class catch-up, not 8 MiB/s)
-  - `io_errors=0`, min `channels_live=3` until orderly teardown
-  - s8 log: no `inbound lane overflow`, no over-window warn, `disconnects=0`
-  - ~22.4 GiB uploaded in 45s. This shows the loop does not `continue`-starve
-    through a 400+ MB/s flood. It does **not** prove a 12.7h close cannot
-    recur; it is the first log taken with overflow warns actually enabled.
+- Live, **unlimited** OpenSSH freeze-catchup with `RUST_LOG=russh=warn`
+  and a pass/fail judge (`soak-results/REPEAT_VERIFY.md`):
+  - 15s freeze × 5 independent 3-channel sessions: **5/5**, peaks 769–800 MB/s
+  - 3×15s freeze on **one** connection: 3 SIGSTOP gaps only, peak 913 MB/s
+  - upload-only (the 12.7h victim) × 3: **3/3**, peaks 886–967 MB/s
+  - 30s freeze × 2 (after fixing traffic.py `wait_for` vs SIGSTOP): **2/2**
+  - 180s continuous unlimited: 156.5 GiB, peak 933 MB/s, **no jsonl gaps**
+  - 12 judged passes; no `inbound lane overflow` / over-window warn
+
