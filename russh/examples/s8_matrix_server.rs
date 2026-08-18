@@ -127,7 +127,7 @@ struct Stats {
 impl Stats {
     fn json(&self) -> String {
         format!(
-            "{{\"ok\":true,\"sessions\":{},\"channels\":{},\"bytes_in\":{},\"bytes_out\":{},\"auth_ok\":{},\"auth_fail\":{},\"disconnects\":{},\"rekey_triggers\":{},\"rekey_merges\":{},\"rekey_idle_drops\":{}}}",
+            "{{\"ok\":true,\"sessions\":{},\"channels\":{},\"bytes_in\":{},\"bytes_out\":{},\"auth_ok\":{},\"auth_fail\":{},\"disconnects\":{},\"rekey_triggers\":{},\"rekey_merges\":{},\"rekey_idle_drops\":{},\"rekey_begins\":{},\"rekey_peer_starts\":{},\"rekey_completes\":{}}}",
             self.sessions.load(Ordering::SeqCst),
             self.channels.load(Ordering::SeqCst),
             self.bytes_in.load(Ordering::SeqCst),
@@ -138,6 +138,9 @@ impl Stats {
             self.i6.triggers(),
             self.i6.merges(),
             self.i6.idle_drops(),
+            self.i6.begins(),
+            self.i6.peer_starts(),
+            self.i6.completes(),
         )
     }
 }

@@ -196,3 +196,9 @@ required-features = ["_test_hooks"]
 name = "s8_matrix_server"
 path = "examples/s8_matrix_server.rs"
 required-features = ["s8_fixture"]
+
+# 24h soak client (public client API only). Pairs with s8_matrix_server
+# or a real OpenSSH sshd via direct-tcpip.
+[[example]]
+name = "soak_client"
+path = "examples/soak_client.rs"

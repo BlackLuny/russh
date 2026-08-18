@@ -1,0 +1,35 @@
+{
+  "ok": false,
+  "samples": 25,
+  "t0": 1.009,
+  "tN": 55.114,
+  "bytes_in": 1336229832,
+  "bytes_out": 18058183632,
+  "min_live": 2,
+  "max_io_errors": 1,
+  "max_verify_errors": 0,
+  "gaps": [
+    {
+      "t0": 4.029,
+      "t1": 34.963,
+      "dt": 30.934,
+      "d_out": 672474432,
+      "d_in": 49456448,
+      "live": 3
+    }
+  ],
+  "peak_out_bps": 746823761.4314114,
+  "peak_in_bps": 53466994.05940605,
+  "peak_out_t": [
+    54.108,
+    55.114
+  ],
+  "peak_in_t": [
+    47.051,
+    48.061
+  ],
+  "fails": [
+    "channels_live dropped to 2 (want 3)",
+    "io_errors=1 during the run"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "ok": true,
+  "samples": 25,
+  "t0": 1.001,
+  "tN": 25.018,
+  "bytes_in": 0,
+  "bytes_out": 14219313152,
+  "min_live": 1,
+  "max_io_errors": 0,
+  "max_verify_errors": 0,
+  "gaps": [],
+  "peak_out_bps": 584843264.0,
+  "peak_in_bps": 0.0,
+  "peak_out_t": [
+    1.001,
+    2.001
+  ],
+  "peak_in_t": null,
+  "rekey_triggers": 0,
+  "rekey_completes": 1749,
+  "rekey_begins": 1749,
+  "rekey_peer_starts": 1749,
+  "fails": []
+}

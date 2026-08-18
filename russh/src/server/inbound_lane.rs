@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use log::warn;
 use tokio::sync::Notify;
 
 use crate::ChannelId;
@@ -57,6 +58,10 @@ pub enum LanePush {
     Accepted,
     DroppedZero,
     DroppedDup,
+    /// DATA/EXT exceeded `window_remaining`. Ignored per RFC 4254 §5.2
+    /// instead of occupying the DoS cap (which would Overflow-close a
+    /// slightly over-window peer such as OpenSSH with in-flight packets).
+    DroppedOverWindow,
     /// No lane (channel not opened). Caller counts `unknown_drops`.
     NoLane,
     Overflow,
@@ -104,6 +109,10 @@ pub struct ChannelLane {
     /// Peer-open: true at insert. Server-open: false until
     /// `CHANNEL_OPEN_CONFIRMATION` (`LaneTable::confirm`).
     confirmed: bool,
+    /// One warn per lane for over-window DATA (flood-safe).
+    warned_over_window: bool,
+    /// One warn per lane for occupancy Overflow (flood-safe).
+    warned_overflow: bool,
 }
 
 impl ChannelLane {
@@ -134,6 +143,8 @@ impl ChannelLane {
             close_queued: false,
             data_items: 0,
             confirmed,
+            warned_over_window: false,
+            warned_overflow: false,
         }
     }
 
@@ -161,7 +172,8 @@ impl ChannelLane {
     }
 
     /// I1: bytes are off the wire. Extra data past the advertised window
-    /// is ignored (RFC 4254 §5.2) — occupancy Overflow is a different gate.
+    /// is not deducted here; [`LaneTable::ingest`] zeros remaining when
+    /// dropping an over-window packet so the ledger does not stay open.
     fn consume_window(&mut self, len: usize) {
         let n = len as u32;
         if n <= self.window_remaining {
@@ -370,7 +382,105 @@ impl LaneTable {
         let Some(lane) = self.lanes.get_mut(&id) else {
             return LanePush::NoLane;
         };
-        lane.try_push(item)
+        let add = item.byte_len();
+        let occ = lane.bytes;
+        let cap = lane.byte_cap;
+        let cnt = lane.items.len();
+        let ccap = lane.count_cap;
+        let win = lane.window_remaining;
+        let ctrl = lane.ctrl_bytes;
+        let r = lane.try_push(item);
+        if r == LanePush::Overflow {
+            if !lane.warned_overflow {
+                lane.warned_overflow = true;
+                let why = if cnt >= ccap {
+                    "count_cap"
+                } else if occ.saturating_add(add) > cap {
+                    "byte_cap"
+                } else {
+                    "ctrl_cap"
+                };
+                warn!(
+                    "inbound lane overflow id={id:?} why={why} add={add} occ_bytes={occ}/{cap} occ_count={cnt}/{ccap} window_remaining={win} ctrl_bytes={ctrl}"
+                );
+            }
+        }
+        r
+    }
+
+    /// Occupancy bytes and inbound-window remaining under **one** lock.
+    ///
+    /// `maybe_grant_after_delivery` must not read these on two separate
+    /// `Mutex` acquisitions: Reader can ingest between them and a stale
+    /// occupancy + fresh remaining over-grants by the raced amount N.
+    /// Then `lane_bytes + window_remaining = target + N`, and N > maxpkt
+    /// Overflows a compliant peer.
+    pub fn grant_plan(&self, id: ChannelId) -> Option<(usize, u32)> {
+        self.lanes
+            .get(&id)
+            .map(|l| (l.bytes, l.window_remaining))
+    }
+
+    /// `WINDOW_ADJUST` Δ from a single grant-plan snapshot.
+    pub fn grant_delta(target: u32, undelivered: u32, remaining: u32) -> u32 {
+        let ceiling = target.saturating_sub(undelivered);
+        if remaining >= ceiling / 2 {
+            return 0;
+        }
+        ceiling.saturating_sub(remaining)
+    }
+
+    /// Reader ingest: consume the inbound window, then queue.
+    ///
+    /// DATA/EXT that exceeds `window_remaining` is ignored (RFC 4254 §5.2)
+    /// and is not queued. This is hardening against a window-ignoring peer,
+    /// not the proven soak close path (that is Session `more_lanes` starving
+    /// select, plus a torn occupancy/remaining grant read). Occupancy
+    /// Overflow remains the DoS gate for inject / accounting bugs.
+    ///
+    /// On drop, `window_remaining` is cleared so the ledger does not keep
+    /// advertising credit the peer already spent.
+    pub fn ingest(&mut self, id: ChannelId, item: LaneItem) -> LanePush {
+        match &item {
+            LaneItem::Data(d) => {
+                let n = d.len();
+                let Some(lane) = self.lanes.get_mut(&id) else {
+                    return LanePush::NoLane;
+                };
+                if (n as u32) > lane.window_remaining {
+                    if !lane.warned_over_window {
+                        lane.warned_over_window = true;
+                        warn!(
+                            "inbound DATA exceeds remaining window id={id:?} len={n} remaining={} (ignored, remaining cleared)",
+                            lane.window_remaining
+                        );
+                    }
+                    lane.window_remaining = 0;
+                    return LanePush::DroppedOverWindow;
+                }
+                lane.consume_window(n);
+            }
+            LaneItem::ExtendedData { data, .. } => {
+                let n = data.len();
+                let Some(lane) = self.lanes.get_mut(&id) else {
+                    return LanePush::NoLane;
+                };
+                if (n as u32) > lane.window_remaining {
+                    if !lane.warned_over_window {
+                        lane.warned_over_window = true;
+                        warn!(
+                            "inbound EXTDATA exceeds remaining window id={id:?} len={n} remaining={} (ignored, remaining cleared)",
+                            lane.window_remaining
+                        );
+                    }
+                    lane.window_remaining = 0;
+                    return LanePush::DroppedOverWindow;
+                }
+                lane.consume_window(n);
+            }
+            _ => {}
+        }
+        self.try_push(id, item)
     }
 
     pub fn pop_any(&mut self) -> Option<(ChannelId, LaneItem)> {
@@ -644,6 +754,7 @@ pub struct LaneObserveSlot {
     dup_drops: AtomicU64,
     unknown_drops: AtomicU64,
     overflows: AtomicU64,
+    over_window_drops: AtomicU64,
     close_dropped: AtomicU64,
     last_bytes: std::sync::atomic::AtomicUsize,
     last_count: std::sync::atomic::AtomicUsize,
@@ -677,6 +788,9 @@ impl LaneObserveSlot {
     pub fn note_overflow(&self) {
         self.overflows.fetch_add(1, Ordering::SeqCst);
     }
+    pub fn note_over_window(&self) {
+        self.over_window_drops.fetch_add(1, Ordering::SeqCst);
+    }
     pub fn note_close_dropped(&self) {
         self.close_dropped.fetch_add(1, Ordering::SeqCst);
     }
@@ -691,6 +805,9 @@ impl LaneObserveSlot {
     }
     pub fn overflows(&self) -> u64 {
         self.overflows.load(Ordering::SeqCst)
+    }
+    pub fn over_window_drops(&self) -> u64 {
+        self.over_window_drops.load(Ordering::SeqCst)
     }
     pub fn close_dropped(&self) -> u64 {
         self.close_dropped.load(Ordering::SeqCst)
@@ -995,5 +1112,89 @@ mod tests {
         // Data bound is still byte_cap = 2 KiB; the floor does not leak.
         let data = LaneItem::Data(Bytes::from(vec![0u8; 4 * 1024]));
         assert_eq!(t.try_push(id, data), LanePush::Overflow);
+    }
+
+    /// Over-window DATA must not be queued (RFC 4254 §5.2 hardening).
+    /// Remaining is cleared on drop so the ledger does not stay open.
+    /// Direct `try_push` (Q5 inject) is still the byte_cap DoS gate.
+    #[test]
+    fn over_window_data_is_ignored_not_queued() {
+        let mut t = LaneTable::new(8, 32);
+        let id = ChannelId(1);
+        t.open(id, 0, 100, 50, true);
+
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 90]))),
+            LanePush::Accepted
+        );
+        assert_eq!(t.window_remaining(id), Some(10));
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 50]))),
+            LanePush::DroppedOverWindow
+        );
+        assert_eq!(
+            t.window_remaining(id),
+            Some(0),
+            "over-window drop must clear remaining so the ledger does not stay open"
+        );
+        assert_eq!(t.occupancy_bytes(id), 90);
+        assert_eq!(t.occupancy_count(id), 1);
+
+        t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 1]))); // still over, remaining already 0
+        assert_eq!(t.window_remaining(id), Some(0));
+
+        t.open(ChannelId(2), 0, 100, 50, true);
+        let id = ChannelId(2);
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 100]))),
+            LanePush::Accepted
+        );
+
+        // Direct try_push (Q5 inject, no ingest) still Overflows at the cap.
+        assert_eq!(
+            t.try_push(id, LaneItem::Data(Bytes::from(vec![0u8; 51]))),
+            LanePush::Overflow
+        );
+    }
+
+    /// A torn occupancy/remaining pair over-grants by the raced ingest N.
+    /// A single-lock `grant_plan` keeps `occ + remaining + delta ≤ target`.
+    #[test]
+    fn grant_plan_is_atomic_against_ingest() {
+        let mut t = LaneTable::new(8, 32);
+        let id = ChannelId(1);
+        let target = 100u32;
+        t.open(id, 0, target, 20, true);
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 80]))),
+            LanePush::Accepted
+        );
+
+        let (occ_before, rem_before) = t.grant_plan(id).unwrap();
+        assert_eq!(occ_before, 80);
+        assert_eq!(rem_before, 20);
+        let delta_before = LaneTable::grant_delta(target, occ_before as u32, rem_before);
+        assert_eq!(delta_before, 0, "half-full remaining must not grant");
+
+        assert_eq!(
+            t.ingest(id, LaneItem::Data(Bytes::from(vec![0u8; 20]))),
+            LanePush::Accepted
+        );
+        let (occ_after, rem_after) = t.grant_plan(id).unwrap();
+        assert_eq!(occ_after, 100);
+        assert_eq!(rem_after, 0);
+        let atomic_delta = LaneTable::grant_delta(target, occ_after as u32, rem_after);
+        assert_eq!(atomic_delta, 0);
+
+        // Stale occupancy from before the second ingest + fresh remaining:
+        let torn_delta = LaneTable::grant_delta(target, occ_before as u32, rem_after);
+        assert_eq!(
+            torn_delta, 20,
+            "torn read must over-grant by the raced N=20"
+        );
+        assert!(
+            occ_after as u32 + rem_after + torn_delta > target,
+            "torn expand would break occ+remaining ≤ target"
+        );
     }
 }

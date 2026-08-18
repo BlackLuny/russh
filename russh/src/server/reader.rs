@@ -531,6 +531,11 @@ impl ReaderHandle {
             .unwrap_or(0)
     }
 
+    /// Occupancy and window remaining in one lock (grant planning).
+    pub fn grant_plan(&self, id: ChannelId) -> Option<(usize, u32)> {
+        self.lanes.lock().ok().and_then(|g| g.grant_plan(id))
+    }
+
     pub fn occupancy_count(&self, id: ChannelId) -> usize {
         self.lanes
             .lock()
@@ -1081,7 +1086,10 @@ fn dispatch_lane_item(
         match push {
             LanePush::Accepted => ready.notify_one(),
             LanePush::DroppedDup => {}
-            LanePush::DroppedZero | LanePush::NoLane | LanePush::Overflow => {
+            LanePush::DroppedZero
+            | LanePush::DroppedOverWindow
+            | LanePush::NoLane
+            | LanePush::Overflow => {
                 if try_push_ctrl(
                     ctrl_tx,
                     ctrl_bytes,
@@ -1101,14 +1109,9 @@ fn dispatch_lane_item(
     }
 
     let push = if let Ok(mut g) = lanes.lock() {
-        // I1: consume at receive, regardless of later lane accept/Overflow.
-        // Extra bytes past the advertised window are ignored (RFC 4254 §5.2).
-        match &item {
-            LaneItem::Data(d) => g.consume_window(id, d.len()),
-            LaneItem::ExtendedData { data, .. } => g.consume_window(id, data.len()),
-            _ => {}
-        }
-        let p = g.try_push(id, item);
+        // I1: consume at receive. Over-window DATA/EXT is dropped, not queued
+        // (RFC 4254 §5.2). Occupancy Overflow stays the DoS gate for inject.
+        let p = g.ingest(id, item);
         #[cfg(feature = "_test_hooks")]
         if let Some(ref o) = hooks.lane_observe {
             o.set_occ(g.occupancy_bytes(id), g.occupancy_count(id));
@@ -1207,7 +1210,10 @@ fn dispatch_lane_item(
             }
             true
         }
-        LanePush::DroppedZero | LanePush::DroppedDup | LanePush::NoLane => true,
+        LanePush::DroppedZero
+        | LanePush::DroppedDup
+        | LanePush::DroppedOverWindow
+        | LanePush::NoLane => true,
         LanePush::Overflow => {
             if try_push_ctrl(
                 ctrl_tx,
@@ -1232,6 +1238,7 @@ fn note_push(hooks: &ReaderHooks, push: &LanePush, is_close: bool) {
     if let Some(ref o) = hooks.lane_observe {
         match push {
             LanePush::DroppedZero => o.note_zero(),
+            LanePush::DroppedOverWindow => o.note_over_window(),
             LanePush::DroppedDup => o.note_dup(),
             LanePush::NoLane if is_close => o.note_close_dropped(),
             LanePush::NoLane => o.note_unknown(),

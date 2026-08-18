@@ -331,8 +331,9 @@ async fn q5_occupancy_bound_closes_only_victim() -> Result<(), anyhow::Error> {
     let (session, _) = connect_faulty(addr, ccfg, Progress::new()).await?;
     let mut victim = session.channel_open_session().await?;
     let mut other = session.channel_open_session().await?;
-    // One legal packet; the window-ignoring flood is injected on the
-    // Reader (a compliant russh client will never exceed byte_cap).
+    // Wire over-window DATA is ignored (see q5_wire_over_window_is_ignored).
+    // This test is the remaining production-adjacent byte_cap DoS gate:
+    // inject_until_overflow bypasses ingest and try_push()es until Overflow.
     victim.data_bytes(vec![0u8; 64]).await?;
     wait_for("Q5 overflow", Duration::from_secs(5), || {
         observe.overflows() > 0 || discard.discarded_items() > 0
@@ -754,9 +755,12 @@ async fn trailing_bytes_data_eof_close_rejected() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Wire occupancy bound: raw client ignores window, total > window+maxpkt.
+/// Wire over-window DATA is ignored (RFC 4254 §5.2), not Overflow-queued.
+/// This is unproven-hardening vs a window-ignoring peer — not the soak close
+/// root cause. The byte_cap DoS gate is still `q5_occupancy_bound_closes_only_victim`
+/// (inject, not ingest). DroppedOverWindow is counted separately from zero-byte drops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn q5_wire_occupancy_overflow() -> Result<(), anyhow::Error> {
+async fn q5_wire_over_window_is_ignored() -> Result<(), anyhow::Error> {
     let rec = Rec::default();
     let discard = StopDiscardSlot::new();
     let observe = LaneObserveSlot::new();
@@ -778,25 +782,27 @@ async fn q5_wire_occupancy_overflow() -> Result<(), anyhow::Error> {
         rec.last_server_id.load(Ordering::SeqCst) != 0
     })
     .await?;
-    // First open is victim. last_server_id is `other` (second). Victim is other-1
-    // if ids are consecutive; send by opening order: victim opened first = 1.
     wait_for("victim opened", Duration::from_secs(3), || {
         rec.last_server_id.load(Ordering::SeqCst) != 0
     })
     .await?;
-    // Two channels: last_id is `other`. Victim opened first → id 1.
     let victim_id = rec.last_server_id.load(Ordering::SeqCst).saturating_sub(1);
     let victim_id = if victim_id == 0 { 1 } else { victim_id };
-    // byte_cap = 64+32 = 96. Four 32B frames = 128 > 96.
+    // window=64, maxpkt=32, byte_cap=96. Four 32B frames = 128.
+    // Only the first two fit the window; the rest must not be queued.
     for _ in 0..4 {
         victim
             .send_raw_payload(encode_data(victim_id, &[0u8; 32], &[]))
             .await?;
     }
-    wait_for("wire overflow", Duration::from_secs(5), || {
-        observe.overflows() > 0 || discard.discarded_items() > 0
+    wait_for("over-window ignored", Duration::from_secs(5), || {
+        observe.last_bytes() == 64 && observe.overflows() == 0 && observe.over_window_drops() > 0
     })
     .await?;
+    let occ_bytes = observe.last_bytes();
+    let overflows = observe.overflows();
+    let discarded = discard.discarded_items();
+    let over_window = observe.over_window_drops();
     hold.store(false, Ordering::SeqCst);
     other.data_bytes(&b"ok"[..]).await?;
     wait_for("other lives", Duration::from_secs(3), || {
@@ -804,13 +810,23 @@ async fn q5_wire_occupancy_overflow() -> Result<(), anyhow::Error> {
     })
     .await?;
     eprintln!(
-        "q5_wire overflows={} discarded={}",
-        observe.overflows(),
-        discard.discarded_items()
+        "q5_wire bytes={occ_bytes} overflows={overflows} discarded={discarded} over_window={over_window}"
+    );
+    assert_eq!(
+        occ_bytes, 64,
+        "Q5-wire HARD: occupancy must stay at the advertised window"
+    );
+    assert_eq!(
+        overflows, 0,
+        "Q5-wire HARD: over-window DATA must not Overflow-close the channel"
+    );
+    assert_eq!(
+        discarded, 0,
+        "Q5-wire HARD: over-window DATA must not StopDiscard"
     );
     assert!(
-        observe.overflows() > 0 || discard.discarded_items() > 0,
-        "Q5-wire HARD: occupancy overflow on the real path"
+        over_window > 0,
+        "Q5-wire HARD: extra frames must count as DroppedOverWindow, not zero-byte drops"
     );
     let _ = victim;
     Ok(())

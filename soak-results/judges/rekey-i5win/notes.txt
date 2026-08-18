@@ -1,0 +1,5 @@
+25s upload-only, S8 --max-bytes=4194304, OpenSSH RekeyLimit=32M
+Server I5 wins the race (peer_starts=0).
+{"ok":true,"sessions":1,"channels":0,"bytes_in":12416843776,"bytes_out":0,"auth_ok":1,"auth_fail":0,"disconnects":0,"rekey_triggers":2557,"rekey_merges":0,"rekey_idle_drops":101337,"rekey_begins":2557,"rekey_peer_starts":0,"rekey_completes":2557}
+bytes/complete ≈ 4.63 MiB (4 MiB threshold + in-flight during kex).
+idle_drops/trigger ≈ 39.6: due=true while kex != Idle (storm counted, no stall).

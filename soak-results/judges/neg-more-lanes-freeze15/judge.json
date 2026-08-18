@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "samples": 30,
+  "t0": 1.005,
+  "tN": 45.136,
+  "bytes_in": 1592653584,
+  "bytes_out": 22362766104,
+  "min_live": 3,
+  "max_io_errors": 0,
+  "max_verify_errors": 0,
+  "gaps": [
+    {
+      "t0": 4.023,
+      "t1": 19.961,
+      "dt": 15.938,
+      "d_out": 687783280,
+      "d_in": 49462640,
+      "live": 3
+    }
+  ],
+  "peak_out_bps": 787925359.7621405,
+  "peak_in_bps": 53087626.24254472,
+  "peak_out_t": [
+    41.106,
+    42.115
+  ],
+  "peak_in_t": [
+    37.081,
+    38.087
+  ],
+  "rekey_triggers": 0,
+  "fails": []
+}

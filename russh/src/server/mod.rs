@@ -382,6 +382,22 @@ pub struct Config {
     /// Q8 must go red with an enumerated failure class.
     #[cfg(feature = "_test_hooks")]
     pub invert_omit_lane_from_undelivered: bool,
+    /// Test-only: read occupancy and remaining on two separate lane
+    /// locks (the production bug). Must-red vs `grant_plan`.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_torn_grant_reads: bool,
+    /// Test-only: restore soak-era `more_lanes { continue }` so a
+    /// posted peer `WINDOW_ADJUST` is not applied. Must-red vs the
+    /// production path that still reaches `apply_pending_peer_credit`.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_more_lanes_continue: bool,
+    /// After the stale occupancy read, wait while true so a test can
+    /// ingest before the remaining read. Paired with `torn_grant_mid`.
+    #[cfg(feature = "_test_hooks")]
+    pub torn_grant_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Set true after the occupancy half of a torn grant read.
+    #[cfg(feature = "_test_hooks")]
+    pub torn_grant_mid: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Test-only S5a invert: pop the lane before `try_reserve` and
     /// `send().await` (old session-loop stall). Isolation must go red.
     #[cfg(feature = "_test_hooks")]
@@ -623,6 +639,14 @@ impl Default for Config {
             invert_open_confirm_before_lane: false,
             #[cfg(feature = "_test_hooks")]
             invert_omit_lane_from_undelivered: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_torn_grant_reads: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_more_lanes_continue: false,
+            #[cfg(feature = "_test_hooks")]
+            torn_grant_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            torn_grant_mid: None,
             #[cfg(feature = "_test_hooks")]
             invert_eager_lane_pop: false,
             #[cfg(feature = "_test_hooks")]
@@ -1812,6 +1836,7 @@ async fn reply<H: Handler + Send>(
     {
         // Not currently in a rekey / pending install but received KEXINIT
         info!("Client has initiated re-key");
+        session.common.config.rekey_i6.note_peer_start();
         session.begin_rekey()?;
         // Kex will consume the packet right away
     }
