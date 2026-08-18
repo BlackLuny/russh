@@ -821,8 +821,24 @@ impl ChannelParams {
 
     /// Ready-set membership for S2d DATA scheduling (plan §4.3).
     /// Fences are emitted on a separate pass and do not enter the set.
+    ///
+    /// `Closing` with CLOSE still parked stays in the set. `submit_ctrl`
+    /// flips the lane the moment CLOSE is enqueued, but that CLOSE carries
+    /// a *later* seq than DATA already queued behind it, so the fence pass
+    /// (`flush_channel_inner`, `allow_data=false`) refuses to emit it while
+    /// `ctrl_ahead_of_data()` is false. Gating the ready set on `Confirmed`
+    /// alone therefore strands that DATA forever: it waits for a lane that
+    /// never returns to `Confirmed`, while CLOSE waits for it to drain.
+    /// `outbound_closed` is the real cutoff — it latches only once CLOSE
+    /// has been framed (`pop_ctrl_front`) or the backlog was discarded
+    /// (`stop_discard`, which clears `pending_data` anyway).
     pub(crate) fn in_ready_set(&self) -> bool {
-        self.lane == ChannelLaneState::Confirmed
+        let lane_drains = match self.lane {
+            ChannelLaneState::Confirmed => true,
+            ChannelLaneState::Closing => !self.outbound_closed,
+            _ => false,
+        };
+        lane_drains
             && !self.pending_data.is_empty()
             && self.recipient_window_size > 0
             && !self.ctrl_ahead_of_data()
@@ -1160,4 +1176,63 @@ impl<M: Send> Drop for ChannelOpenHandleInner<M> {
         // Expired / already-claimed openings must not emit a second FAILURE.
         let _ = self.try_send_reply(Err(ChannelOpenFailure::AdministrativelyProhibited));
     }
+}
+
+/// Outcome classes for the S9 closing-lane drain gate.
+#[cfg(feature = "_test_hooks")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum S9ClosingLaneClass {
+    /// DATA submitted before CLOSE stays drainable while CLOSE is only
+    /// parked, and leaves the ready set once CLOSE is framed.
+    DrainsThenCloses,
+    /// DATA submitted before CLOSE left the ready set the moment CLOSE was
+    /// enqueued — nothing can emit it and CLOSE waits on it forever.
+    StrandedBehindClose,
+    /// Still drainable after CLOSE was framed / the backlog discarded.
+    DrainsAfterClose,
+    Unexpected,
+}
+
+/// S9 closing-lane gate: `Handle`/`ChannelStream` shutdown submits CLOSE
+/// while the credit window may still hold un-drained DATA, so the lane
+/// flips to `Closing` with DATA queued *ahead* of the parked CLOSE. That
+/// DATA must stay in the ready set — the fence pass will not emit CLOSE
+/// while `ctrl_ahead_of_data()` is false, so dropping it from the set
+/// deadlocks the channel (observed as a wedged 1-channel bulk download).
+///
+/// `invert = true` restores the pre-fix predicate (`lane == Confirmed`
+/// alone), which must land on `StrandedBehindClose` (must-red).
+#[cfg(feature = "_test_hooks")]
+pub fn s9_object_closing_lane_drain_round(invert: bool) -> S9ClosingLaneClass {
+    let ready = |ch: &ChannelParams| {
+        if invert {
+            ch.lane == ChannelLaneState::Confirmed
+                && !ch.pending_data.is_empty()
+                && ch.recipient_window_size > 0
+                && !ch.ctrl_ahead_of_data()
+        } else {
+            ch.in_ready_set()
+        }
+    };
+
+    let mut ch = ChannelParams::new(1, ChannelId(1), 4 * 1024 * 1024, 4 * 1024 * 1024, 32, 32, true);
+    ch.lane = ChannelLaneState::Confirmed;
+    if !ch.enqueue_data(bytes::Bytes::from_static(&[0u8; 8]), None, 0) {
+        return S9ClosingLaneClass::Unexpected;
+    }
+    // The race: CLOSE lands while that DATA is still queued behind it.
+    ch.enqueue_ctrl(ChannelCtrlItem::Close);
+    if ch.lane != ChannelLaneState::Closing || ch.outbound_closed || ch.ctrl_ahead_of_data() {
+        return S9ClosingLaneClass::Unexpected;
+    }
+    if !ready(&ch) {
+        return S9ClosingLaneClass::StrandedBehindClose;
+    }
+    // Once CLOSE is framed (or the backlog discarded) the lane is done:
+    // `outbound_closed` is the cutoff, not `lane`.
+    ch.outbound_closed = true;
+    if ready(&ch) {
+        return S9ClosingLaneClass::DrainsAfterClose;
+    }
+    S9ClosingLaneClass::DrainsThenCloses
 }

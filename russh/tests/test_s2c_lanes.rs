@@ -615,3 +615,31 @@ impl Handler for LaneH {
         Ok(())
     }
 }
+
+/// S9: `ChannelStream::shutdown` / `Handle::close` submit CLOSE while the
+/// credit window may still hold un-drained DATA, so the lane flips to
+/// `Closing` with DATA queued *ahead* of the parked CLOSE. That DATA has
+/// to stay in the ready set: the fence pass will not emit CLOSE while
+/// `ctrl_ahead_of_data()` is false, so dropping it from the set is a
+/// mutual wait — DATA waits for a lane that never returns to `Confirmed`,
+/// CLOSE waits for the DATA. Observed as a wedged 1-channel bulk download
+/// (~4% of runs), with every runtime worker parked.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn closing_lane_still_drains_data_queued_before_close() {
+    match russh::s9_object_closing_lane_drain_round(false) {
+        russh::S9ClosingLaneClass::DrainsThenCloses => {}
+        other => panic!("DATA ahead of a parked CLOSE must stay drainable, got {other:?}"),
+    }
+}
+
+/// Must-red twin: the pre-fix predicate gated the ready set on
+/// `lane == Confirmed` alone, which strands that DATA forever.
+#[cfg(feature = "_test_hooks")]
+#[test]
+fn confirmed_only_ready_set_invert_strands_data() {
+    match russh::s9_object_closing_lane_drain_round(true) {
+        russh::S9ClosingLaneClass::StrandedBehindClose => {}
+        other => panic!("invert must strand DATA behind CLOSE, got {other:?}"),
+    }
+}
