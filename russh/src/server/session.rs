@@ -5406,6 +5406,11 @@ impl Session {
         if self.writer.is_some() {
             // Drain enc.write → SealRaw while pending is empty.
             let hold_app_during_kex = self.blocks_outbound_intake();
+            if !hold_app_during_kex {
+                // S9 O1: whole-tail zero-copy hand-off; declines back to the
+                // per-packet loop below whenever it cannot take everything.
+                self.try_drain_enc_write_frozen()?;
+            }
             loop {
                 if !self.pending_outbound.is_empty() {
                     break;
@@ -5501,6 +5506,156 @@ impl Session {
             self.apply_i5_rekey(rekey)?;
         }
         Ok(())
+    }
+
+    /// S9 O1: hand the Writer zero-copy slices of the staging buffer.
+    ///
+    /// The per-packet path in [`Self::flush_apply`] copies every framed packet
+    /// out of `enc.write` with `Bytes::copy_from_slice` — one full-payload
+    /// memcpy per DATA packet, the copy `main` does not pay (it seals straight
+    /// out of its own staging buffer).
+    ///
+    /// When the whole staged tail can go out in one pass the staging `Vec` is
+    /// moved into a `Bytes` instead and each packet becomes a refcounted slice
+    /// of it. Same cmds, same order, same instant: nothing here changes when a
+    /// packet is handed over, only what backs its bytes. Measured at −5%
+    /// CPU/byte on the 1ch downstream bench.
+    ///
+    /// What this does *not* remove is the allocation: the replacement staging
+    /// `Vec` below is itself a packet-sized allocation, so the count per packet
+    /// is unchanged and only the copy is saved. Amortizing that away needs
+    /// `enc.write` to be a `BytesMut` carved with `split_to`, which is a type
+    /// change across every staging site rather than a local fast path.
+    ///
+    /// Declines — leaving `enc.write` and the cursor untouched for the
+    /// per-packet path — whenever one of that path's per-packet decisions
+    /// could fire: parked cmds ahead of us, a tail that does not fit under the
+    /// hard cap, or a tail that is not whole packets.
+    fn try_drain_enc_write_frozen(&mut self) -> Result<(), Error> {
+        use byteorder::{BigEndian, ByteOrder};
+        use crate::server::writer::TrySendWireError;
+
+        if !self.pending_outbound.is_empty() || self.writer.is_none() {
+            return Ok(());
+        }
+        // Pass 1: the tail must be whole packets, and all of it must fit.
+        // Only headers are read here, so declining costs nothing.
+        let (start, end, total_weight) = {
+            let Some(enc) = self.common.encrypted.as_ref() else {
+                return Ok(());
+            };
+            let start = enc.write_cursor;
+            let end = enc.write.len();
+            if start >= end {
+                return Ok(());
+            }
+            let mut cur = start;
+            let mut weight = 0usize;
+            while cur < end {
+                if cur.saturating_add(4) > end {
+                    return Ok(());
+                }
+                #[allow(clippy::indexing_slicing)]
+                let len = BigEndian::read_u32(&enc.write[cur..]) as usize;
+                if len == 0 || cur.saturating_add(4).saturating_add(len) > end {
+                    return Ok(());
+                }
+                weight = weight
+                    .saturating_add(len.saturating_add(Self::WIRE_OVERHEAD_PER_PACKET));
+                cur += 4 + len;
+            }
+            (start, end, weight)
+        };
+        let one = (self.common.config.maximum_packet_size as usize)
+            .saturating_add(Self::packet_reservation(Self::CHANNEL_DATA_FRAMING));
+        let hard = crate::sshbuffer::OUTBOUND_HIGH_WATERMARK.saturating_add(one);
+        // `sealed_backlog_bytes` already counts this tail (it prices
+        // `enc.write` from the cursor), so the tail must not be added a second
+        // time: the per-packet path's check is the same quantity spelled
+        // `backlog-without-this-packet + this packet`.
+        debug_assert_eq!(
+            total_weight,
+            self.common
+                .encrypted
+                .as_ref()
+                .map(|enc| Self::enc_write_wire_weight(&enc.write, enc.write_cursor))
+                .unwrap_or(0),
+        );
+        if self.sealed_backlog_bytes() > hard {
+            return Ok(());
+        }
+        // Move the staging buffer out. The replacement keeps a bounded slice
+        // of the old capacity: the freed allocation now belongs to `frozen`
+        // and is released once the Writer has written every slice of it.
+        const RESTAGE_CAP: usize = 256 * 1024;
+        let frozen = {
+            let Some(enc) = self.common.encrypted.as_mut() else {
+                return Ok(());
+            };
+            let cap = enc.write.capacity().min(RESTAGE_CAP);
+            let buf = std::mem::replace(&mut enc.write, Vec::with_capacity(cap));
+            enc.write_cursor = 0;
+            bytes::Bytes::from(buf)
+        };
+        // Pass 2: emit. `remaining` mirrors what `enc.write` would still hold
+        // at each step, so the ledger sees the same transfer sequence as the
+        // per-packet path (weight leaves the write buffer before the Writer or
+        // `pending_outbound` takes it).
+        let mut remaining = total_weight;
+        let mut cur = start;
+        while cur < end {
+            #[allow(clippy::indexing_slicing)]
+            let len = BigEndian::read_u32(&frozen[cur..]) as usize;
+            let packet = frozen.slice((cur + 4)..(cur + 4 + len));
+            cur += 4 + len;
+            remaining =
+                remaining.saturating_sub(len.saturating_add(Self::WIRE_OVERHEAD_PER_PACKET));
+            #[cfg(feature = "_test_hooks")]
+            if let Some(ref fl) = self.full_ledger {
+                fl.set_enc_write(remaining);
+            }
+            let writer = match self.writer.as_ref() {
+                Some(w) => w,
+                None => {
+                    self.restage_frozen_tail(&frozen, cur - 4 - len);
+                    return Ok(());
+                }
+            };
+            match writer.try_seal_raw(packet) {
+                Ok(()) => {}
+                Err(TrySendWireError::Full(p)) => {
+                    // Pure transfer into pending (same payload+OH weight), then
+                    // hand the untouched remainder back to the staging buffer.
+                    // Backpressure is the per-packet path's territory: leaving
+                    // the same cursor/`enc.write` state it would have left keeps
+                    // this a pure fast path, not a second parking policy.
+                    self.pending_outbound
+                        .push_back(PendingOutboundCmd::SealRaw(p));
+                    self.restage_frozen_tail(&frozen, cur);
+                    return Ok(());
+                }
+                Err(TrySendWireError::FullCmd) | Err(TrySendWireError::Closed) => {
+                    self.restage_frozen_tail(&frozen, cur);
+                    return Err(Error::SendError);
+                }
+            }
+        }
+        #[cfg(feature = "_test_hooks")]
+        {
+            self.outbound_log_cursor = 0;
+        }
+        Ok(())
+    }
+
+    /// Put a frozen staging buffer back where the per-packet path would have
+    /// left it: same bytes, cursor just past the last packet handed over.
+    fn restage_frozen_tail(&mut self, frozen: &bytes::Bytes, cursor: usize) {
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            let mut restored = Vec::with_capacity(frozen.len());
+            restored.extend_from_slice(frozen);
+            enc.write = restored;
+            enc.write_cursor = cursor;
+        }
     }
 
     pub(crate) fn flush_pending_apply(&mut self, channel: ChannelId) -> Result<usize, Error> {
