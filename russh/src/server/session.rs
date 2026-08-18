@@ -2009,7 +2009,35 @@ impl Session {
         // Occupancy and remaining MUST come from one lock: a torn pair
         // (stale occ + fresh remaining) over-grants by the raced ingest N
         // and a compliant peer can then fill past `window + maxpkt`.
-        let (lane_bytes, remaining) = self.snapshot_grant_plan(id).await;
+        let (lane_bytes, remaining) = {
+            #[cfg(feature = "_test_hooks")]
+            if self.common.config.invert_torn_grant_reads {
+                let occ = self
+                    .reader
+                    .as_ref()
+                    .map(|r| r.occupancy_bytes(id))
+                    .unwrap_or(0);
+                tokio::task::yield_now().await;
+                let rem = self
+                    .reader
+                    .as_ref()
+                    .and_then(|r| r.sender_window(id))
+                    .unwrap_or_else(|| {
+                        self.common
+                            .encrypted
+                            .as_ref()
+                            .map(|enc| enc.sender_window_size(id) as u32)
+                            .unwrap_or(0)
+                    });
+                (occ, rem)
+            } else {
+                self.snapshot_grant_plan(id)
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                self.snapshot_grant_plan(id)
+            }
+        };
         let omit_lane = {
             #[cfg(feature = "_test_hooks")]
             {
@@ -2164,31 +2192,16 @@ impl Session {
         Ok(())
     }
 
-    /// One-lock occupancy + remaining. The two-lock invert restores the
-    /// soak-class over-grant (stale occ, fresh remaining).
-    async fn snapshot_grant_plan(&self, id: ChannelId) -> (usize, u32) {
+    /// One-lock occupancy + remaining. The two-lock invert lives in
+    /// `maybe_grant_after_delivery` (must not be an `async fn(&self)` —
+    /// `Session` is `!Sync`, and a `&self` future would make `run` `!Send`).
+    fn snapshot_grant_plan(&self, id: ChannelId) -> (usize, u32) {
         let fallback_remaining = self
             .common
             .encrypted
             .as_ref()
             .map(|enc| enc.sender_window_size(id) as u32)
             .unwrap_or(0);
-        #[cfg(feature = "_test_hooks")]
-        if self.common.config.invert_torn_grant_reads {
-            let occ = self
-                .reader
-                .as_ref()
-                .map(|r| r.occupancy_bytes(id))
-                .unwrap_or(0);
-            // Yield so Reader can ingest N between the two locks.
-            tokio::task::yield_now().await;
-            let rem = self
-                .reader
-                .as_ref()
-                .and_then(|r| r.sender_window(id))
-                .unwrap_or(fallback_remaining);
-            return (occ, rem);
-        }
         if let Some(r) = self.reader.as_ref() {
             if let Some(plan) = r.grant_plan(id) {
                 return plan;
