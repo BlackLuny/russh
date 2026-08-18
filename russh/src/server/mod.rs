@@ -396,6 +396,14 @@ pub struct Config {
     /// `pin_outbound_before_credit`, Handle::data must stall.
     #[cfg(feature = "_test_hooks")]
     pub invert_skip_outbound_settle: bool,
+    /// S9 P2 invert: `retry_pending_outbound` gates the parked command on
+    /// the session-wide `sealed_backlog_bytes()` (which already counts that
+    /// command *and* the un-submitted `enc.write` only `flush_apply` can
+    /// drain) instead of the Writer's own backlog. Restores the retry/flush
+    /// deadlock: enough concurrent bulk channels plus a volume rekey wedge
+    /// the session permanently.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_retry_global_hwm: bool,
     /// S5b invert: server `Channel::data` uses the stale WindowSizeRef
     /// mirror (Session no longer updates it). Window-0 then ADJUST stalls.
     #[cfg(feature = "_test_hooks")]
@@ -621,6 +629,8 @@ impl Default for Config {
             invert_skip_close_discard_on_park: false,
             #[cfg(feature = "_test_hooks")]
             invert_skip_outbound_settle: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_retry_global_hwm: false,
             #[cfg(feature = "_test_hooks")]
             invert_channel_window_mirror: false,
             #[cfg(feature = "_test_hooks")]

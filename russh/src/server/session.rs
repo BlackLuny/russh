@@ -4230,12 +4230,38 @@ impl Session {
         let one = (self.common.config.maximum_packet_size as usize)
             .saturating_add(Self::packet_reservation(Self::CHANNEL_DATA_FRAMING));
         let hard = crate::sshbuffer::OUTBOUND_HIGH_WATERMARK.saturating_add(one);
+        // One packet of slack below the hard cap: `w` is the *pre-seal*
+        // reservation and the sealed wire can exceed it (padding and MAC
+        // length differ across cipher epochs), so admitting right up to
+        // `hard` lets the Writer overshoot it (F14 measures that peak).
+        let retry_cap = crate::sshbuffer::OUTBOUND_HIGH_WATERMARK;
         while let Some(cmd) = self.pending_outbound.pop_front() {
             // Byte HWM, not mpsc count: hard-cap park must not be undone by
             // retry (that was F1 +97 — a 97B WINDOW_ADJUST re-entering Writer
             // on top of an already-full HWM+one pipeline).
+            //
+            // S9 P2: gate on the **Writer's** backlog, not the session-wide
+            // one. Moving a parked command into the Writer is weight-neutral
+            // — its bytes are already inside `sealed_backlog_bytes()` via
+            // `pending_outbound.bytes()` — so comparing the global total
+            // against `hard` double-counts `w`, and worse, that total also
+            // carries the un-submitted `enc.write` weight. `enc.write` is
+            // drained only by `flush_apply`, which refuses to run while
+            // `pending_outbound` is non-empty: once `enc.write` alone reached
+            // the cap the two blocked each other permanently (8 concurrent
+            // bulk channels + volume rekey wedged the session for good).
+            // The Writer's own backlog drains to the socket unaided, so this
+            // park always clears.
             let w = PendingOutbound::weight_of(&cmd);
-            if w > 0 && self.sealed_backlog_bytes().saturating_add(w) > hard {
+            #[cfg(feature = "_test_hooks")]
+            let (gate, cap) = if self.common.config.invert_retry_global_hwm {
+                (self.sealed_backlog_bytes(), hard)
+            } else {
+                (writer.pending_bytes(), retry_cap)
+            };
+            #[cfg(not(feature = "_test_hooks"))]
+            let (gate, cap) = (writer.pending_bytes(), retry_cap);
+            if w > 0 && gate.saturating_add(w) > cap {
                 self.pending_outbound.push_front(cmd);
                 return Ok(());
             }
