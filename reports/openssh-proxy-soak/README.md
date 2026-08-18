@@ -25,7 +25,7 @@ python3 scripts/openssh_loopback_soak.py \
   rekey stays at library defaults (1 GiB / 1 h).
 
 Results of the 2-hour long-lived stream run: [RESULTS.md](RESULTS.md).
-Short-connection churn: [CHURN.md](CHURN.md) (filled after that soak).
+Short-connection churn (2h, ~100 in-flight): [../openssh-proxy-churn/CHURN.md](../openssh-proxy-churn/CHURN.md).
 
 ```bash
 python3 scripts/openssh_loopback_soak.py \
