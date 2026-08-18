@@ -12,6 +12,11 @@ use thiserror::Error;
 #[cfg(test)]
 mod tests;
 
+/// Compile-checked spike: rustls-style SM vs SSH channel/session composition.
+/// Not production protocol code; see `.omc/research/rustls-style-sm-feasibility.md`.
+#[cfg(test)]
+mod sm_feasibility;
+
 mod auth;
 
 mod cert;
