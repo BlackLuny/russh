@@ -102,7 +102,9 @@ async def run_backend(echo: int, sink: int, source: int, ready: str) -> None:
     await asyncio.gather(e.serve_forever(), s.serve_forever(), o.serve_forever())
 
 
-async def pump_down(host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int) -> None:
+async def pump_down(
+    host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int, io_timeout: float
+) -> None:
     c.channels_opened += 1
     c.channels_live += 1
     started = time.time()
@@ -111,7 +113,7 @@ async def pump_down(host: str, port: int, c: Counters, stop: asyncio.Event, rate
         reader, writer = await asyncio.open_connection(host, port)
         try:
             while not stop.is_set():
-                data = await asyncio.wait_for(reader.read(CHUNK), timeout=30)
+                data = await asyncio.wait_for(reader.read(CHUNK), timeout=io_timeout)
                 if not data:
                     print("SOAK_PUMP_DOWN_EOF", flush=True)
                     c.io_errors += 1
@@ -135,7 +137,9 @@ async def pump_down(host: str, port: int, c: Counters, stop: asyncio.Event, rate
     c.channels_closed += 1
 
 
-async def pump_up(host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int) -> None:
+async def pump_up(
+    host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int, io_timeout: float
+) -> None:
     c.channels_opened += 1
     c.channels_live += 1
     chunk = bytes([SOURCE_FILL]) * CHUNK
@@ -164,7 +168,9 @@ async def pump_up(host: str, port: int, c: Counters, stop: asyncio.Event, rate_b
     c.channels_closed += 1
 
 
-async def pump_echo(host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int) -> None:
+async def pump_echo(
+    host: str, port: int, c: Counters, stop: asyncio.Event, rate_bps: int, io_timeout: float
+) -> None:
     c.channels_opened += 1
     c.channels_live += 1
     started = time.time()
@@ -183,7 +189,9 @@ async def pump_echo(host: str, port: int, c: Counters, stop: asyncio.Event, rate
                 sent += len(payload)
                 buf = bytearray()
                 while len(buf) < len(payload):
-                    data = await asyncio.wait_for(reader.read(len(payload) - len(buf)), timeout=30)
+                    data = await asyncio.wait_for(
+                        reader.read(len(payload) - len(buf)), timeout=io_timeout
+                    )
                     if not data:
                         c.io_errors += 1
                         return
@@ -214,11 +222,23 @@ async def run_client(args: argparse.Namespace) -> int:
     t0 = time.time()
     tasks = []
     for _ in range(args.down):
-        tasks.append(asyncio.create_task(pump_down(args.host, args.down_port, c, stop, args.rate_bps)))
+        tasks.append(
+            asyncio.create_task(
+                pump_down(args.host, args.down_port, c, stop, args.rate_bps, args.io_timeout)
+            )
+        )
     for _ in range(args.up):
-        tasks.append(asyncio.create_task(pump_up(args.host, args.up_port, c, stop, args.rate_bps)))
+        tasks.append(
+            asyncio.create_task(
+                pump_up(args.host, args.up_port, c, stop, args.rate_bps, args.io_timeout)
+            )
+        )
     for _ in range(args.echo):
-        tasks.append(asyncio.create_task(pump_echo(args.host, args.echo_port, c, stop, args.rate_bps)))
+        tasks.append(
+            asyncio.create_task(
+                pump_echo(args.host, args.echo_port, c, stop, args.rate_bps, args.io_timeout)
+            )
+        )
 
     if args.stats:
         os.makedirs(os.path.dirname(args.stats) or ".", exist_ok=True)
@@ -287,6 +307,12 @@ def main() -> int:
     c.add_argument("--seconds", type=int, default=86400)
     c.add_argument("--stall-secs", type=int, default=60)
     c.add_argument("--rate-bps", type=int, default=0)
+    c.add_argument(
+        "--io-timeout",
+        type=float,
+        default=30,
+        help="read timeout seconds (must exceed SIGSTOP freeze or wait_for fires on CONT)",
+    )
     c.add_argument("--stats", default="")
 
     args = p.parse_args()

@@ -34,6 +34,14 @@ if [[ "$FREEZE_SECS" -gt 0 ]]; then
     STALL_SECS="$need"
   fi
 fi
+# wait_for uses CLOCK_MONOTONIC, which keeps ticking during SIGSTOP.
+# Freeze >= the old 30s timeout made echo/down fail on CONT (harness, not russh).
+if [[ -z "${IO_TIMEOUT+x}" ]]; then
+  IO_TIMEOUT=30
+  if [[ "$FREEZE_SECS" -gt 0 ]]; then
+    IO_TIMEOUT=$((FREEZE_SECS + 60))
+  fi
+fi
 if [[ -z "${MIN_PEAK_OUT_BPS+x}" ]]; then
   if [[ "$RATE_BPS" -gt 0 ]]; then
     MIN_PEAK_OUT_BPS=0
@@ -140,6 +148,7 @@ python3 "$ROOT/scripts/soak/traffic.py" client \
   --down-port "$DOWN_PORT" --up-port "$UP_PORT" --echo-port "$ECHO_PORT" \
   --down "$DOWN" --up "$UP" --echo "$ECHO" \
   --seconds "$SECONDS_RUN" --stall-secs "$STALL_SECS" --rate-bps "$RATE_BPS" \
+  --io-timeout "$IO_TIMEOUT" \
   --stats "$WD/traffic.jsonl" \
   >"$WD/traffic.log" 2>&1 &
 TPID=$!
