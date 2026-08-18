@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use bytes::BufMut;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4500,7 +4501,7 @@ impl Session {
         }
         if let Some(ref mut enc) = self.common.encrypted {
             push_packet!(enc.write, {
-                enc.write.push(if success {
+                enc.write.put_u8(if success {
                     msg::REQUEST_SUCCESS
                 } else {
                     msg::REQUEST_FAILURE
@@ -5532,6 +5533,11 @@ impl Session {
     /// could fire: parked cmds ahead of us, a tail that does not fit under the
     /// hard cap, or a tail that is not whole packets.
     fn try_drain_enc_write_frozen(&mut self) -> Result<(), Error> {
+        /// Packets carved out of one staging allocation before it is replaced.
+        const ARENA_PACKETS: usize = 4;
+        /// Ceiling on the staging allocation a session may hold.
+        const MAX_ARENA: usize = 256 * 1024;
+
         use byteorder::{BigEndian, ByteOrder};
         use crate::server::writer::TrySendWireError;
 
@@ -5584,18 +5590,26 @@ impl Session {
         if self.sealed_backlog_bytes() > hard {
             return Ok(());
         }
-        // Move the staging buffer out. The replacement keeps a bounded slice
-        // of the old capacity: the freed allocation now belongs to `frozen`
-        // and is released once the Writer has written every slice of it.
-        const RESTAGE_CAP: usize = 256 * 1024;
+        // Split the staged bytes off the front. `BytesMut` keeps the rest of
+        // the allocation behind, and once the Writer has dropped the slices we
+        // hand it, the reserve below reclaims that same allocation in place
+        // instead of taking a new one — that reclaim, not the chunk size, is
+        // what keeps this from allocating per packet (S9 P8).
+        // Re-arm only when there is no room left for one more packet: topping
+        // up while a packet still fits would take a fresh allocation every
+        // round, which is what the per-packet path already did.
+        let one_packet = (self.common.config.maximum_packet_size as usize).saturating_add(256);
+        let arena = one_packet.saturating_mul(ARENA_PACKETS).min(MAX_ARENA);
         let frozen = {
             let Some(enc) = self.common.encrypted.as_mut() else {
                 return Ok(());
             };
-            let cap = enc.write.capacity().min(RESTAGE_CAP);
-            let buf = std::mem::replace(&mut enc.write, Vec::with_capacity(cap));
+            let taken = enc.write.split_to(end).freeze();
             enc.write_cursor = 0;
-            bytes::Bytes::from(buf)
+            if enc.write.capacity().saturating_sub(enc.write.len()) < one_packet {
+                enc.write.reserve(arena);
+            }
+            taken
         };
         // Pass 2: emit. `remaining` mirrors what `enc.write` would still hold
         // at each step, so the ledger sees the same transfer sequence as the
@@ -5651,7 +5665,7 @@ impl Session {
     /// left it: same bytes, cursor just past the last packet handed over.
     fn restage_frozen_tail(&mut self, frozen: &bytes::Bytes, cursor: usize) {
         if let Some(enc) = self.common.encrypted.as_mut() {
-            let mut restored = Vec::with_capacity(frozen.len());
+            let mut restored = bytes::BytesMut::with_capacity(frozen.len());
             restored.extend_from_slice(frozen);
             enc.write = restored;
             enc.write_cursor = cursor;
@@ -6029,7 +6043,7 @@ impl Session {
     ) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             push_packet!(enc.write, {
-                enc.write.push(msg::CHANNEL_OPEN_FAILURE);
+                enc.write.put_u8(msg::CHANNEL_OPEN_FAILURE);
                 channel.encode(&mut enc.write)?;
                 reason.code().encode(&mut enc.write)?;
                 description.encode(&mut enc.write)?;
@@ -6743,7 +6757,7 @@ impl Session {
                 );
             }
             push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
+                enc.write.put_u8(msg::GLOBAL_REQUEST);
                 "tcpip-forward".encode(&mut enc.write)?;
                 (want_reply as u8).encode(&mut enc.write)?;
                 address.encode(&mut enc.write)?;
@@ -6976,7 +6990,7 @@ mod tests {
                     session_id: CryptoVec::new(),
                     channels: HashMap::new(),
                     last_channel_id: Wrapping(0),
-                    write: Vec::new(),
+                    write: bytes::BytesMut::new(),
                     write_cursor: 0,
                     server_compression: Compression::None,
                     client_compression: Compression::None,

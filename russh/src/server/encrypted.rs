@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 use auth::*;
 use byteorder::{BigEndian, ByteOrder};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use cert::PublicKeyOrCertificate;
 use log::{debug, error, info, trace, warn};
 use msg;
@@ -649,7 +649,7 @@ mod tests {
             session_id: CryptoVec::new(),
             channels: std::collections::HashMap::new(),
             last_channel_id: Wrapping(0),
-            write: Vec::new(),
+            write: bytes::BytesMut::new(),
             write_cursor: 0,
             server_compression: Compression::None,
             client_compression: Compression::None,
@@ -664,16 +664,16 @@ mod tests {
 fn server_accept_service(
     banner: Option<String>,
     methods: MethodSet,
-    buffer: &mut Vec<u8>,
+    buffer: &mut bytes::BytesMut,
 ) -> Result<AuthRequest, crate::Error> {
     push_packet!(buffer, {
-        buffer.push(msg::SERVICE_ACCEPT);
+        buffer.put_u8(msg::SERVICE_ACCEPT);
         "ssh-userauth".encode(buffer)?;
     });
 
     if let Some(banner) = banner {
         push_packet!(buffer, {
-            buffer.push(msg::USERAUTH_BANNER);
+            buffer.put_u8(msg::USERAUTH_BANNER);
             banner.encode(buffer)?;
             "".encode(buffer)?;
         })
@@ -997,7 +997,7 @@ impl Encrypted {
                             algo.extend_from_slice(pubkey_algo.as_bytes());
                             debug!("pubkey_key: {pubkey_key:?}");
                             push_packet!(self.write, {
-                                self.write.push(msg::USERAUTH_PK_OK);
+                                self.write.put_u8(msg::USERAUTH_PK_OK);
                                 map_err!(pubkey_algo.encode(&mut self.write))?;
                                 map_err!(pubkey_key.encode(&mut self.write))?;
                             });
@@ -1041,14 +1041,14 @@ impl Encrypted {
 
 async fn reject_auth_request(
     until: Instant,
-    write: &mut Vec<u8>,
+    write: &mut bytes::BytesMut,
     auth_request: &mut AuthRequest,
 ) -> Result<(), Error> {
     debug!("rejecting {auth_request:?}");
     push_packet!(write, {
-        write.push(msg::USERAUTH_FAILURE);
+        write.put_u8(msg::USERAUTH_FAILURE);
         NameList::from(&auth_request.methods).encode(write)?;
-        write.push(auth_request.partial_success as u8);
+        write.put_u8(auth_request.partial_success as u8);
     });
     auth_request.current = None;
     auth_request.rejection_count += 1;
@@ -1057,16 +1057,16 @@ async fn reject_auth_request(
     Ok(())
 }
 
-fn server_auth_request_success(buffer: &mut Vec<u8>) {
+fn server_auth_request_success(buffer: &mut bytes::BytesMut) {
     push_packet!(buffer, {
-        buffer.push(msg::USERAUTH_SUCCESS);
+        buffer.put_u8(msg::USERAUTH_SUCCESS);
     })
 }
 
 async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
     until: Instant,
     handler: &mut H,
-    write: &mut Vec<u8>,
+    write: &mut bytes::BytesMut,
     auth_request: &mut AuthRequest,
     user: &str,
     r: &mut R,
@@ -1102,7 +1102,7 @@ async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
 async fn reply_userauth_info_response(
     until: Instant,
     auth_request: &mut AuthRequest,
-    write: &mut Vec<u8>,
+    write: &mut bytes::BytesMut,
     auth: Auth,
 ) -> Result<bool, Error> {
     match auth {

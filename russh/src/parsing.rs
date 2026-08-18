@@ -99,7 +99,7 @@ impl OpenChannelMessage {
     /// Pushes a failure message to the vec.
     pub fn fail(
         &self,
-        buffer: &mut Vec<u8>,
+        buffer: &mut bytes::BytesMut,
         reason: u8,
         message: &[u8],
     ) -> Result<(), crate::Error> {
@@ -114,7 +114,7 @@ impl OpenChannelMessage {
     }
 
     /// Pushes an unknown type error to the vec.
-    pub fn unknown_type(&self, buffer: &mut Vec<u8>) -> Result<(), crate::Error> {
+    pub fn unknown_type(&self, buffer: &mut bytes::BytesMut) -> Result<(), crate::Error> {
         self.fail(
             buffer,
             msg::SSH_OPEN_UNKNOWN_CHANNEL_TYPE,

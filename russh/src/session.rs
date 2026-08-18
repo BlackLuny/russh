@@ -18,7 +18,7 @@ use std::fmt::{Debug, Formatter};
 use std::mem::replace;
 use std::num::Wrapping;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, trace};
 use ssh_encoding::Encode;
@@ -49,7 +49,13 @@ pub(crate) struct Encrypted {
     // Non-sensitive packet assembly buffer, analogous to
     // OpenSSH sshbuf (output side).  Not mlocked because it
     // holds only protocol framing and ciphertext.
-    pub write: Vec<u8>,
+    //
+    // `BytesMut` rather than `Vec<u8>` so the Writer hand-off in
+    // `flush_apply` can split a whole tail off the front as `Bytes` without
+    // copying *and* without surrendering the allocation: what stays behind
+    // keeps the rest of the capacity, so one allocation is amortised over
+    // every packet carved out of it (S9 P8).
+    pub write: bytes::BytesMut,
     pub write_cursor: usize,
     pub server_compression: crate::compression::Compression,
     pub client_compression: crate::compression::Compression,
@@ -57,6 +63,21 @@ pub(crate) struct Encrypted {
     pub rekey_wanted: bool,
     pub received_extensions: Vec<String>,
     pub extension_info_awaiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+}
+
+/// Sink that `push_packet!` can build a plaintext packet into.
+///
+/// Two of them exist: `Encrypted::write` (a `BytesMut`, so the Writer
+/// hand-off can split packets off the front without copying) and the
+/// `PacketWriter`'s own `Vec` used before encryption is up.
+pub(crate) trait StagingSink:
+    ssh_encoding::Writer + std::ops::DerefMut<Target = [u8]> + for<'a> Extend<&'a u8>
+{
+}
+
+impl<T> StagingSink for T where
+    T: ssh_encoding::Writer + std::ops::DerefMut<Target = [u8]> + for<'a> Extend<&'a u8>
+{
 }
 
 pub(crate) struct CommonSession<Config> {
@@ -206,7 +227,7 @@ impl<C> CommonSession<C> {
             state,
             channels: HashMap::new(),
             last_channel_id: Wrapping(1),
-            write: Vec::new(),
+            write: bytes::BytesMut::new(),
             write_cursor: 0,
             server_compression: newkeys.names.server_compression,
             client_compression: newkeys.names.client_compression,
@@ -240,7 +261,14 @@ impl<C> CommonSession<C> {
         description: &str,
         language_tag: &str,
     ) -> Result<(), crate::Error> {
-        let disconnect = |buf: &mut Vec<u8>| {
+        // Generic over the sink: the staging buffer is a `BytesMut` while the
+        // pre-encryption path still writes into the `PacketWriter`'s `Vec`.
+        fn disconnect<W: StagingSink>(
+            buf: &mut W,
+            reason: Disconnect,
+            description: &str,
+            language_tag: &str,
+        ) -> Result<(), crate::Error> {
             push_packet!(buf, {
                 msg::DISCONNECT.encode(buf)?;
                 (reason as u32).encode(buf)?;
@@ -248,13 +276,18 @@ impl<C> CommonSession<C> {
                 language_tag.encode(buf)?;
             });
             Ok(())
-        };
+        }
         if !self.disconnected {
             self.disconnected = true;
             return if let Some(ref mut enc) = self.encrypted {
-                disconnect(&mut enc.write)
+                disconnect(&mut enc.write, reason, description, language_tag)
             } else {
-                disconnect(&mut self.packet_writer.buffer().buffer)
+                disconnect(
+                    &mut self.packet_writer.buffer().buffer,
+                    reason,
+                    description,
+                    language_tag,
+                )
             };
         }
         Ok(())
@@ -267,7 +300,12 @@ impl<C> CommonSession<C> {
         message: &str,
         language_tag: &str,
     ) -> Result<(), crate::Error> {
-        let debug = |buf: &mut Vec<u8>| {
+        fn debug<W: StagingSink>(
+            buf: &mut W,
+            always_display: bool,
+            message: &str,
+            language_tag: &str,
+        ) -> Result<(), crate::Error> {
             push_packet!(buf, {
                 msg::DEBUG.encode(buf)?;
                 (always_display as u8).encode(buf)?;
@@ -275,11 +313,16 @@ impl<C> CommonSession<C> {
                 language_tag.encode(buf)?;
             });
             Ok(())
-        };
+        }
         if let Some(ref mut enc) = self.encrypted {
-            debug(&mut enc.write)
+            debug(&mut enc.write, always_display, message, language_tag)
         } else {
-            debug(&mut self.packet_writer.buffer().buffer)
+            debug(
+                &mut self.packet_writer.buffer().buffer,
+                always_display,
+                message,
+                language_tag,
+            )
         }
     }
 
@@ -315,7 +358,7 @@ pub fn newkeys_rewrites_compression_enums(
             session_id: CryptoVec::new(),
             channels: HashMap::new(),
             last_channel_id: Wrapping(1),
-            write: Vec::new(),
+            write: bytes::BytesMut::new(),
             write_cursor: 0,
             server_compression: old_server.clone(),
             client_compression: old_client.clone(),
@@ -356,7 +399,7 @@ impl Encrypted {
     pub fn byte(&mut self, channel: ChannelId, msg: u8) -> Result<(), crate::Error> {
         if let Some(channel) = self.channels.get(&channel) {
             push_packet!(self.write, {
-                self.write.push(msg);
+                self.write.put_u8(msg);
                 channel.recipient_channel.encode(&mut self.write)?;
             });
         }
@@ -490,7 +533,7 @@ impl Encrypted {
                     channel.sender_window_size, target, undelivered, ceiling
                 );
                 push_packet!(self.write, {
-                    self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+                    self.write.put_u8(msg::CHANNEL_WINDOW_ADJUST);
                     channel.recipient_channel.encode(&mut self.write)?;
                     (ceiling - channel.sender_window_size).encode(&mut self.write)?;
                 });
@@ -516,7 +559,7 @@ impl Encrypted {
             return Ok(false);
         }
         push_packet!(self.write, {
-            self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+            self.write.put_u8(msg::CHANNEL_WINDOW_ADJUST);
             ch.recipient_channel.encode(&mut self.write)?;
             delta.encode(&mut self.write)?;
         });
@@ -566,7 +609,7 @@ impl Encrypted {
         Ok(body)
     }
 
-    fn push_ctrl_to_write(write: &mut Vec<u8>, payload: &[u8]) -> Result<(), crate::Error> {
+    fn push_ctrl_to_write(write: &mut bytes::BytesMut, payload: &[u8]) -> Result<(), crate::Error> {
         push_packet!(write, {
             write.extend_from_slice(payload);
         });
@@ -577,7 +620,7 @@ impl Encrypted {
     /// gated on the peer window (I3 / appendix B.8). DATA still consumes
     /// window via `data_noqueue`.
     fn flush_channel(
-        write: &mut Vec<u8>,
+        write: &mut bytes::BytesMut,
         channel: &mut ChannelParams,
         admit: &mut impl FnMut(&crate::ChannelCtrlItem) -> bool,
         allow_data: bool,
@@ -586,7 +629,7 @@ impl Encrypted {
     }
 
     fn flush_channel_with_writer(
-        write: &mut Vec<u8>,
+        write: &mut bytes::BytesMut,
         writer: &mut PacketWriter,
         channel: &mut ChannelParams,
         admit: &mut impl FnMut(&crate::ChannelCtrlItem) -> bool,
@@ -595,7 +638,7 @@ impl Encrypted {
     }
 
     fn flush_channel_inner(
-        write: &mut Vec<u8>,
+        write: &mut bytes::BytesMut,
         mut writer: Option<&mut PacketWriter>,
         channel: &mut ChannelParams,
         admit: &mut impl FnMut(&crate::ChannelCtrlItem) -> bool,
@@ -805,7 +848,7 @@ impl Encrypted {
     /// entries up to `min(peer_maxpacket, window, 32 KiB)`.
     /// Does not cross a fence (ctrl seq ≤ next data seq) or a different ext.
     fn gather_one_data_packet(
-        write: &mut Vec<u8>,
+        write: &mut bytes::BytesMut,
         mut writer: Option<&mut PacketWriter>,
         channel: &mut ChannelParams,
     ) -> Result<usize, crate::Error> {
@@ -903,7 +946,7 @@ impl Encrypted {
     /// the window, dividing it into packets if it is too large, and
     /// return the length that was written.
     fn data_noqueue(
-        write: &mut Vec<u8>,
+        write: &mut bytes::BytesMut,
         channel: &mut ChannelParams,
         buf0: &[u8],
         a: Option<u32>,
@@ -935,13 +978,13 @@ impl Encrypted {
             let off = std::cmp::min(buf.len(), max_packet_size);
             match a {
                 None => push_packet!(write, {
-                    write.push(msg::CHANNEL_DATA);
+                    write.put_u8(msg::CHANNEL_DATA);
                     channel.recipient_channel.encode(write)?;
                     #[allow(clippy::indexing_slicing)] // length checked
                     buf[..off].encode(write)?;
                 }),
                 Some(ext) => push_packet!(write, {
-                    write.push(msg::CHANNEL_EXTENDED_DATA);
+                    write.put_u8(msg::CHANNEL_EXTENDED_DATA);
                     channel.recipient_channel.encode(write)?;
                     ext.encode(write)?;
                     #[allow(clippy::indexing_slicing)] // length checked
@@ -1289,7 +1332,7 @@ mod tests {
     use std::num::Wrapping;
 
     use byteorder::{BigEndian, ByteOrder};
-    use bytes::Bytes;
+    use bytes::{BufMut, Bytes};
 
     use super::{Encrypted, EncryptedState, Exchange};
     use crate::compression::{Compression, Decompress};
@@ -1308,7 +1351,7 @@ mod tests {
             session_id: CryptoVec::new(),
             channels: HashMap::new(),
             last_channel_id: Wrapping(0),
-            write: Vec::new(),
+            write: bytes::BytesMut::new(),
             write_cursor: 0,
             server_compression: Compression::None,
             client_compression: Compression::None,
@@ -1929,7 +1972,7 @@ mod tests {
         encrypted
             .channels
             .insert(channel_id, test_channel(channel_id, 42, false, false));
-        push_packet!(encrypted.write, encrypted.write.push(msg::REQUEST_SUCCESS));
+        push_packet!(encrypted.write, encrypted.write.put_u8(msg::REQUEST_SUCCESS));
 
         let mut writer = PacketWriter::clear();
         encrypted
@@ -2070,7 +2113,7 @@ mod tests {
         encrypted
             .channels
             .insert(channel_id, test_ready_channel(channel_id, 44));
-        push_packet!(encrypted.write, encrypted.write.push(msg::REQUEST_SUCCESS));
+        push_packet!(encrypted.write, encrypted.write.put_u8(msg::REQUEST_SUCCESS));
 
         let mut writer = PacketWriter::clear();
         encrypted
@@ -2098,7 +2141,7 @@ mod tests {
         channel.recipient_window_size = 256 * 1024;
         channel.recipient_maximum_packet_size = 32 * 1024;
         encrypted.channels.insert(channel_id, channel);
-        push_packet!(encrypted.write, encrypted.write.push(msg::REQUEST_SUCCESS));
+        push_packet!(encrypted.write, encrypted.write.put_u8(msg::REQUEST_SUCCESS));
 
         let mut writer = PacketWriter::clear();
         encrypted
