@@ -825,7 +825,42 @@ impl Encrypted {
         if cap == 0 {
             return Ok(0);
         }
-        let mut gathered = Vec::with_capacity(cap.min(4096));
+        // Fast path (steady state): the head entry alone fills this packet,
+        // so hand its `Bytes` straight to `data_noqueue`. Staging it through
+        // `gathered` first costs a full payload memcpy plus the realloc
+        // churn of growing a 4 KiB Vec to `max_packet_size` — per packet.
+        let head = channel
+            .pending_data
+            .front()
+            .map(|(b, e, f)| (b.len().saturating_sub(*f), *e));
+        if let Some((avail, head_ext)) = head {
+            let take = avail.min(cap);
+            let alone = take == cap
+                || channel.pending_data.len() == 1
+                || channel.pending_data.get(1).map(|(_, e, _)| *e) != Some(head_ext);
+            if take > 0 && alone {
+                let Some((buf, ext, from, seq)) = channel.pop_data_front() else {
+                    return Ok(0);
+                };
+                let end = from.saturating_add(take);
+                let chunk = buf.slice(from..end);
+                if end < buf.len() {
+                    channel.push_data_front(buf, ext, end, seq);
+                }
+                channel.boost_pending = false;
+                let size = if write.is_empty() {
+                    if let Some(ref mut w) = writer {
+                        Self::data_noqueue_direct(w, channel, &chunk, ext, 0)?
+                    } else {
+                        Self::data_noqueue(write, channel, &chunk, ext, 0)?
+                    }
+                } else {
+                    Self::data_noqueue(write, channel, &chunk, ext, 0)?
+                };
+                return Ok(size);
+            }
+        }
+        let mut gathered = Vec::with_capacity(cap);
         while gathered.len() < cap {
             if channel.ctrl_ahead_of_data() {
                 break;
