@@ -99,8 +99,8 @@ Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
   and a pass/fail judge (`soak-results/REPEAT_VERIFY.md`, JSON in
   `soak-results/judges/`):
   - 15s freeze × 5, 3×15s on one connection, upload-only × 3, 30s freeze × 2,
-    180s unlimited, **180s with 8 MiB rekey** (`idle_drops=29`; I5-only
-    counters — peer-driven completes are a later `/stats` field)
+    180s unlimited, **180s with 8 MiB rekey** (I5 `idle_drops=29`;
+    later 25s verbose run: `rekey_completes=1749`, peer-driven)
   - **Negative control:** putting `more_lanes { continue }` back did **not**
     fail 180s unlimited or 15s freeze-catchup. Fast sink drain keeps
     `more_lanes` from staying true; this harness does not nail that as the

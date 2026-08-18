@@ -41,12 +41,25 @@ log is no longer a silent pass).
 `rekey_completes` in addition to I5 `rekey_triggers` /
 `rekey_idle_drops` / `rekey_merges`. `--min-rekey-triggers` only
 counts server-initiated I5; `--min-rekey-completes` is the coverage
-gate. The 180s 8 MiB run predates those fields (`triggers=1`,
-`idle_drops=29`). That is **not** ~14000 I5 fires: either the peer
-won almost every 8 MiB race (then `rekey_completes` should be
-thousands) or `bytes_this_epoch` / I5 is nearly idle (then
-`rekey_completes` stays near 1). A short `SSH_VERBOSE=1` rerun
-records which.
+gate.
+
+Confirmed (25s upload-only, `REKEY_LIMIT=8M`, `--max-bytes=8388608`,
+`SSH_VERBOSE=-vv`, `soak-results/judges/rekey8m-verbose/`):
+
+- 14.2 GiB in, peak 585 MB/s, zero gaps, `disconnects=0`
+- `rekey_triggers=0` `idle_drops=0` `merges=0`
+- `rekey_peer_starts=1749` `rekey_begins=1749` `rekey_completes=1749`
+- ssh.stderr: `SSH2_MSG_KEXINIT` 3500 (sent+recv ≈ 2×1749 + initial),
+  `ssh_set_newkeys: rekeying in` 1749
+
+So I5/`bytes_this_epoch` is **not** stuck at ~0. OpenSSH wins the 8 MiB
+race almost every time; russh completes the peer-driven kex (same
+family as a successful `begin_rekey`, not the `exchange.take()` bug).
+The 180s 109.6 GiB run (`triggers=1`, `idle_drops=29`) is the same
+regime: ~109.6 GiB / ~8.1 MiB ≈ **13500** completed rekeys, not "I5
+only fired 30 times". That is stronger than the original soak's 5854
+I5 triggers. `triggers=1` on that run is I5 winning once; it is not
+the completion count.
 
 ## Live OpenSSH → `s8_matrix_server` (fixed binary)
 
@@ -57,7 +70,8 @@ records which.
 | 15s freeze, upload only | 3 | **3/3** | peaks 886–967 MB/s |
 | 30s freeze (io-timeout=freeze+60) | 2 | **2/2** | peaks 765–778 MB/s |
 | 180s unlimited, no freeze | 1 | **pass** | 156.5 GiB; peak 933 MB/s; zero gaps |
-| 180s unlimited, **8 MiB rekey** | 1 | **pass** | 109.6 GiB; peak 662 MB/s; zero gaps; `rekey_triggers=1` `rekey_idle_drops=29` `disconnects=0` |
+| 180s unlimited, **8 MiB rekey** | 1 | **pass** | 109.6 GiB; peak 662 MB/s; zero gaps; I5 `triggers=1` `idle_drops=29`; peer-driven completes not exported yet |
+| 25s upload, **8 MiB rekey** + verbose | 1 | **pass** | 14.2 GiB; peak 585 MB/s; `completes=1749` `peer_starts=1749` `triggers=0` |
 
 ## Negative control (`more_lanes { continue }` restored, then reverted)
 
@@ -89,8 +103,9 @@ is.
 - **`more_lanes` skip-select:** session must-red (peer ADJUST starved).
   Live 12/12 remains "healthy after fix", not causality. Nailed in
   unit, not by this harness's negative control.
-- **Flood × volume rekey:** 8 MiB I5 + OpenSSH `RekeyLimit=8M` for 180s
-  did not stall/close. I5 counters (`triggers=1`, `idle_drops=29`) do
-  **not** count peer-driven kex; attribution of the ~14000 threshold
-  crossings is pending `rekey_completes` / `SSH_VERBOSE`. Not a
-  5854-trigger 10h soak.
+- **Flood × volume rekey:** 25s verbose run completed **1749** peer-driven
+  rekeys at ~585 MB/s with zero gaps (`triggers=0`). The 180s 109.6 GiB
+  run is the same race (OpenSSH `RekeyLimit=8M` wins; I5 `triggers=1`
+  is not the completion count). Stronger than the original soak's 5854
+  I5 triggers. Nailed as "peer-driven volume rekey under flood does
+  not stall/close"; not a 10h soak.
