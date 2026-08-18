@@ -94,11 +94,13 @@ Fix: `LaneTable::grant_plan(id) -> (occ, remaining)` under one lock;
   ignored (`occupancy=64`, `overflows=0`, `over_window_drops=2`).
   `window_grant_is_lane_only` / omit-lane red / G7 still pass.
 - Live, **unlimited** OpenSSH freeze-catchup with `RUST_LOG=russh=warn`
-  and a pass/fail judge (`soak-results/REPEAT_VERIFY.md`):
-  - 15s freeze × 5 independent 3-channel sessions: **5/5**, peaks 769–800 MB/s
-  - 3×15s freeze on **one** connection: 3 SIGSTOP gaps only, peak 913 MB/s
-  - upload-only (the 12.7h victim) × 3: **3/3**, peaks 886–967 MB/s
-  - 30s freeze × 2 (after fixing traffic.py `wait_for` vs SIGSTOP): **2/2**
-  - 180s continuous unlimited: 156.5 GiB, peak 933 MB/s, **no jsonl gaps**
-  - 12 judged passes; no `inbound lane overflow` / over-window warn
+  and a pass/fail judge (`soak-results/REPEAT_VERIFY.md`, JSON in
+  `soak-results/judges/`):
+  - 15s freeze × 5, 3×15s on one connection, upload-only × 3, 30s freeze × 2,
+    180s unlimited, **180s with 8 MiB rekey** (`idle_drops=29`)
+  - **Negative control:** putting `more_lanes { continue }` back did **not**
+    fail 180s unlimited or 15s freeze-catchup. Fast sink drain keeps
+    `more_lanes` from staying true; this harness does not nail that as the
+    soak root cause. The select-arm change is still the right code.
+
 

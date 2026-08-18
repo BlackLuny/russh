@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "samples": 179,
+  "t0": 1.006,
+  "tN": 180.325,
+  "bytes_in": 9354996160,
+  "bytes_out": 156526938312,
+  "min_live": 3,
+  "max_io_errors": 0,
+  "max_verify_errors": 0,
+  "gaps": [],
+  "peak_out_bps": 932655246.0317501,
+  "peak_in_bps": 53356413.51888669,
+  "peak_out_t": [
+    98.715,
+    99.723
+  ],
+  "peak_in_t": [
+    3.02,
+    4.026
+  ],
+  "fails": []
+}
