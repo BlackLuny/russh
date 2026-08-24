@@ -1,0 +1,22 @@
+[package]
+name = "sunset-loopback-bench"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+embedded-io-async = "0.7"
+tokio = { version = "1", features = ["full"] }
+critical-section = { version = "1", features = ["std"] }
+sunset = { path = "/tmp/ssh-proxy-cmp/sunset", features = ["std"] }
+sunset-async = { path = "/tmp/ssh-proxy-cmp/sunset/async", features = ["std", "tokio", "multi-thread"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+panic = "abort"
