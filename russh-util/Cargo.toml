@@ -10,6 +10,7 @@ license = "Apache-2.0"
 repository = "https://github.com/warp-tech/russh"
 
 [dependencies]
+pin-project = "1"
 tokio = { workspace = true, features = ["sync", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
