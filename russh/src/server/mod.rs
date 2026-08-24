@@ -41,7 +41,6 @@ use futures::future::Future;
 use log::{debug, error, info, warn};
 use msg::{is_kex_msg, validate_client_msg_strict_kex};
 use russh_util::runtime::JoinHandle;
-use russh_util::time::Instant;
 use ssh_key::{Certificate, PrivateKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, ToSocketAddrs};
@@ -58,10 +57,42 @@ use crate::*;
 
 mod kex;
 mod session;
+mod session_facade;
+pub(crate) mod executor;
+pub(crate) mod global_budget;
 pub use self::session::*;
+pub use self::global_budget::{
+    GlobalBudget, DEFAULT_GLOBAL_BYTE_BUDGET, DEFAULT_MAX_CONNECTIONS, OUTBOUND_CAP_ESTIMATE,
+    WRITER_KEX_BUDGET,
+};
+#[cfg(feature = "_test_hooks")]
+pub use self::executor::{HandleObserveSlot, HandlerObserveSlot, SlotObserveSlot};
+#[cfg(feature = "_test_hooks")]
+pub use self::global_budget::AdmitSplitGate;
 mod encrypted;
 pub mod supervisor;
-pub use self::supervisor::{DisconnectCause, DisconnectCauseSlot, WriteProgress};
+pub mod writer;
+pub mod reader;
+pub(crate) mod inbound_lane;
+pub use self::supervisor::{
+    AtomicWriteProgress, DisconnectCause, DisconnectCauseSlot, WriteProgress,
+};
+#[cfg(feature = "_test_hooks")]
+pub use self::supervisor::{
+    CapacityChainSlot, CompressionObserveSlot, DeferredGrantSlot, FullLedger, InjectIgnoreGate,
+    InstallAckHoldGate, KexInstallObserveSlot, LedgerMaxSlot, NeedSubmitSeenSlot,
+    OutboundOrderSlot, ReplyQueueSlot, SchedSlot, StopDiscardSlot, WatchdogObserveSlot,
+};
+#[cfg(feature = "_test_hooks")]
+pub use self::reader::{MidPacketHold, ReadHoldGate, ReaderObserveSlot};
+#[cfg(feature = "_test_hooks")]
+pub use self::writer::WriterObserveSlot;
+#[cfg(feature = "_test_hooks")]
+pub use self::inbound_lane::LaneObserveSlot;
+#[cfg(feature = "_test_hooks")]
+pub use self::inbound_lane::WindowObserveSlot;
+pub use self::inbound_lane::PeerCreditBoard;
+pub use self::writer::{WriterHandle, WriterEvent, KEX_QUEUE_CAP};
 
 /// Configuration of a server.
 pub struct Config {
@@ -77,8 +108,9 @@ pub struct Config {
     pub auth_rejection_time_initial: Option<std::time::Duration>,
     /// The server's keys. The first key pair in the client's preference order will be chosen.
     pub keys: Vec<PrivateKey>,
-    /// The bytes and time limits before key re-exchange.
-    pub limits: Limits,
+    /// Per-epoch rekey hard limits (packets / bytes). No time trigger;
+    /// the in-flight completion deadline is `rekey_deadline`.
+    pub limits: RekeyPolicy,
     /// The initial size of a channel (used for flow control).
     pub window_size: u32,
     /// The maximal size of a single packet.
@@ -87,12 +119,16 @@ pub struct Config {
     pub channel_buffer_size: usize,
     /// Internal event buffer size
     pub event_buffer_size: usize,
-    /// Hard safety cap on the number of inbound payload bytes that may be queued per channel
-    /// while its application buffer is full (head-of-line backpressure, see
-    /// `RC2_HOL_FIX_DESIGN.md`). With delivery-gated window grants a well-behaved peer can hold at
-    /// most ~`window_size` bytes in flight, so this only trips when a peer ignores its advertised
-    /// window; exceeding it closes that one channel as a protocol violation, never the session.
-    pub max_pending_inbound_bytes: usize,
+    /// S3b ctrl byte budget. Full → Cancelling (I2'). Default 2 MiB.
+    pub inbound_ctrl_budget: usize,
+    /// Extra zero-byte / REQUEST slots in the per-channel count bound (`K`).
+    pub inbound_lane_count_slack: usize,
+    /// Smallest packet used for `count_cap = window / min(8, this) + K`.
+    pub inbound_min_packet_size: u32,
+    /// When true, over-window inbound DATA would disconnect. Default
+    /// **false**; this slice does not wire the disconnect (RFC 4254 §5.2
+    /// extra-data ignore stays). Independent decision later.
+    pub strict_window_enforcement: bool,
     /// Hard safety cap on the number of outbound payload bytes that may be queued per channel
     /// while the peer's receive window is exhausted.
     ///
@@ -134,6 +170,302 @@ pub struct Config {
     /// Test-only first-cause slot (S1 harness). Production leaves this `None`.
     #[cfg(feature = "_test_hooks")]
     pub disconnect_cause_slot: Option<std::sync::Arc<supervisor::DisconnectCauseSlot>>,
+    /// Test-only: delay Session consumption of Writer InstallAck until released.
+    #[cfg(feature = "_test_hooks")]
+    pub install_ack_hold: Option<std::sync::Arc<supervisor::InstallAckHoldGate>>,
+    /// Test-only: count NeedSubmit entries for atomic KEX install.
+    #[cfg(feature = "_test_hooks")]
+    pub need_submit_seen: Option<std::sync::Arc<supervisor::NeedSubmitSeenSlot>>,
+    /// Test-only: live KEX install phase + non-Idle observation for R2/R3/R5/R6.
+    #[cfg(feature = "_test_hooks")]
+    pub kex_install_observe: Option<std::sync::Arc<supervisor::KexInstallObserveSlot>>,
+    /// Test-only: atomic max of sealed_backlog_bytes (R4 numerical bound).
+    #[cfg(feature = "_test_hooks")]
+    pub ledger_max: Option<std::sync::Arc<supervisor::LedgerMaxSlot>>,
+    /// Test-only: next Writer seal fails once (R5 ACK/Writer-fail inject).
+    #[cfg(feature = "_test_hooks")]
+    pub fail_next_seal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: when true, Writer hangs socket writes (HangWrite) but still
+    /// dequeues/seals into out_q — deterministic Full / NeedSubmit (R2/R3/R4).
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: next bulk try_send / SealBatch returns Full once (R2/R3/R4).
+    #[cfg(feature = "_test_hooks")]
+    pub force_next_bulk_full: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: next Writer socket write fails once with an I/O error (R5).
+    #[cfg(feature = "_test_hooks")]
+    pub fail_next_socket_write: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: disable the 20ms NeedSubmit poll sleep so the ONLY liveness
+    /// source for a parked KEX install is the Writer capacity notify (R3).
+    #[cfg(feature = "_test_hooks")]
+    pub need_submit_timer_disable: bool,
+    /// Test-only: disable the 50ms deferred-grant poll so a connection
+    /// starved by global-budget exhaust is only replayed on its own
+    /// loop events (F3 invert / D30).
+    #[cfg(feature = "_test_hooks")]
+    pub deferred_grant_timer_disable: bool,
+    /// Test-only: R3 liveness chain counters (dequeue notify → capacity arm →
+    /// install advance).
+    #[cfg(feature = "_test_hooks")]
+    pub capacity_chain: Option<std::sync::Arc<supervisor::CapacityChainSlot>>,
+    /// Test-only: count inbound CHANNEL_WINDOW_ADJUST packets (F1 replenishment
+    /// proof — each arriving adjust is one credit replenishment).
+    #[cfg(feature = "_test_hooks")]
+    pub window_adjust_seen: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Test-only: pause Writer mpsc dequeue (R3 one-cmd gate).
+    #[cfg(feature = "_test_hooks")]
+    pub dequeue_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: wake Session to emit one IGNORE into the Writer mpsc (R3).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_ignore: Option<std::sync::Arc<supervisor::InjectIgnoreGate>>,
+    /// Test-only: deferred WINDOW_ADJUST insert/replay/emitted counters.
+    #[cfg(feature = "_test_hooks")]
+    pub deferred_grant: Option<std::sync::Arc<supervisor::DeferredGrantSlot>>,
+    /// Test-only: write-watchdog armed / eligible / rekey-gen edges.
+    #[cfg(feature = "_test_hooks")]
+    pub watchdog_observe: Option<std::sync::Arc<supervisor::WatchdogObserveSlot>>,
+    /// Test-only: per-channel outbound emit order (S2c fence / wire order).
+    #[cfg(feature = "_test_hooks")]
+    pub outbound_order: Option<std::sync::Arc<supervisor::OutboundOrderSlot>>,
+    /// Test-only: hold Session consumption of Reader inbound InstallAck (N8).
+    #[cfg(feature = "_test_hooks")]
+    pub inbound_ack_hold: Option<std::sync::Arc<supervisor::InstallAckHoldGate>>,
+    /// Test-only: observe Reader park/await/apply (N1–N8 / mid-read).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_observe: Option<std::sync::Arc<reader::ReaderObserveSlot>>,
+    /// Test-only: hold Reader at packet boundary before `cipher::read` (risk 2).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_read_hold: Option<std::sync::Arc<reader::ReadHoldGate>>,
+    /// Test-only: next inbound epoch try_push fails as Full (N7).
+    #[cfg(feature = "_test_hooks")]
+    pub force_inbound_install_full: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: skip NeedsReply inbound send so NEWKEYS-first is forced (N2).
+    #[cfg(feature = "_test_hooks")]
+    pub delay_inbound_epoch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: stall `cipher::read` mid-packet (risk-2 hard test).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_mid_packet_hold: Option<std::sync::Arc<reader::MidPacketHold>>,
+    /// Test-only: next Reader transport read becomes ReadError.
+    #[cfg(feature = "_test_hooks")]
+    pub reader_fail_next_read: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: hold Reader after inbound epoch recv, before apply (N5).
+    #[cfg(feature = "_test_hooks")]
+    pub reader_apply_hold: Option<std::sync::Arc<reader::ReadHoldGate>>,
+    /// Test-only: Writer took the socket-hang path with sealed-but-undrained bytes.
+    #[cfg(feature = "_test_hooks")]
+    pub socket_hang_seen: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: queued SUCCESS/FAILURE count (S2c fix1 generation admit).
+    #[cfg(feature = "_test_hooks")]
+    pub reply_queue: Option<std::sync::Arc<supervisor::ReplyQueueSlot>>,
+    /// Test-only: S2d ready-set / boost counters.
+    #[cfg(feature = "_test_hooks")]
+    pub sched: Option<std::sync::Arc<supervisor::SchedSlot>>,
+    /// Test-only: skip first-packet boost (on/off position contrast).
+    #[cfg(feature = "_test_hooks")]
+    pub disable_sched_boost: bool,
+    /// S7b invert: DATA drain serves only the lowest ready ChannelId.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_sched_greedy: bool,
+    /// S7b invert: DATA drain serves only `boost_pending` channels.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_sched_boost_starve: bool,
+    /// Test-only: StopDiscard discarded-item / grant-clear counters.
+    #[cfg(feature = "_test_hooks")]
+    pub stop_discard: Option<std::sync::Arc<supervisor::StopDiscardSlot>>,
+    /// Next ctrl try_push fails (S3b Q7).
+    #[cfg(feature = "_test_hooks")]
+    pub force_ctrl_full: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "_test_hooks")]
+    pub lane_observe: Option<std::sync::Arc<inbound_lane::LaneObserveSlot>>,
+    /// Session skips pumping Reader lanes (S3b Q6 fill).
+    #[cfg(feature = "_test_hooks")]
+    pub lane_pump_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: sleep after each REQUEST pop so a live producer can
+    /// keep the lane non-empty (H21). Production is always `None`.
+    #[cfg(feature = "_test_hooks")]
+    pub lane_request_pop_delay: Option<std::time::Duration>,
+    #[cfg(feature = "_test_hooks")]
+    pub inject_zero_data: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// After the next real DATA, flood the lane until Overflow (Q5).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_until_overflow: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// After the next real DATA, inject CHANNEL_CLOSE for this channel id (0 = off).
+    #[cfg(feature = "_test_hooks")]
+    pub inject_close_for: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Test-only: grant-order / ADJUST-bypass counters (W2/W3).
+    #[cfg(feature = "_test_hooks")]
+    pub window_observe: Option<std::sync::Arc<inbound_lane::WindowObserveSlot>>,
+    /// Test-only: swap emit-ADJUST / expand in `grant_expand_then_adjust`
+    /// (same two production calls, inverted). Proves W3 is a real must-fail.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_grant_order: bool,
+    /// Test-only: inject the in-flight ADJUST aggregation board.
+    #[cfg(feature = "_test_hooks")]
+    pub peer_credit: Option<std::sync::Arc<inbound_lane::PeerCreditBoard>>,
+    /// Per-callback timeout for HandlerExecutor (S4b). Default 30s.
+    pub handler_callback_timeout: std::time::Duration,
+    /// Invoke queue depth (1 running + queued). Default 32.
+    pub max_in_flight_handler_queue: usize,
+    /// Cap on pending want-reply obligations per queue (one global
+    /// queue, one per channel). Exceeding it is protocol abuse and
+    /// tears the connection down. Default 4096.
+    pub max_pending_want_replies: usize,
+    /// Hard cap on `opening + active + closing` channels (S4c).
+    /// Default 128. zfc can raise this.
+    pub max_channels: usize,
+    /// How long a peer CHANNEL_OPEN may stay in `opening` before
+    /// Session emits OPEN_FAILURE, releases the slot, and invalidates
+    /// the handle generation. Default 30s.
+    pub open_decision_deadline: std::time::Duration,
+    /// Process-level byte ceiling (S4d). Three categories share one
+    /// ledger: inbound grant credit, opening reservation
+    /// (`window_size + OUTBOUND_CAP_ESTIMATE`), and per-connection
+    /// fixed protocol (`inbound_ctrl_budget + WRITER_KEX_BUDGET`).
+    /// Default is a conservative 4 TiB counter — not an allocation —
+    /// sized so a fully loaded default connection still fits in its
+    /// floor. Set an explicit value to enforce a host cap.
+    pub global_byte_budget: u64,
+    /// Process-level connection cap (S4d). Enforced by CAS at
+    /// `run_stream` entry; the default (4096) is large enough that
+    /// existing single-connection tests are unaffected.
+    pub max_connections: usize,
+    /// Optional override for the per-connection exclusive floor.
+    /// `None` (default) uses `global_byte_budget / max_connections`.
+    /// The effective floor is `min(declared_need, this, budget/max)`.
+    /// Excess above floor may be taken by other connections; unused
+    /// connection slots keep their floor reserved so a large
+    /// connection cannot starve a later one.
+    pub per_connection_floor: Option<u64>,
+    /// Shared process ledger. `None` → created from the three fields
+    /// above on first `run_stream` / `run_on_socket`. Tests that share
+    /// one ledger across configs set this to `Some`.
+    pub global_budget: Option<std::sync::Arc<global_budget::GlobalBudget>>,
+    /// Lazy init when `global_budget` is None. Public so `Config { .. }`
+    /// updates from other crates keep compiling; do not write this field.
+    pub budget_cell: std::sync::OnceLock<std::sync::Arc<global_budget::GlobalBudget>>,
+    /// Test-only G4 invert: expand Reader cap before reserving global
+    /// credit (same two production operations, swapped). G4 must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_global_before_expand: bool,
+    /// Test-only: if `Some` and the atomic is > 0, `maybe_grant_after_delivery`
+    /// uses that value as the inbound grant target (ceiling growth without
+    /// going through `Handler::adjust_window` nest-wait).
+    #[cfg(feature = "_test_hooks")]
+    pub grant_target_override: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Test-only G7 invert: `grant_expand_then_adjust` rereads the
+    /// window and recomputes Δ (S4d r1 P1-1). G7 must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_recompute_grant_delta: bool,
+    /// Test-only: Handle event-queue occupancy / parked sender (H9).
+    #[cfg(feature = "_test_hooks")]
+    pub handle_observe: Option<std::sync::Arc<executor::HandleObserveSlot>>,
+    /// Test-only: Handler::data call count / timeout linger / dropped Invokes.
+    #[cfg(feature = "_test_hooks")]
+    pub handler_observe: Option<std::sync::Arc<executor::HandlerObserveSlot>>,
+    /// Test-only H1 invert: Delivered DATA also calls Handler::data and waits.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_delivered_handler_data: bool,
+    /// Test-only H4 invert: skip facade drain while a callback is in-flight.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_facade_drain: bool,
+    /// Test-only: Session does not recv ctrl (w7 used to pin the loop in Handler::data).
+    #[cfg(feature = "_test_hooks")]
+    pub hold_session_ctrl: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only: channel slot occupancy / expire / full-reject (L1–L5).
+    #[cfg(feature = "_test_hooks")]
+    pub slot_observe: Option<std::sync::Arc<executor::SlotObserveSlot>>,
+    /// Test-only L4 invert: flush CONFIRMATION before register_lane
+    /// (S3c #13 inverted). L4 must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_open_confirm_before_lane: bool,
+    /// Test-only S5a invert: grant `undelivered = 0` (omit lane occupancy).
+    /// Q8 must go red with an enumerated failure class.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_omit_lane_from_undelivered: bool,
+    /// Test-only S5a invert: pop the lane before `try_reserve` and
+    /// `send().await` (old session-loop stall). Isolation must go red.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_eager_lane_pop: bool,
+    /// Test-only S5a invert: skip StopDiscard when a CLOSE is already
+    /// in the lane but the app buffer / Executor is Full. Dual-Full
+    /// regression must go red (`still_accepts_ctrl`).
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_close_discard_on_park: bool,
+    /// Test-only ackstall invert: skip `settle_outbound_after_stage`
+    /// (drain → flush → release). Combined with
+    /// `pin_outbound_before_credit`, Handle::data must stall.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_outbound_settle: bool,
+    /// S9 P2 invert: `retry_pending_outbound` gates the parked command on
+    /// the session-wide `sealed_backlog_bytes()` (which already counts that
+    /// command *and* the un-submitted `enc.write` only `flush_apply` can
+    /// drain) instead of the Writer's own backlog. Restores the retry/flush
+    /// deadlock: enough concurrent bulk channels plus a volume rekey wedge
+    /// the session permanently.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_retry_global_hwm: bool,
+    /// S5b invert: server `Channel::data` uses the stale WindowSizeRef
+    /// mirror (Session no longer updates it). Window-0 then ADJUST stalls.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_channel_window_mirror: bool,
+    /// S5b invert: `discard_channel_outbound` leaves parked acks so a
+    /// later `release_outbound_acks` can Ok a discarded producer.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_discard_ack_drop: bool,
+    /// S5b-fix1 invert: wake at most once per channel (P1-A multi-writer
+    /// starvation). Second parked ChannelTx must stay Pending.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_single_writer_wake: bool,
+    /// S5b-fix1 invert: `finalize_close` skips wake (P1-B). Parked
+    /// notify writers stay Pending after the channel object is gone.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_teardown_wake: bool,
+    /// Test-only ackstall pin: apply aggregation-board credit *after*
+    /// the loop-top batch drain so a `ChannelDataAcked` is dispatched
+    /// before WINDOW_ADJUST is applied (data-msg-before-ADJUST).
+    #[cfg(feature = "_test_hooks")]
+    pub pin_outbound_before_credit: bool,
+    /// I6 rekey counters (always compiled; inject a shared Arc from tests).
+    pub rekey_i6: std::sync::Arc<session::RekeyI6>,
+    /// S6a: override I5 packet threshold (`limits.max_packets` when `None`).
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_max_packets_override: Option<u64>,
+    /// S6a: share Writer packets atomic (wrap-near inject).
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_out_packets: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: share Writer `cipher_bytes` atomic (W6 inject).
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_out_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: share Reader packets atomic.
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_in_packets: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: share Reader bytes atomic.
+    #[cfg(feature = "_test_hooks")]
+    pub rekey_in_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// S6a: Writer observe slot (seqn / packets), distinct from production atomics.
+    #[cfg(feature = "_test_hooks")]
+    pub writer_observe: Option<std::sync::Arc<writer::WriterObserveSlot>>,
+    /// S6a invert: flush reads observe slots instead of production atomics.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_i5_observe_only: bool,
+    /// S6a invert: flush ignores packet-count predicates.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_packet_rekey: bool,
+    /// S6a invert: flush `begin_rekey` even when `kex != Idle`.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_idle_gate: bool,
+    /// S6a invert: `begin_rekey` ignores an open pending install.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_skip_pending_rekey_guard: bool,
+    /// S6a invert: tombstone drop increments outbound packet count.
+    #[cfg(feature = "_test_hooks")]
+    pub invert_tombstone_counts: bool,
+    /// S6c: negotiated compression enums + activate flags.
+    #[cfg(feature = "_test_hooks")]
+    pub compression_observe: Option<std::sync::Arc<supervisor::CompressionObserveSlot>>,
+    /// S6c invert: epoch install keeps the old Compress/Decompress (must-red).
+    #[cfg(feature = "_test_hooks")]
+    pub invert_keep_old_decompress: bool,
 }
 
 impl Default for Config {
@@ -153,9 +485,12 @@ impl Default for Config {
             maximum_packet_size: 32768,
             channel_buffer_size: 100,
             event_buffer_size: 10,
-            max_pending_inbound_bytes: 8 * 2_000_000,
+            inbound_ctrl_budget: crate::server::inbound_lane::INBOUND_CTRL_BUDGET,
+            inbound_lane_count_slack: crate::server::inbound_lane::INBOUND_LANE_COUNT_SLACK,
+            inbound_min_packet_size: crate::server::inbound_lane::INBOUND_LANE_MIN_PACKET as u32,
+            strict_window_enforcement: false,
             max_pending_outbound_bytes: 8 * 2_000_000,
-            limits: Limits::default(),
+            limits: RekeyPolicy::default(),
             preferred: Default::default(),
             max_auth_attempts: 10,
             inactivity_timeout: Some(std::time::Duration::from_secs(600)),
@@ -172,7 +507,188 @@ impl Default for Config {
             teardown_grace: std::time::Duration::from_secs(5),
             #[cfg(feature = "_test_hooks")]
             disconnect_cause_slot: None,
+            #[cfg(feature = "_test_hooks")]
+            install_ack_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            need_submit_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            kex_install_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            ledger_max: None,
+            #[cfg(feature = "_test_hooks")]
+            fail_next_seal: None,
+            #[cfg(feature = "_test_hooks")]
+            socket_hang: None,
+            #[cfg(feature = "_test_hooks")]
+            force_next_bulk_full: None,
+            #[cfg(feature = "_test_hooks")]
+            fail_next_socket_write: None,
+            #[cfg(feature = "_test_hooks")]
+            need_submit_timer_disable: false,
+            #[cfg(feature = "_test_hooks")]
+            deferred_grant_timer_disable: false,
+            #[cfg(feature = "_test_hooks")]
+            capacity_chain: None,
+            #[cfg(feature = "_test_hooks")]
+            window_adjust_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            dequeue_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_ignore: None,
+            #[cfg(feature = "_test_hooks")]
+            deferred_grant: None,
+            #[cfg(feature = "_test_hooks")]
+            watchdog_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            outbound_order: None,
+            #[cfg(feature = "_test_hooks")]
+            inbound_ack_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_read_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            force_inbound_install_full: None,
+            #[cfg(feature = "_test_hooks")]
+            delay_inbound_epoch: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_mid_packet_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_fail_next_read: None,
+            #[cfg(feature = "_test_hooks")]
+            reader_apply_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            socket_hang_seen: None,
+            #[cfg(feature = "_test_hooks")]
+            reply_queue: None,
+            #[cfg(feature = "_test_hooks")]
+            sched: None,
+            #[cfg(feature = "_test_hooks")]
+            disable_sched_boost: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_sched_greedy: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_sched_boost_starve: false,
+            #[cfg(feature = "_test_hooks")]
+            stop_discard: None,
+            #[cfg(feature = "_test_hooks")]
+            force_ctrl_full: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_pump_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            lane_request_pop_delay: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_zero_data: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_until_overflow: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_close_for: None,
+            #[cfg(feature = "_test_hooks")]
+            window_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_grant_order: false,
+            #[cfg(feature = "_test_hooks")]
+            peer_credit: None,
+            handler_callback_timeout: crate::server::executor::DEFAULT_HANDLER_TIMEOUT,
+            max_in_flight_handler_queue: crate::server::executor::DEFAULT_HANDLER_QUEUE,
+            max_pending_want_replies: crate::server::executor::DEFAULT_MAX_PENDING_WANT_REPLIES,
+            max_channels: crate::server::executor::DEFAULT_MAX_CHANNELS,
+            open_decision_deadline: crate::server::executor::DEFAULT_OPEN_DECISION_DEADLINE,
+            global_byte_budget: crate::server::global_budget::DEFAULT_GLOBAL_BYTE_BUDGET,
+            max_connections: crate::server::global_budget::DEFAULT_MAX_CONNECTIONS,
+            per_connection_floor: None,
+            global_budget: None,
+            budget_cell: std::sync::OnceLock::new(),
+            #[cfg(feature = "_test_hooks")]
+            invert_global_before_expand: false,
+            #[cfg(feature = "_test_hooks")]
+            grant_target_override: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_recompute_grant_delta: false,
+            #[cfg(feature = "_test_hooks")]
+            handle_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            handler_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_delivered_handler_data: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_facade_drain: false,
+            #[cfg(feature = "_test_hooks")]
+            hold_session_ctrl: None,
+            #[cfg(feature = "_test_hooks")]
+            slot_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_open_confirm_before_lane: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_omit_lane_from_undelivered: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_eager_lane_pop: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_close_discard_on_park: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_outbound_settle: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_retry_global_hwm: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_channel_window_mirror: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_discard_ack_drop: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_single_writer_wake: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_teardown_wake: false,
+            #[cfg(feature = "_test_hooks")]
+            pin_outbound_before_credit: false,
+            rekey_i6: session::RekeyI6::new(),
+            #[cfg(feature = "_test_hooks")]
+            rekey_max_packets_override: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_out_packets: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_out_bytes: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_in_packets: None,
+            #[cfg(feature = "_test_hooks")]
+            rekey_in_bytes: None,
+            #[cfg(feature = "_test_hooks")]
+            writer_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_i5_observe_only: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_packet_rekey: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_idle_gate: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_skip_pending_rekey_guard: false,
+            #[cfg(feature = "_test_hooks")]
+            invert_tombstone_counts: false,
+            #[cfg(feature = "_test_hooks")]
+            compression_observe: None,
+            #[cfg(feature = "_test_hooks")]
+            invert_keep_old_decompress: false,
         }
+    }
+}
+
+impl Config {
+    /// Process-level ledger shared by every `run_stream` on this config.
+    /// Prefers `global_budget` if set; otherwise lazily builds one from
+    /// `global_byte_budget` / `max_connections` / `per_connection_floor`.
+    pub fn shared_budget(&self) -> std::sync::Arc<global_budget::GlobalBudget> {
+        if let Some(b) = &self.global_budget {
+            return b.clone();
+        }
+        self.budget_cell
+            .get_or_init(|| {
+                std::sync::Arc::new(global_budget::GlobalBudget::new(
+                    self.global_byte_budget,
+                    self.max_connections,
+                    self.per_connection_floor,
+                ))
+            })
+            .clone()
     }
 }
 
@@ -192,7 +708,6 @@ impl Debug for Config {
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("channel_buffer_size", &self.channel_buffer_size)
             .field("event_buffer_size", &self.event_buffer_size)
-            .field("max_pending_inbound_bytes", &self.max_pending_inbound_bytes)
             .field("max_pending_outbound_bytes", &self.max_pending_outbound_bytes)
             .field("limits", &self.limits)
             .field("preferred", &self.preferred)
@@ -200,6 +715,14 @@ impl Debug for Config {
             .field("inactivity_timeout", &self.inactivity_timeout)
             .field("keepalive_interval", &self.keepalive_interval)
             .field("keepalive_max", &self.keepalive_max)
+            .field("handler_callback_timeout", &self.handler_callback_timeout)
+            .field("max_in_flight_handler_queue", &self.max_in_flight_handler_queue)
+            .field("max_pending_want_replies", &self.max_pending_want_replies)
+            .field("max_channels", &self.max_channels)
+            .field("open_decision_deadline", &self.open_decision_deadline)
+            .field("global_byte_budget", &self.global_byte_budget)
+            .field("max_connections", &self.max_connections)
+            .field("per_connection_floor", &self.per_connection_floor)
             .finish()
     }
 }
@@ -1111,6 +1634,18 @@ where
     let handshake_deadline_at =
         tokio::time::Instant::now() + config.handshake_deadline;
 
+    // S4d: CAS the process ledger before any Session exists. Full →
+    // drop the socket (no banner, no half-init). DISCONNECT is not
+    // useful before the SSH id exchange.
+    let budget = config.shared_budget();
+    let conn_budget = match budget.try_acquire(&config) {
+        Ok(acc) => Some(acc),
+        Err(_) => {
+            log::debug!("max_connections / global budget: drop socket, no Session");
+            return Err(crate::Error::MaxConnections.into());
+        }
+    };
+
     // Writing SSH id (inside handshake budget).
     let mut write_buffer = SSHBuffer::new();
     write_buffer.send_ssh_id(&config.as_ref().server_id);
@@ -1130,6 +1665,19 @@ where
     let handle = server::session::Handle {
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        live: std::sync::Arc::new(crate::channels::OutboundLiveSet::default()),
+        use_acked_window: {
+            #[cfg(feature = "_test_hooks")]
+            {
+                !config.invert_channel_window_mirror
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                true
+            }
+        },
+        #[cfg(feature = "_test_hooks")]
+        observe: config.handle_observe.clone(),
     };
 
     let common = match tokio::time::timeout_at(
@@ -1150,8 +1698,9 @@ where
         pending_reads: Vec::new(),
         pending_len: 0,
         channels: HashMap::new(),
-        inbound: HashMap::new(),
+        inbound_gate: HashMap::new(),
         inbound_needs_reserve: Vec::new(),
+        backpressured: std::collections::HashSet::new(),
         outbound_acks: std::collections::HashMap::new(),
         open_global_requests: VecDeque::new(),
         kex: SessionKexState::Idle,
@@ -1160,6 +1709,35 @@ where
         rekey_gen: 0,
         rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
         handshake_deadline_at: Some(handshake_deadline_at),
+        writer: None,
+        reader: None,
+        peer_credit: None,
+        pending_supervisor_cause: None,
+        pending_outbound: crate::server::session::PendingOutbound::default(),
+        pending_kex_install: None,
+        deferred_window_grants: std::collections::HashSet::new(),
+        deferred_grant_budget: false,
+        #[cfg(feature = "_test_hooks")]
+        full_ledger: None,
+        #[cfg(feature = "_test_hooks")]
+        outbound_log_cursor: 0,
+        sched_next: None,
+        sched_since_boost: crate::BOOST_PERIOD,
+        sched_debt: None,
+        facade_cmd_tx: None,
+        facade_cmd_rx: None,
+        executor: None,
+        next_invoke_gen: 0,
+        pending_harvest: HashMap::new(),
+        facade_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        pending_open_ids: std::collections::HashSet::new(),
+        global_replies: crate::ReplyQueue::default(),
+        openings: std::collections::HashMap::new(),
+        next_channel_gen: 1,
+        conn_budget,
+        channel_global_held: HashMap::new(),
+        channel_window_covered: HashMap::new(),
     };
 
     session.begin_rekey()?;
@@ -1201,7 +1779,7 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
 
 async fn reply<H: Handler + Send>(
     session: &mut Session,
-    handler: &mut H,
+    mut handler: Option<&mut H>,
     pkt: &mut IncomingSshPacket,
 ) -> Result<(), H::Error> {
     if let Some(message_type) = pkt.buffer.first() {
@@ -1220,8 +1798,19 @@ async fn reply<H: Handler + Send>(
         }
     }
 
-    if pkt.buffer.first() == Some(&msg::KEXINIT) && session.kex == SessionKexState::Idle {
-        // Not currently in a rekey but received KEXINIT
+    // Peer KEXINIT while an outbound-install transaction is still open: park for
+    // replay after finalize (do not begin_rekey or mis-handle as encrypted app data).
+    if pkt.buffer.first() == Some(&msg::KEXINIT) && session.should_park_kexinit() {
+        debug!("parking peer KEXINIT until pending kex install completes");
+        session.park_pending_read(pkt.buffer.clone());
+        return Ok(());
+    }
+
+    if pkt.buffer.first() == Some(&msg::KEXINIT)
+        && session.kex == SessionKexState::Idle
+        && session.pending_kex_install.is_none()
+    {
+        // Not currently in a rekey / pending install but received KEXINIT
         info!("Client has initiated re-key");
         session.begin_rekey()?;
         // Kex will consume the packet right away
@@ -1230,71 +1819,241 @@ async fn reply<H: Handler + Send>(
     let is_kex_msg = pkt.buffer.first().cloned().map(is_kex_msg).unwrap_or(false);
 
     if is_kex_msg {
-        if let SessionKexState::InProgress(kex) = session.kex.take() {
-            let progress = kex
-                .step(Some(pkt), &mut session.common.packet_writer, handler)
-                .await?;
+        if let SessionKexState::InProgress(mut kex) = session.kex.take() {
+            // Collect plaintext; seal via Writer (or atomic batch+install at NEWKEYS).
+            let mut coll = crate::sshbuffer::PayloadCollector::default();
+            let progress = kex.step(Some(pkt), &mut coll, session, handler.as_mut().map(|h| &mut **h)).await?;
+            let payloads = std::mem::take(&mut coll.payloads);
 
             match progress {
-                KexProgress::NeedsReply { kex, reset_seqn } => {
+                KexProgress::NeedsReply { mut kex, reset_seqn } => {
                     debug!("kex impl continues: {kex:?}");
-                    session.kex = SessionKexState::InProgress(kex);
-                    if reset_seqn {
-                        debug!("kex impl requests seqno reset");
-                        session.common.reset_seqn();
+                    // §4.4: register atomic seal+install (after=None → wait for peer Done).
+                    if let Some(half) = kex.take_outbound_epoch_install() {
+                        let kex_gen = if kex.is_rekey() {
+                            session.rekey_gen
+                        } else {
+                            0
+                        };
+                        let post_auth = matches!(
+                            session.common.encrypted.as_ref().map(|e| &e.state),
+                            Some(
+                                EncryptedState::InitCompression
+                                    | EncryptedState::Authenticated
+                            )
+                        );
+                        let activate_compress = if half.compression.is_deferred() {
+                            post_auth
+                        } else {
+                            true
+                        };
+                        if session
+                            .register_seal_batch_and_install(
+                                payloads,
+                                kex_gen,
+                                half.cipher,
+                                half.compression,
+                                activate_compress,
+                                half.reset_seqn || reset_seqn,
+                                None, // peer Done not yet
+                            )
+                            .is_err()
+                        {
+                            // cause staged; do not put kex back / do not flush
+                            return Ok(());
+                        }
+                        let kex_gen = if kex.is_rekey() {
+                            session.rekey_gen
+                        } else {
+                            0
+                        };
+                        if session.push_inbound_from_kex(&mut kex, kex_gen).is_err() {
+                            return Ok(());
+                        }
+                    } else {
+                        if let Err(e) = session.seal_payloads(payloads) {
+                            debug!("kex seal_payloads failed: {e:?}");
+                            session.stage_cause(
+                                crate::server::DisconnectCause::PeerError,
+                            );
+                            return Ok(());
+                        }
+                        let _ = reset_seqn;
+                        // Keys may still exist (no outbound half) — try inbound anyway.
+                        let kex_gen = if kex.is_rekey() {
+                            session.rekey_gen
+                        } else {
+                            0
+                        };
+                        if session.push_inbound_from_kex(&mut kex, kex_gen).is_err() {
+                            return Ok(());
+                        }
                     }
+                    session.kex = SessionKexState::InProgress(kex);
                 }
-                KexProgress::Done { newkeys, .. } => {
+                KexProgress::Done { mut newkeys, .. } => {
                     debug!("kex impl has completed");
                     session.common.strict_kex =
                         session.common.strict_kex || newkeys.names.strict_kex();
 
+                    let need_outbound_install = !payloads.is_empty();
+
                     if session.common.encrypted.is_some() {
-                        // This is a rekey
-                        {
-                            let common = &mut session.common;
-                            common.newkeys(newkeys);
-                            common.packet_writer.buffer().bytes = 0;
-                            if let Some(enc) = common.encrypted.as_mut() {
-                                enc.last_rekey = Instant::now();
-                                enc.flush_all_pending_with_writer(&mut common.packet_writer)?;
+                        // Rekey Done — **inbound commits this turn** (peer NEWKEYS cutover).
+                        if need_outbound_install {
+                            // skip_exchange: register outbound install, then commit inbound.
+                            let kex_gen = session.rekey_gen;
+                            let post_auth = matches!(
+                                session.common.encrypted.as_ref().map(|e| &e.state),
+                                Some(
+                                    EncryptedState::InitCompression
+                                        | EncryptedState::Authenticated
+                                )
+                            );
+                            let half = kex::ServerKex::take_outbound_from_newkeys(
+                                &mut newkeys,
+                                session.common.strict_kex,
+                            );
+                            let activate_compress = if half.compression.is_deferred() {
+                                post_auth
+                            } else {
+                                true
+                            };
+                            if session
+                                .register_seal_batch_and_install(
+                                    payloads,
+                                    kex_gen,
+                                    half.cipher,
+                                    half.compression,
+                                    activate_compress,
+                                    half.reset_seqn,
+                                    Some(
+                                        crate::server::session::KexAfterInstall::RekeyComplete,
+                                    ),
+                                )
+                                .is_err()
+                            {
+                                return Ok(()); // cause staged; no flush
                             }
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    kex_gen,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            session.commit_rekey_inbound(newkeys);
+                            // Completion waits for both InstallAcks + peer Done.
+                        } else {
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    session.rekey_gen,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            session.commit_rekey_inbound(newkeys);
+                            let after =
+                                crate::server::session::KexAfterInstall::RekeyComplete;
+                            if let Some(ready) =
+                                session.merge_peer_done_into_pending(after)
+                            {
+                                session.apply_kex_after_install(ready);
+                                // Unified gate re-entry (not process_packet bypass).
+                                session.replay_pending_reads(handler).await?;
+                                let _ = session.flush();
+                            }
+                            // else: wait for InstallAck; kex stays Taken; inbound already live.
                         }
-
-                        let mut pending = std::mem::take(&mut session.pending_reads);
-                        for p in pending.drain(..) {
-                            session.process_packet(handler, &p).await?;
-                        }
-                        session.pending_reads = pending;
-                        session.pending_len = 0;
-                        session.flush()?;
                     } else {
-                        // This is the initial kex
-
-                        session.common.encrypted(
-                            EncryptedState::WaitingAuthServiceRequest {
-                                sent: false,
-                                accepted: false,
-                            },
-                            newkeys,
-                        );
-
-                        session.maybe_send_ext_info()?;
+                        // Initial Done — **inbound/Encrypted commit this turn**.
+                        if need_outbound_install {
+                            let (local, outbound_comp, reset_seqn) =
+                                crate::server::session::Session::take_outbound_from_newkeys_server(
+                                    &mut newkeys,
+                                );
+                            let activate = !outbound_comp.is_deferred();
+                            if session
+                                .register_seal_batch_and_install(
+                                    payloads,
+                                    0,
+                                    local,
+                                    outbound_comp,
+                                    activate,
+                                    reset_seqn,
+                                    Some(
+                                        crate::server::session::KexAfterInstall::InitialComplete,
+                                    ),
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    0,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            session.commit_initial_encrypted(
+                                EncryptedState::WaitingAuthServiceRequest {
+                                    sent: false,
+                                    accepted: false,
+                                },
+                                newkeys,
+                            );
+                        } else {
+                            if session
+                                .push_inbound_from_newkeys_if_needed(
+                                    &mut newkeys,
+                                    0,
+                                    session.common.strict_kex,
+                                )
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            session.commit_initial_encrypted(
+                                EncryptedState::WaitingAuthServiceRequest {
+                                    sent: false,
+                                    accepted: false,
+                                },
+                                newkeys,
+                            );
+                            let after =
+                                crate::server::session::KexAfterInstall::InitialComplete;
+                            if let Some(ready) =
+                                session.merge_peer_done_into_pending(after)
+                            {
+                                session.apply_kex_after_install(ready);
+                            }
+                            // else wait for InstallAck (inbound already committed)
+                        }
                     }
-
-                    session.kex = SessionKexState::Idle;
-                    // S1: rekey completed — unregister deadline (gen-checked).
-                    session.clear_rekey_deadline();
 
                     if session.common.strict_kex {
                         pkt.seqn = Wrapping(0);
                     }
 
-                    debug!("kex done");
+                    debug!("kex done (inbound committed; completion may wait ACK)");
                 }
             }
 
-            session.flush()?;
+            // Err path (staged cause): do not flush.
+            if session.pending_supervisor_cause.is_some() {
+                return Ok(());
+            }
+            let _ = session.flush();
 
             return Ok(());
         }

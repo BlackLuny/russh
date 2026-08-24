@@ -13,6 +13,8 @@
 // limitations under the License.
 //
 use std::borrow::Cow;
+#[cfg(feature = "_test_hooks")]
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use log::debug;
@@ -29,7 +31,7 @@ use crate::keys::key::safe_rng;
 use crate::parsing::ensure_end;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server::Config;
-use crate::sshbuffer::PacketWriter;
+
 use crate::{AlgorithmKind, Error, cipher, compression, kex, mac, msg};
 
 #[cfg(target_arch = "wasm32")]
@@ -53,6 +55,26 @@ pub struct Names {
     // as strict kext algo is not sent during a rekey and hence the state
     // of [strict_kex] cannot be known without a [KexCause].
     strict_kex: bool,
+}
+
+#[cfg(feature = "_test_hooks")]
+impl Names {
+    pub(crate) fn with_compression(
+        client: compression::Compression,
+        server: compression::Compression,
+    ) -> Self {
+        Self {
+            kex: crate::kex::NONE,
+            key: Algorithm::Ed25519,
+            cipher: crate::cipher::NONE,
+            client_mac: crate::mac::NONE,
+            server_mac: crate::mac::NONE,
+            client_compression: client,
+            server_compression: server,
+            ignore_guessed: false,
+            strict_kex: false,
+        }
+    }
 }
 
 impl Names {
@@ -307,12 +329,24 @@ pub(crate) trait Select {
                 }
             };
 
-        // Compression
+        // Compression. `_test_hooks` may replace the local preference so a
+        // rekey KEXINIT that offered a new list also *selects* from that list
+        // (russh otherwise keeps selecting from the original Preferred).
+        let local_compression = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                kex_compression_override().unwrap_or(pref.compression.as_ref())
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                pref.compression.as_ref()
+            }
+        };
 
         // client-to-server compression.
         let client_compression = compression::Compression::new(
             &Self::select(
-                &pref.compression,
+                local_compression,
                 &NameList::decode(&mut r)?,
                 AlgorithmKind::Compression,
             )?
@@ -322,7 +356,7 @@ pub(crate) trait Select {
         // server-to-client compression.
         let server_compression = compression::Compression::new(
             &Self::select(
-                &pref.compression,
+                local_compression,
                 &NameList::decode(&mut r)?,
                 AlgorithmKind::Compression,
             )?
@@ -408,7 +442,7 @@ impl Select for Client {
 
 pub(crate) fn write_kex(
     prefs: &Preferred,
-    writer: &mut PacketWriter,
+    writer: &mut impl crate::sshbuffer::PacketOut,
     server_config: Option<&Config>,
 ) -> Result<Bytes, Error> {
     writer.packet_bytes(|w| {
@@ -489,20 +523,29 @@ pub(crate) fn write_kex(
         // mac server to client
         NameList(prefs.mac.iter().map(|x| x.as_ref().to_string()).collect()).encode(w)?;
 
-        // compress client to server
+        // compress client to server / server to client.
+        // `_test_hooks` may replace the lists so a rekey KEXINIT can
+        // negotiate a different algorithm than the initial handshake
+        // without mutating production Preferred.
+        let compression = {
+            #[cfg(feature = "_test_hooks")]
+            {
+                kex_compression_override().unwrap_or(prefs.compression.as_ref())
+            }
+            #[cfg(not(feature = "_test_hooks"))]
+            {
+                prefs.compression.as_ref()
+            }
+        };
         NameList(
-            prefs
-                .compression
+            compression
                 .iter()
                 .map(|x| x.as_ref().to_string())
                 .collect(),
         )
         .encode(w)?;
-
-        // compress server to client
         NameList(
-            prefs
-                .compression
+            compression
                 .iter()
                 .map(|x| x.as_ref().to_string())
                 .collect(),
@@ -516,6 +559,73 @@ pub(crate) fn write_kex(
         0u32.encode(w)?; // reserved
         Ok(())
     })
+}
+
+/// Test-only: next `write_kex` uses this compression name-list (both
+/// directions) so a peer rekey KEXINIT can offer a different algorithm
+/// than the initial handshake. Clears on drop.
+#[cfg(feature = "_test_hooks")]
+pub struct KexCompressionOverride {
+    _priv: (),
+}
+
+#[cfg(feature = "_test_hooks")]
+static KEX_COMPRESSION_OVERRIDE: Mutex<Option<&'static [compression::Name]>> = Mutex::new(None);
+
+#[cfg(feature = "_test_hooks")]
+static SKIP_NEWKEYS_WRITEBACK: Mutex<bool> = Mutex::new(false);
+
+#[cfg(feature = "_test_hooks")]
+impl KexCompressionOverride {
+    pub fn set(list: &'static [compression::Name]) -> Self {
+        if let Ok(mut g) = KEX_COMPRESSION_OVERRIDE.lock() {
+            *g = Some(list);
+        }
+        Self { _priv: () }
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+impl Drop for KexCompressionOverride {
+    fn drop(&mut self) {
+        if let Ok(mut g) = KEX_COMPRESSION_OVERRIDE.lock() {
+            *g = None;
+        }
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+fn kex_compression_override() -> Option<&'static [compression::Name]> {
+    KEX_COMPRESSION_OVERRIDE.lock().ok().and_then(|g| *g)
+}
+
+#[cfg(feature = "_test_hooks")]
+pub struct SkipNewkeysWriteback {
+    _priv: (),
+}
+
+#[cfg(feature = "_test_hooks")]
+impl SkipNewkeysWriteback {
+    pub fn arm() -> Self {
+        if let Ok(mut g) = SKIP_NEWKEYS_WRITEBACK.lock() {
+            *g = true;
+        }
+        Self { _priv: () }
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+impl Drop for SkipNewkeysWriteback {
+    fn drop(&mut self) {
+        if let Ok(mut g) = SKIP_NEWKEYS_WRITEBACK.lock() {
+            *g = false;
+        }
+    }
+}
+
+#[cfg(feature = "_test_hooks")]
+pub(crate) fn skip_newkeys_writeback() -> bool {
+    SKIP_NEWKEYS_WRITEBACK.lock().map(|g| *g).unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use std::convert::TryInto;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use log::{debug, error, info, trace, warn};
 use ssh_encoding::{Decode, Encode, Reader};
 use ssh_key::Algorithm;
@@ -28,7 +28,7 @@ use crate::client::{ChannelOpenHandle, Handler, Msg, Prompt, Reply, Session};
 use crate::helpers::{AlgorithmExt, EncodedExt, NameList, sign_with_hash_alg};
 use crate::keys::key::parse_public_key;
 use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage, ensure_end};
-use crate::pending_inbound::{InboundDelivery, InboundItem};
+use super::pending_inbound::{InboundDelivery, InboundItem};
 use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse};
 use crate::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelParams, Error, MethodSet, Sig, auth,
@@ -684,7 +684,7 @@ impl Session {
                         if wants_reply == 1 {
                             trace!("Received keep alive message: {req:?}",);
                             self.common.wants_reply = false;
-                            push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS));
+                            push_packet!(enc.write, enc.write.put_u8(msg::REQUEST_SUCCESS));
                         } else {
                             warn!("Received keepalive without reply request!");
                         }
@@ -706,7 +706,7 @@ impl Session {
                     } else {
                         warn!("Unhandled global request: {req:?} {wants_reply:?}",);
                         self.common.wants_reply = false;
-                        push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                        push_packet!(enc.write, enc.write.put_u8(msg::REQUEST_FAILURE))
                     }
                 }
                 self.common.received_data = false;
@@ -737,19 +737,15 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
-                let channel_params = ChannelParams {
-                    recipient_channel: msg.recipient_channel,
-                    sender_channel: id,
-                    recipient_window_size: msg.recipient_window_size,
-                    sender_window_size: self.common.config.window_size,
-                    recipient_maximum_packet_size: msg.recipient_maximum_packet_size,
-                    sender_maximum_packet_size: self.common.config.maximum_packet_size,
-                    confirmed: true,
-                    wants_reply: false,
-                    pending_data: std::collections::VecDeque::new(),
-                    pending_eof: false,
-                    pending_close: false,
-                };
+                let channel_params = ChannelParams::new(
+                    msg.recipient_channel,
+                    id,
+                    msg.recipient_window_size,
+                    self.common.config.window_size,
+                    msg.recipient_maximum_packet_size,
+                    self.common.config.maximum_packet_size,
+                    true,
+                );
 
                 let (channel, channel_ref) = Channel::new(
                     id,
@@ -766,6 +762,8 @@ impl Session {
                     packet_size: self.common.config.maximum_packet_size,
                     channel_ref,
                     channel_params,
+                    generation: 0,
+                    lease: None,
                 };
                 let reply = ChannelOpenHandle::new(
                     self.open_reply_tx.clone(),
@@ -998,7 +996,7 @@ impl Encrypted {
     ) -> Result<bool, crate::Error> {
         // The server is waiting for our USERAUTH_REQUEST.
         Ok(push_packet!(self.write, {
-            self.write.push(msg::USERAUTH_REQUEST);
+            self.write.put_u8(msg::USERAUTH_REQUEST);
 
             match *auth_method {
                 auth::Method::None => {
@@ -1019,7 +1017,7 @@ impl Encrypted {
                     user.encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "publickey".encode(&mut self.write)?;
-                    self.write.push(0); // This is a probe
+                    self.write.put_u8(0); // This is a probe
 
                     debug!("write_auth_request: key - {:?}", key.algorithm());
                     key.algorithm().as_str().encode(&mut self.write)?;
@@ -1030,7 +1028,7 @@ impl Encrypted {
                     user.as_bytes().encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "publickey".encode(&mut self.write)?;
-                    self.write.push(0); // This is a probe
+                    self.write.put_u8(0); // This is a probe
 
                     debug!("write_auth_request: cert - {:?}", cert.algorithm());
                     cert.algorithm()
@@ -1043,7 +1041,7 @@ impl Encrypted {
                     user.as_bytes().encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "publickey".encode(&mut self.write)?;
-                    self.write.push(0); // This is a probe
+                    self.write.put_u8(0); // This is a probe
 
                     key.algorithm()
                         .with_hash_alg(hash_alg)
@@ -1057,7 +1055,7 @@ impl Encrypted {
                     user.as_bytes().encode(&mut self.write)?;
                     "ssh-connection".encode(&mut self.write)?;
                     "publickey".encode(&mut self.write)?;
-                    self.write.push(0); // This is a probe
+                    self.write.put_u8(0); // This is a probe
 
                     cert.algorithm()
                         .to_certificate_type()
@@ -1088,7 +1086,7 @@ impl Encrypted {
         self.session_id.as_ref().encode(buffer)?;
 
         let i0 = buffer.len();
-        buffer.push(msg::USERAUTH_REQUEST);
+        buffer.put_u8(msg::USERAUTH_REQUEST);
         user.encode(buffer)?;
         "ssh-connection".encode(buffer)?;
         "publickey".encode(buffer)?;

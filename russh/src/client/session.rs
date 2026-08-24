@@ -1,4 +1,5 @@
 use log::error;
+use bytes::BufMut;
 use ssh_encoding::Encode;
 use tokio::sync::oneshot;
 
@@ -13,7 +14,7 @@ impl Session {
         write_suffix: F,
     ) -> Result<ChannelId, crate::Error>
     where
-        F: FnOnce(&mut Vec<u8>) -> Result<(), crate::Error>,
+        F: FnOnce(&mut bytes::BytesMut) -> Result<(), crate::Error>,
     {
         let result = if let Some(ref mut enc) = self.common.encrypted {
             match enc.state {
@@ -157,8 +158,8 @@ impl Session {
 
                     channel.recipient_channel.encode(&mut enc.write)?;
                     "x11-req".encode(&mut enc.write)?;
-                    enc.write.push(want_reply as u8);
-                    enc.write.push(single_connection as u8);
+                    enc.write.put_u8(want_reply as u8);
+                    enc.write.put_u8(single_connection as u8);
                     x11_authentication_protocol.encode(&mut enc.write)?;
                     x11_authentication_cookie.encode(&mut enc.write)?;
                     x11_screen_number.encode(&mut enc.write)?;

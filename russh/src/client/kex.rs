@@ -163,12 +163,22 @@ impl ClientKex {
                         Ok(())
                     })?;
 
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref flag) = self.config.dh_init_sent {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+
                     self.state = ClientKexState::WaitingForGexReply { names, kex };
                 } else {
                     output.write_packet(|w| {
                         kex.client_dh(&mut self.exchange.client_ephemeral, w)?;
                         Ok(())
                     })?;
+
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(ref flag) = self.config.dh_init_sent {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
 
                     self.state = ClientKexState::WaitingForDhReply { names, kex };
                 }
@@ -221,6 +231,12 @@ impl ClientKex {
                     kex.client_dh(&mut exchange.client_ephemeral, w)?;
                     Ok(())
                 })?;
+
+                #[cfg(feature = "_test_hooks")]
+                if let Some(ref flag) = self.config.dh_init_sent {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+
                 self.state = ClientKexState::WaitingForDhReply { names, kex };
 
                 Ok(KexProgress::NeedsReply {

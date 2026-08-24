@@ -315,6 +315,69 @@ pub(crate) struct PacketBytesWriter {
     buffer: BytesMut,
 }
 
+/// Sink for building outbound SSH plaintext packets without owning a cipher.
+/// `PacketWriter` seals immediately; `PayloadCollector` only records payloads
+/// for later `SealPayload` to a Writer-owned `PacketWriter` (S2b).
+pub(crate) trait PacketOut {
+    fn write_packet<F: FnOnce(&mut Vec<u8>) -> Result<(), Error>>(
+        &mut self,
+        f: F,
+    ) -> Result<(), Error>;
+
+    fn packet_bytes<F>(&mut self, f: F) -> Result<Bytes, Error>
+    where
+        F: FnOnce(&mut PacketBytesWriter) -> Result<(), Error>;
+}
+
+impl PacketOut for PacketWriter {
+    fn write_packet<F: FnOnce(&mut Vec<u8>) -> Result<(), Error>>(
+        &mut self,
+        f: F,
+    ) -> Result<(), Error> {
+        PacketWriter::write_packet(self, f)
+    }
+
+    fn packet_bytes<F>(&mut self, f: F) -> Result<Bytes, Error>
+    where
+        F: FnOnce(&mut PacketBytesWriter) -> Result<(), Error>,
+    {
+        PacketWriter::packet_bytes(self, f)
+    }
+}
+
+/// Collects plaintext SSH message payloads (msg type + body) without sealing.
+#[derive(Debug, Default)]
+pub(crate) struct PayloadCollector {
+    pub payloads: Vec<Bytes>,
+}
+
+impl PacketOut for PayloadCollector {
+    fn write_packet<F: FnOnce(&mut Vec<u8>) -> Result<(), Error>>(
+        &mut self,
+        f: F,
+    ) -> Result<(), Error> {
+        let mut buf = Vec::new();
+        f(&mut buf)?;
+        if !buf.is_empty() {
+            self.payloads.push(Bytes::from(buf));
+        }
+        Ok(())
+    }
+
+    fn packet_bytes<F>(&mut self, f: F) -> Result<Bytes, Error>
+    where
+        F: FnOnce(&mut PacketBytesWriter) -> Result<(), Error>,
+    {
+        let mut buf = PacketBytesWriter {
+            buffer: BytesMut::new(),
+        };
+        f(&mut buf)?;
+        let packet = buf.freeze();
+        self.payloads.push(packet.clone());
+        Ok(packet)
+    }
+}
+
 impl Writer for PacketBytesWriter {
     fn write(&mut self, bytes: &[u8]) -> ssh_encoding::Result<()> {
         self.buffer.extend_from_slice(bytes);
@@ -362,10 +425,11 @@ pub(crate) struct IncomingSshPacket {
 /// the loop until the buffer is empty. Must comfortably exceed one maximum-size packet so a
 /// slow-but-draining peer still makes progress.
 ///
-/// This is a soft bound: replies generated while processing inbound packets (window adjusts,
-/// channel-open confirmations, request replies) are intentionally not gated — they are small,
-/// strictly peer-packet-driven, and gating them would reintroduce read stalls. Channel data
-/// itself is additionally capped by the peer's advertised windows.
+/// Soft bound on *application* outbound intake. Non-KEX control replies
+/// (`GLOBAL_REQUEST` want_reply) are refused (PeerError) if they would
+/// cross `HWM + one peer packet`; inbound reads stay open so kex/auth
+/// and WINDOW_ADJUST delivery cannot wedge. Writer drain does not wait
+/// on read.
 pub(crate) const OUTBOUND_HIGH_WATERMARK: usize = 128 * 1024;
 
 /// Packet writer for constructing and encrypting outgoing SSH packets.
@@ -415,6 +479,52 @@ impl PacketWriter {
     /// Lifetime total of bytes that reached the socket (monotonic).
     pub fn drained_total(&self) -> u64 {
         self.drained_total
+    }
+
+    /// Take all sealed-but-unflushed wire bytes out of the write buffer.
+    ///
+    /// Skips `[0..flush_cursor)` already written to the socket (P2 / S2b safety).
+    /// In S2a Session never mid-`flush_into` when shipping, so cursor is normally 0.
+    /// `debug_assert` only checks the cursor is in-bounds (not that it is zero).
+    pub fn take_pending_wire_bytes(&mut self) -> bytes::Bytes {
+        if self.write_buffer.buffer.is_empty() {
+            return bytes::Bytes::new();
+        }
+        debug_assert!(
+            self.flush_cursor <= self.write_buffer.buffer.len(),
+            "take_pending_wire_bytes: flush_cursor={} len={}",
+            self.flush_cursor,
+            self.write_buffer.buffer.len()
+        );
+        let mut buf = std::mem::take(&mut self.write_buffer.buffer);
+        if self.flush_cursor > 0 {
+            let skip = self.flush_cursor.min(buf.len());
+            buf.drain(..skip);
+        }
+        self.flush_cursor = 0;
+        bytes::Bytes::from(buf)
+    }
+
+    /// Restore sealed wire bytes previously taken by [`take_pending_wire_bytes`]
+    /// when the Writer queue rejected them (try_send full). Prepends so order is
+    /// preserved if anything was sealed after the take (should not happen).
+    pub fn restore_pending_wire_bytes(&mut self, bytes: bytes::Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Restored bytes are unwritten; cursor must stay 0 relative to them.
+        debug_assert_eq!(
+            self.flush_cursor, 0,
+            "restore_pending_wire_bytes with non-zero flush_cursor"
+        );
+        if self.write_buffer.buffer.is_empty() {
+            self.write_buffer.buffer = bytes.to_vec();
+        } else {
+            let mut restored = bytes.to_vec();
+            restored.append(&mut self.write_buffer.buffer);
+            self.write_buffer.buffer = restored;
+        }
+        self.flush_cursor = 0;
     }
 
     /// Test helper: stage raw bytes into the write buffer (bypasses sealing).

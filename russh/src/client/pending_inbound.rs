@@ -1,10 +1,11 @@
 //! Per-channel non-blocking inbound delivery (Scheme C — see `RC2_HOL_FIX_DESIGN.md`).
 //!
-//! Shared by the server and client session loops: inbound `CHANNEL_DATA` / `EXTENDED_DATA` /
-//! `EOF` / `CLOSE` is handed to the per-channel application buffer with `try_send`; when the
-//! buffer is full the channel becomes backpressured and items queue here behind a single
-//! in-flight `reserve_owned()` future, so the shared session loop never blocks on one channel's
-//! slow consumer, and the channel's inbound window grant is withheld until delivery.
+//! Client-only: the server replaced this queue with lane-gated drainage (S5a). Inbound
+//! `CHANNEL_DATA` / `EXTENDED_DATA` / `EOF` / `CLOSE` is handed to the per-channel application
+//! buffer with `try_send`; when the buffer is full the channel becomes backpressured and items
+//! queue here behind a single in-flight `reserve_owned()` future, so the shared session loop
+//! never blocks on one channel's slow consumer, and the inbound window grant is withheld until
+//! delivery.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -111,6 +112,15 @@ pub(crate) struct InboundQueue {
     pub(crate) eof_queued: bool,
     /// Same, for `Close`.
     pub(crate) close_queued: bool,
+}
+
+/// Scheme C occupancy for one channel (0 if not backpressured).
+#[cfg(feature = "_test_hooks")]
+pub(crate) fn pending_bytes_for(
+    inbound: &HashMap<ChannelId, InboundQueue>,
+    id: ChannelId,
+) -> usize {
+    inbound.get(&id).map(|q| q.pending_bytes).unwrap_or(0)
 }
 
 /// Outcome of [`deliver_inbound`].

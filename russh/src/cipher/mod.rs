@@ -265,6 +265,14 @@ pub(crate) trait SealingKey {
         // Maximum packet length:
         // https://tools.ietf.org/html/rfc4253#section-6.1
         assert!(packet_length <= u32::MAX as usize);
+        // One allocation for the whole wire packet. Without it the three
+        // growth steps below (length+padding byte, payload, padding, tag)
+        // realloc a buffer that the Writer path hands away as `Bytes` after
+        // every packet — i.e. starts empty again — costing two full-packet
+        // memcpys per packet. No-op when the buffer already has capacity.
+        buffer
+            .buffer
+            .reserve(PACKET_LENGTH_LEN + packet_length + self.tag_len());
         buffer
             .buffer
             .extend_from_slice(&(packet_length as u32).to_be_bytes());
@@ -362,7 +370,7 @@ const PADDING_LENGTH_LEN: usize = 1;
 const MAXIMUM_PADDING_LEN: usize = 19;
 const MAXIMUM_PACKET_LEN_HEADROOM: usize =
     PADDING_LENGTH_LEN + CHANNEL_EXTENDED_DATA_PACKET_OVERHEAD + MAXIMUM_PADDING_LEN;
-const MAXIMUM_PACKET_LEN: usize = MAXIMUM_PACKET_LEN_BASELINE + MAXIMUM_PACKET_LEN_HEADROOM;
+pub(crate) const MAXIMUM_PACKET_LEN: usize = MAXIMUM_PACKET_LEN_BASELINE + MAXIMUM_PACKET_LEN_HEADROOM;
 // Keep post-decompression growth within the same packet-acceptance model as
 // the transport read path.
 pub(crate) const MAXIMUM_DECOMPRESSED_PACKET_LEN: usize = MAXIMUM_PACKET_LEN;

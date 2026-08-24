@@ -6,7 +6,7 @@ use ssh_encoding::Encode;
 #[cfg(feature = "flate2")]
 use crate::cipher::MAXIMUM_DECOMPRESSED_PACKET_LEN;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Compression {
     None,
     #[cfg(feature = "flate2")]
@@ -216,12 +216,55 @@ mod tests {
         let decompressed = decompressor.decompress(&compressed, &mut output).unwrap();
         assert!(decompressed.is_empty());
     }
+
+    /// KEXINIT-shaped payload: long, highly compressible. Production
+    /// compress uses Partial flush; output must be the full plaintext,
+    /// not a prefix sized to the compressed length.
+    #[test]
+    fn large_compressible_packet_survives_partial_flush() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[crate::msg::KEXINIT; 1]);
+        payload.extend_from_slice(&[0u8; 16]);
+        for name in [
+            "mlkem768x25519-sha256,curve25519-sha256,curve25519-sha256@libssh.org",
+            "ssh-ed25519,rsa-sha2-256,rsa-sha2-512,ecdsa-sha2-nistp256",
+            "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com",
+            "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256",
+            "none,zlib,zlib@openssh.com",
+        ] {
+            for _ in 0..3 {
+                payload.extend_from_slice(name.as_bytes());
+            }
+        }
+        assert!(payload.len() > 400, "fixture must be larger than a typical compressed KEXINIT");
+
+        let mut compressor = Compress::Zlib(flate2::Compress::new(flate2::Compression::fast(), true));
+        let mut cbuf = Vec::new();
+        let compressed = compressor.compress(&payload, &mut cbuf).unwrap();
+        assert!(
+            compressed.len() < payload.len(),
+            "fixture must compress (got {} vs {})",
+            compressed.len(),
+            payload.len()
+        );
+
+        let mut decompressor = Decompress::Zlib(flate2::Decompress::new(true));
+        let mut dbuf = Vec::new();
+        let got = decompressor.decompress(compressed, &mut dbuf).unwrap();
+        assert_eq!(got, payload.as_slice());
+    }
 }
 
 #[cfg(feature = "flate2")]
 impl Compress {
     fn zlib_output_reserve_bound(input_len: usize) -> usize {
-        input_len.saturating_add(10)
+        // zlib/deflate worst-case expansion (same order as zlib's compressBound):
+        // len + (len>>12) + (len>>14) + (len>>25) + 13 — never under-reserve large packets.
+        input_len
+            .saturating_add(input_len >> 12)
+            .saturating_add(input_len >> 14)
+            .saturating_add(input_len >> 25)
+            .saturating_add(13)
     }
 
     pub fn compress<'a>(
@@ -235,15 +278,19 @@ impl Compress {
                 output.clear();
                 let n_in = z.total_in() as usize;
                 let n_out = z.total_out() as usize;
-                output.resize(input.len() + 10, 0);
+                output.resize(Self::zlib_output_reserve_bound(input.len()), 0);
                 let flush = flate2::FlushCompress::Partial;
                 loop {
                     let n_in_ = z.total_in() as usize - n_in;
                     let n_out_ = z.total_out() as usize - n_out;
                     #[allow(clippy::indexing_slicing)] // length checked
                     let c = z.compress(&input[n_in_..], &mut output[n_out_..], flush)?;
+                    let n_in_after = z.total_in() as usize - n_in;
                     match c {
                         flate2::Status::BufError => {
+                            output.resize(output.len() * 2, 0);
+                        }
+                        _ if n_in_after < input.len() => {
                             output.resize(output.len() * 2, 0);
                         }
                         _ => break,
@@ -280,8 +327,16 @@ impl Compress {
                     let n_out_ = z.total_out() as usize - n_out;
                     #[allow(clippy::indexing_slicing)] // length checked
                     let c = z.compress(&input[n_in_..], &mut output[start_len + n_out_..], flush)?;
+                    let n_in_after = z.total_in() as usize - n_in;
                     match c {
                         flate2::Status::BufError => {
+                            let growth = output.len().saturating_sub(start_len).max(1);
+                            output.resize(output.len() + growth, 0);
+                        }
+                        // Keep going until every input byte is consumed; otherwise the
+                        // stream state carries unconsumed input into the next SSH packet
+                        // and the peer's inflate stream desyncs (SshEncoding::Length).
+                        _ if n_in_after < input.len() => {
                             let growth = output.len().saturating_sub(start_len).max(1);
                             output.resize(output.len() + growth, 0);
                         }
@@ -312,23 +367,35 @@ impl Decompress {
                 let max_output_len = MAXIMUM_DECOMPRESSED_PACKET_LEN
                     .checked_add(1)
                     .ok_or(crate::Error::PacketSize(usize::MAX))?;
-                output.resize(input.len().clamp(1, max_output_len), 0);
-                let flush = flate2::FlushDecompress::None;
+                // KEXINIT-sized name lists compress well; sizing the
+                // output to the *compressed* length used to stop after
+                // one BufError fill and drop the rest of the plaintext
+                // (S6c C2/C4 rekey KEXINIT → SshEncoding(Length)).
+                let initial = input
+                    .len()
+                    .saturating_mul(4)
+                    .clamp(64, max_output_len);
+                output.resize(initial, 0);
+                // Compress uses Partial (Z_PARTIAL_FLUSH). Sync here
+                // drains the matching sync-point instead of leaving
+                // leftover inflate output when input is already consumed.
+                let flush = flate2::FlushDecompress::Sync;
                 loop {
-                    let n_in_ = z.total_in() as usize - n_in;
-                    let n_out_ = z.total_out() as usize - n_out;
-                    #[allow(clippy::indexing_slicing)] // length checked
-                    let d = z.decompress(&input[n_in_..], &mut output[n_out_..], flush);
-                    match d? {
+                    let n_in_before = z.total_in() as usize - n_in;
+                    let n_out_before = z.total_out() as usize - n_out;
+                    let in_slice = input.get(n_in_before..).unwrap_or(&[]);
+                    #[allow(clippy::indexing_slicing)] // n_out_before <= output.len()
+                    let out_slice = &mut output[n_out_before..];
+                    let status = z.decompress(in_slice, out_slice, flush)?;
+                    let n_in_after = z.total_in() as usize - n_in;
+                    let n_out_after = z.total_out() as usize - n_out;
+                    if n_out_after > MAXIMUM_DECOMPRESSED_PACKET_LEN {
+                        return Err(crate::Error::PacketSize(n_out_after));
+                    }
+                    match status {
+                        flate2::Status::StreamEnd => break,
                         flate2::Status::Ok | flate2::Status::BufError => {
-                            let consumed_all_input = n_in_ == input.len();
-                            let output_full = n_out_ == output.len();
-
-                            if !output_full && consumed_all_input {
-                                break;
-                            }
-
-                            if output_full {
+                            if n_out_after == output.len() {
                                 if output.len() == max_output_len {
                                     break;
                                 }
@@ -338,9 +405,14 @@ impl Decompress {
                                     .map(|len| len.min(max_output_len))
                                     .ok_or(crate::Error::PacketSize(usize::MAX))?;
                                 output.resize(next_len, 0);
+                                continue;
+                            }
+                            // All input consumed and this call produced
+                            // nothing more → inflate is drained.
+                            if n_in_after >= input.len() && n_out_after == n_out_before {
+                                break;
                             }
                         }
-                        _ => break,
                     }
                 }
                 let n_out_ = z.total_out() as usize - n_out;

@@ -29,6 +29,10 @@ _bench = ["dep:criterion"]
 # Test-only fault-injection gates (S0 malicious-client harness). Never enable in
 # production builds. Integration tests that need KEX-only hold use this feature.
 _test_hooks = []
+# Empty marker so `s8_matrix_server` is not built by default `cargo build
+# --examples`. The fixture uses only public Config; soak builds it
+# without `_test_hooks`.
+s8_fixture = []
 
 [dependencies]
 aes.workspace = true
@@ -159,3 +163,36 @@ harness = false
 [[test]]
 name = "test_malicious_client_s0"
 required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s4b_executor"
+required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s4c_slots"
+required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s4d_budget"
+required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s8c_adjust_window"
+required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s7_perf"
+required-features = ["_test_hooks"]
+
+[[test]]
+name = "test_s7_sched"
+required-features = ["_test_hooks"]
+
+# S8a real-client matrix fixture. Not an API usage example.
+# `s8_fixture` (empty) keeps this out of default `cargo build --examples`
+# and marks it non-user. The fixture uses only public Config — soak
+# builds `--features s8_fixture` without `_test_hooks`.
+[[example]]
+name = "s8_matrix_server"
+path = "examples/s8_matrix_server.rs"
+required-features = ["s8_fixture"]

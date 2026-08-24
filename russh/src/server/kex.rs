@@ -43,6 +43,10 @@ pub(crate) struct ServerKex {
     cause: KexCause,
     state: ServerKexState,
     config: Arc<Config>,
+    /// Outbound half already extracted at local-NEWKEYS NeedsReply (S2b).
+    outbound_half_taken: bool,
+    /// Inbound half extracted at NeedsReply (S3a key-first) or Done.
+    inbound_half_taken: bool,
 }
 
 impl Debug for ServerKex {
@@ -67,6 +71,35 @@ impl Debug for ServerKex {
     }
 }
 
+/// Outbound half material extracted at local-NEWKEYS boundary (S2b §4.4).
+pub(crate) struct OutboundEpochInstall {
+    pub cipher: Box<dyn crate::cipher::SealingKey + Send>,
+    pub compression: crate::compression::Compression,
+    pub reset_seqn: bool,
+}
+
+/// Inbound half material extracted at local-NEWKEYS / Done (S3a).
+pub(crate) struct InboundEpochInstall {
+    pub cipher: Box<dyn crate::cipher::OpeningKey + Send>,
+    pub compression: crate::compression::Compression,
+    pub reset_seqn: bool,
+}
+
+fn inbound_from_newkeys(newkeys: &mut NewKeys, strict_rekey: bool) -> InboundEpochInstall {
+    let cipher = std::mem::replace(
+        &mut newkeys.cipher.remote_to_local,
+        Box::new(crate::cipher::clear::Key {}),
+    );
+    // Server inbound is client→server = names.client_compression.
+    let compression = newkeys.names.client_compression.clone();
+    let reset_seqn = newkeys.names.strict_kex() || strict_rekey;
+    InboundEpochInstall {
+        cipher,
+        compression,
+        reset_seqn,
+    }
+}
+
 impl ServerKex {
     pub fn new(
         config: Arc<Config>,
@@ -80,10 +113,90 @@ impl ServerKex {
             exchange,
             cause,
             state: ServerKexState::Created,
+            outbound_half_taken: false,
+            inbound_half_taken: false,
         }
     }
 
-    pub fn kexinit(&mut self, output: &mut PacketWriter) -> Result<(), Error> {
+    /// True when we have sealed local NEWKEYS and await peer NEWKEYS.
+    pub fn is_waiting_for_peer_newkeys(&self) -> bool {
+        matches!(self.state, ServerKexState::WaitingForNewKeys { .. })
+    }
+
+    /// Take outbound cipher half exactly once after local NEWKEYS was produced.
+    /// Leaves a clear-key stub in `NewKeys` so Done can still consume the rest.
+    pub fn take_outbound_epoch_install(&mut self) -> Option<OutboundEpochInstall> {
+        if self.outbound_half_taken {
+            return None;
+        }
+        let ServerKexState::WaitingForNewKeys { ref mut newkeys } = self.state else {
+            return None;
+        };
+        self.outbound_half_taken = true;
+        let cipher = std::mem::replace(
+            &mut newkeys.cipher.local_to_remote,
+            Box::new(crate::cipher::clear::Key {}),
+        );
+        // Server outbound is server→client = names.server_compression (not client_compression).
+        let compression = newkeys.names.server_compression.clone();
+        let reset_seqn = newkeys.names.strict_kex() || self.cause.is_strict_rekey();
+        Some(OutboundEpochInstall {
+            cipher,
+            compression,
+            reset_seqn,
+        })
+    }
+
+    /// Take inbound cipher half exactly once after local NEWKEYS was produced
+    /// (S3a key-first). Leaves a clear-key stub so Done can still consume metadata.
+    pub fn take_inbound_epoch_install(&mut self) -> Option<InboundEpochInstall> {
+        if self.inbound_half_taken {
+            return None;
+        }
+        let ServerKexState::WaitingForNewKeys { ref mut newkeys } = self.state else {
+            return None;
+        };
+        self.inbound_half_taken = true;
+        Some(inbound_from_newkeys(newkeys, self.cause.is_strict_rekey()))
+    }
+
+    /// Extract inbound half from a `Done` `NewKeys` when it was never taken at
+    /// NeedsReply (`none`/skip_exchange / NEWKEYS-first).
+    pub fn take_inbound_from_newkeys(
+        newkeys: &mut NewKeys,
+        strict_rekey: bool,
+    ) -> InboundEpochInstall {
+        inbound_from_newkeys(newkeys, strict_rekey)
+    }
+
+    /// Extract outbound half from a `Done` `NewKeys` when it was never taken at
+    /// NeedsReply (`none`/skip_exchange). Same direction rules as
+    /// [`take_outbound_epoch_install`].
+    pub fn take_outbound_from_newkeys(
+        newkeys: &mut NewKeys,
+        strict_rekey: bool,
+    ) -> OutboundEpochInstall {
+        let cipher = std::mem::replace(
+            &mut newkeys.cipher.local_to_remote,
+            Box::new(crate::cipher::clear::Key {}),
+        );
+        let compression = newkeys.names.server_compression.clone();
+        let reset_seqn = newkeys.names.strict_kex() || strict_rekey;
+        OutboundEpochInstall {
+            cipher,
+            compression,
+            reset_seqn,
+        }
+    }
+
+    pub fn is_rekey(&self) -> bool {
+        self.cause.is_rekey()
+    }
+
+    pub fn kexinit(
+        &mut self,
+        output: &mut impl crate::sshbuffer::PacketOut,
+    ) -> Result<(), Error> {
         self.exchange.server_kex_init =
             negotiation::write_kex(&self.config.preferred, output, Some(self.config.as_ref()))?;
 
@@ -93,8 +206,9 @@ impl ServerKex {
     pub async fn step<H: Handler + Send>(
         mut self,
         input: Option<&mut IncomingSshPacket>,
-        output: &mut PacketWriter,
-        handler: &mut H,
+        output: &mut impl crate::sshbuffer::PacketOut,
+        session: &mut Session,
+        handler: Option<&mut H>,
     ) -> Result<KexProgress<Self>, H::Error> {
         match self.state {
             ServerKexState::Created => {
@@ -179,7 +293,7 @@ impl ServerKex {
                 ensure_end(&r)?;
                 debug!("client requests a gex group: {gex_params:?}");
 
-                let Some(dh_group) = handler.lookup_dh_gex_group(&gex_params).await? else {
+                let Some(dh_group) = session.dispatch_lookup_gex(handler, &gex_params).await? else {
                     debug!(
                         "server::Handler impl did not find a matching DH group (is lookup_dh_gex_group implemented?)"
                     );
@@ -384,6 +498,9 @@ fn compute_keys(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::compression::Compression;
+    use crate::kex::{KexCause, NONE as KEX_NONE};
     use crate::tests::raw_no_crypto::{assert_rejected, kexinit_payload, raw_kex_signal, timeout};
 
     #[tokio::test]
@@ -395,5 +512,130 @@ mod tests {
         .await;
 
         assert_rejected(result, "server accepted a kexinit with trailing bytes");
+    }
+
+    /// Craft asymmetric compression lists in a client KEXINIT and assert server
+    /// outbound half uses server→client (`server_compression`), not client→server.
+    #[cfg(feature = "flate2")]
+    #[test]
+    fn server_outbound_half_follows_server_compression_field() {
+        use crate::helpers::NameList;
+        use crate::negotiation::{Preferred, Select, Server as NegServer};
+        use ssh_encoding::Encode;
+
+        // Client KEXINIT: c2s=none, s2c=zlib@openssh.com (asymmetric).
+        let mut buf = Vec::new();
+        msg::KEXINIT.encode(&mut buf).unwrap();
+        buf.extend_from_slice(&[0u8; 16]); // cookie
+        NameList(vec!["none".into()]).encode(&mut buf).unwrap(); // kex
+        NameList(vec!["ssh-ed25519".into()])
+            .encode(&mut buf)
+            .unwrap(); // host key
+        NameList(vec!["none".into()]).encode(&mut buf).unwrap(); // cipher c2s
+        NameList(vec!["none".into()]).encode(&mut buf).unwrap(); // cipher s2c
+        NameList(vec!["none".into()]).encode(&mut buf).unwrap(); // mac c2s
+        NameList(vec!["none".into()]).encode(&mut buf).unwrap(); // mac s2c
+        NameList(vec!["none".into()]).encode(&mut buf).unwrap(); // comp c2s
+        NameList(vec!["zlib@openssh.com".into(), "none".into()])
+            .encode(&mut buf)
+            .unwrap(); // comp s2c
+        NameList(vec![]).encode(&mut buf).unwrap(); // lang c2s
+        NameList(vec![]).encode(&mut buf).unwrap(); // lang s2c
+        0u8.encode(&mut buf).unwrap();
+        0u32.encode(&mut buf).unwrap();
+
+        let mut pref = Preferred::DEFAULT;
+        pref.kex = std::borrow::Cow::Borrowed(&[KEX_NONE]);
+        // Client KEXINIT below offers cipher "none"; match that name.
+        pref.cipher = std::borrow::Cow::Borrowed(&[crate::cipher::NONE]);
+        pref.mac = std::borrow::Cow::Borrowed(&[crate::mac::NONE]);
+        pref.compression = std::borrow::Cow::Borrowed(&[
+            crate::compression::ZLIB_LEGACY,
+            crate::compression::NONE,
+        ]);
+        pref.key = std::borrow::Cow::Borrowed(&[Algorithm::Ed25519]);
+
+        let key = ssh_key::PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let names = NegServer::read_kex(
+            &buf,
+            &pref,
+            Some(std::slice::from_ref(&key)),
+            &KexCause::Initial,
+        )
+        .expect("asymmetric kexinit must negotiate");
+
+        assert!(
+            matches!(names.client_compression, Compression::None),
+            "c2s list was none-only → client_compression=None"
+        );
+        assert!(
+            matches!(names.server_compression, Compression::ZlibOpenSSH),
+            "s2c listed zlib@openssh.com first in intersection → server_compression=ZlibOpenSSH"
+        );
+
+        // Simulate Done-path take: outbound must be server_compression.
+        let mut newkeys = NewKeys {
+            exchange: Exchange::new(b"SSH-2.0-c", b"SSH-2.0-s"),
+            names,
+            kex: KEXES.get(&KEX_NONE).unwrap().make(),
+            key: 0,
+            cipher: crate::cipher::CipherPair {
+                local_to_remote: Box::new(crate::cipher::clear::Key {}),
+                remote_to_local: Box::new(crate::cipher::clear::Key {}),
+            },
+            session_id: CryptoVec::new(),
+        };
+        let half = ServerKex::take_outbound_from_newkeys(&mut newkeys, false);
+        assert!(
+            matches!(half.compression, Compression::ZlibOpenSSH),
+            "server outbound half must follow server_compression, not client_compression"
+        );
+
+        // Reverse asymmetry: c2s=zlib, s2c=none.
+        let mut buf2 = Vec::new();
+        msg::KEXINIT.encode(&mut buf2).unwrap();
+        buf2.extend_from_slice(&[0u8; 16]);
+        NameList(vec!["none".into()]).encode(&mut buf2).unwrap();
+        NameList(vec!["ssh-ed25519".into()])
+            .encode(&mut buf2)
+            .unwrap();
+        NameList(vec!["none".into()]).encode(&mut buf2).unwrap();
+        NameList(vec!["none".into()]).encode(&mut buf2).unwrap();
+        NameList(vec!["none".into()]).encode(&mut buf2).unwrap();
+        NameList(vec!["none".into()]).encode(&mut buf2).unwrap();
+        NameList(vec!["zlib@openssh.com".into(), "none".into()])
+            .encode(&mut buf2)
+            .unwrap(); // c2s
+        NameList(vec!["none".into()]).encode(&mut buf2).unwrap(); // s2c
+        NameList(vec![]).encode(&mut buf2).unwrap();
+        NameList(vec![]).encode(&mut buf2).unwrap();
+        0u8.encode(&mut buf2).unwrap();
+        0u32.encode(&mut buf2).unwrap();
+
+        let names2 = NegServer::read_kex(
+            &buf2,
+            &pref,
+            Some(std::slice::from_ref(&key)),
+            &KexCause::Initial,
+        )
+        .expect("reverse asymmetric kexinit");
+        assert!(matches!(names2.client_compression, Compression::ZlibOpenSSH));
+        assert!(matches!(names2.server_compression, Compression::None));
+        let mut newkeys2 = NewKeys {
+            exchange: Exchange::new(b"SSH-2.0-c", b"SSH-2.0-s"),
+            names: names2,
+            kex: KEXES.get(&KEX_NONE).unwrap().make(),
+            key: 0,
+            cipher: crate::cipher::CipherPair {
+                local_to_remote: Box::new(crate::cipher::clear::Key {}),
+                remote_to_local: Box::new(crate::cipher::clear::Key {}),
+            },
+            session_id: CryptoVec::new(),
+        };
+        let half2 = ServerKex::take_outbound_from_newkeys(&mut newkeys2, false);
+        assert!(
+            matches!(half2.compression, Compression::None),
+            "server outbound must be None when s2c negotiated none"
+        );
     }
 }

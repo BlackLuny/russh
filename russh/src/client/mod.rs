@@ -49,7 +49,6 @@ use futures::stream::FuturesUnordered;
 use futures::task::{Context, Poll};
 use kex::ClientKex;
 use log::{debug, error, trace, warn};
-use russh_util::time::Instant;
 use ssh_encoding::{Decode, Encode};
 use ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -60,11 +59,12 @@ use tokio::sync::mpsc::{
 use tokio::sync::oneshot;
 
 pub use crate::auth::AuthResult;
-use crate::pending_inbound::{
-    self, BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
+use pending_inbound::{
+    BoxReserve, DeferredCallback, InboundDelivery, InboundItem, InboundQueue,
 };
 use crate::channels::{
-    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
+    Channel, ChannelAcked, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf,
+    WindowSizeRef,
 };
 use crate::cipher::{self, OpeningKey, clear};
 use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
@@ -74,12 +74,13 @@ use crate::session::{CommonSession, EncryptedState, GlobalRequestResponse, NewKe
 use crate::ssh_read::SshRead;
 use crate::sshbuffer::{IncomingSshPacket, PacketWriter, SSHBuffer, SshId};
 use crate::{
-    ChannelId, ChannelOpenFailure, Disconnect, Error, Limits, MethodSet, Sig, auth, map_err, msg,
+    ChannelId, ChannelOpenFailure, Disconnect, Error, MethodSet, RekeyPolicy, Sig, auth, map_err, msg,
     negotiation,
 };
 
 mod encrypted;
 mod kex;
+mod pending_inbound;
 mod session;
 
 /// Test-only rekey fault-injection gates. Available with `--features _test_hooks`.
@@ -97,12 +98,17 @@ mod test;
 #[derive(Debug)]
 pub struct Session {
     kex: SessionKexState<ClientKex>,
+    /// Test-only: a fully-formed second rekey staged by the `inject_kexinit` hook.
+    /// Installed as `InProgress` the moment the current kex completes, so the peer's
+    /// replayed KEXINIT#2 is answered through the normal DH exchange (no KEXINIT ping-pong).
+    #[cfg(feature = "_test_hooks")]
+    stashed_rekey: Option<ClientKex>,
     common: CommonSession<Arc<Config>>,
     receiver: Receiver<Msg>,
     sender: UnboundedSender<Reply>,
     channels: HashMap<ChannelId, ChannelRef>,
-    /// Per-channel inbound backpressure queues (Scheme C). Present only for channels that are
-    /// currently backpressured (their app buffer filled up). Mirrors the server session.
+    /// Per-channel inbound backpressure queues (Scheme C). Client-only until S8;
+    /// the server uses lane-gated drainage instead.
     inbound: HashMap<ChannelId, InboundQueue>,
     /// Channels that have a pending item but no in-flight `reserve_owned()` future yet; the run
     /// loop drains this into its `FuturesUnordered` after each inbound packet.
@@ -237,6 +243,9 @@ pub enum Msg {
         extension_name: String,
         reply_channel: oneshot::Sender<()>,
     },
+    /// `_test_hooks`: seal an already-encoded SSH payload (no window check).
+    #[cfg(feature = "_test_hooks")]
+    RawPacket(bytes::Bytes),
     GetServerSigAlgs {
         reply_channel: oneshot::Sender<Option<Vec<Algorithm>>>,
     },
@@ -255,6 +264,17 @@ pub enum Msg {
 impl From<(ChannelId, ChannelMsg)> for Msg {
     fn from((id, msg): (ChannelId, ChannelMsg)) -> Self {
         Msg::Channel(id, msg)
+    }
+}
+
+impl ChannelAcked for Msg {
+    fn try_data_acked(
+        _id: ChannelId,
+        _ext: Option<u32>,
+        _data: bytes::Bytes,
+        _ack: oneshot::Sender<()>,
+    ) -> Option<Self> {
+        None
     }
 }
 
@@ -635,6 +655,8 @@ impl<H: Handler> Handle<H> {
                             sender: self.sender.clone(),
                             max_packet_size,
                             window_size: window_size_ref,
+                            live: None,
+                            use_acked: false,
                         },
                         read_half: ChannelReadHalf { receiver },
                     });
@@ -938,6 +960,15 @@ impl<H: Handler> Handle<H> {
     /// Do not call this from inside a [`Handler`] callback — those run on the session loop, so
     /// awaiting window there would prevent the loop from processing the window adjustment that
     /// would release it.
+    /// Seal a complete SSH payload without window / encode checks (`_test_hooks`).
+    #[cfg(feature = "_test_hooks")]
+    pub async fn send_raw_packet(&self, payload: impl Into<bytes::Bytes>) -> Result<(), crate::Error> {
+        self.sender
+            .send(Msg::RawPacket(payload.into()))
+            .await
+            .map_err(|_| crate::Error::SendError)
+    }
+
     pub async fn data(
         &self,
         id: ChannelId,
@@ -1170,6 +1201,8 @@ impl Session {
             receiver,
             sender,
             kex: SessionKexState::Idle,
+            #[cfg(feature = "_test_hooks")]
+            stashed_rekey: None,
             target_window_size,
             inbound_channel_sender,
             inbound_channel_receiver,
@@ -1651,6 +1684,14 @@ impl Session {
                 self.agent_forward(id, want_reply)?
             }
             Msg::Channel(id, ChannelMsg::Close) => self.close(id)?,
+            #[cfg(feature = "_test_hooks")]
+            Msg::Channel(_, ChannelMsg::Raw(payload)) => {
+                self.common.packet_writer.packet_raw(&payload)?;
+            }
+            #[cfg(feature = "_test_hooks")]
+            Msg::RawPacket(payload) => {
+                self.common.packet_writer.packet_raw(&payload)?;
+            }
             Msg::Rekey => self.initiate_rekey()?,
             Msg::AwaitExtensionInfo {
                 extension_name,
@@ -1699,17 +1740,18 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
-                    push_packet!(enc.write, {
-                        msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut enc.write)?;
-                        pending.recipient_channel.encode(&mut enc.write)?;
-                        pending.sender_channel.encode(&mut enc.write)?;
-                        pending.window_size.encode(&mut enc.write)?;
-                        pending.packet_size.encode(&mut enc.write)?;
+                    let id = pending.sender_channel;
+                    let mut params = pending.channel_params;
+                    params.enqueue_ctrl(crate::ChannelCtrlItem::OpenConfirmation {
+                        recipient_channel: pending.recipient_channel,
+                        sender_channel: pending.sender_channel.0,
+                        window_size: pending.window_size,
+                        packet_size: pending.packet_size,
                     });
-                    enc.channels
-                        .insert(pending.sender_channel, pending.channel_params);
+                    enc.channels.insert(id, params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
+                    enc.flush_pending(id)?;
                 }
                 Err(reason) => {
                     push_packet!(enc.write, {
@@ -1977,6 +2019,31 @@ impl Session {
     /// Flush the temporary cleartext buffer into the encryption
     /// buffer. This does *not* flush to the socket.
     fn flush(&mut self) -> Result<(), crate::Error> {
+        // Test-only rekey injection: emit a *real* second KEXINIT (via ClientKex, so
+        // exchange.client_kex_init is recorded and the DH exchange can proceed) and
+        // stash the kex; it is installed as InProgress when the current kex completes.
+        // This keeps the peer a protocol-possible client: the replayed KEXINIT#2 from
+        // the server is answered through the normal kex.step() path.
+        #[cfg(feature = "_test_hooks")]
+        if let Some(ref flag) = self.common.config.inject_kexinit {
+            if flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                debug!("_test_hooks: staging real second rekey (KEXINIT#2 on the wire)");
+                let mut kex = ClientKex::new(
+                    self.common.config.clone(),
+                    &self.common.config.client_id,
+                    &self.common.remote_sshid,
+                    match &self.common.encrypted {
+                        None => KexCause::Initial,
+                        Some(enc) => KexCause::Rekey {
+                            strict: self.common.strict_kex,
+                            session_id: enc.session_id.clone(),
+                        },
+                    },
+                );
+                kex.kexinit(&mut self.common.packet_writer)?;
+                self.stashed_rekey = Some(kex);
+            }
+        }
         if let Some(ref mut enc) = self.common.encrypted {
             if enc.flush(
                 &self.common.config.as_ref().limits,
@@ -2064,7 +2131,6 @@ async fn reply<H: Handler>(
                             common.newkeys(newkeys);
                             common.packet_writer.buffer().bytes = 0;
                             if let Some(enc) = common.encrypted.as_mut() {
-                                enc.last_rekey = Instant::now();
                                 enc.flush_all_pending_with_writer(&mut common.packet_writer)?;
                             }
                         }
@@ -2093,7 +2159,17 @@ async fn reply<H: Handler>(
                         }
                     }
 
-                    session.kex = SessionKexState::Idle;
+                    #[cfg(feature = "_test_hooks")]
+                    {
+                        session.kex = match session.stashed_rekey.take() {
+                            Some(stashed) => SessionKexState::InProgress(stashed),
+                            None => SessionKexState::Idle,
+                        };
+                    }
+                    #[cfg(not(feature = "_test_hooks"))]
+                    {
+                        session.kex = SessionKexState::Idle;
+                    }
 
                     if session.common.strict_kex {
                         pkt.seqn = Wrapping(0);
@@ -2172,9 +2248,8 @@ mod tests {
                     session_id: CryptoVec::new(),
                     channels: HashMap::new(),
                     last_channel_id: Wrapping(0),
-                    write: Vec::new(),
+                    write: bytes::BytesMut::new(),
                     write_cursor: 0,
-                    last_rekey: russh_util::time::Instant::now(),
                     server_compression: Compression::None,
                     client_compression: Compression::None,
                     decompress: Decompress::None,
@@ -2220,9 +2295,8 @@ mod tests {
                     session_id: CryptoVec::new(),
                     channels: HashMap::new(),
                     last_channel_id: Wrapping(0),
-                    write: Vec::new(),
+                    write: bytes::BytesMut::new(),
                     write_cursor: 0,
-                    last_rekey: russh_util::time::Instant::now(),
                     server_compression: Compression::None,
                     client_compression: Compression::None,
                     decompress: Decompress::Zlib(flate2::Decompress::new(true)),
@@ -2468,8 +2542,8 @@ impl Default for GexParams {
 pub struct Config {
     /// The client ID string sent at the beginning of the protocol.
     pub client_id: SshId,
-    /// The bytes and time limits before key re-exchange.
-    pub limits: Limits,
+    /// Per-epoch rekey hard limits (packets / bytes). No time trigger.
+    pub limits: RekeyPolicy,
     /// The initial size of a channel (used for flow control).
     pub window_size: u32,
     /// The maximal size of a single packet.
@@ -2481,11 +2555,10 @@ pub struct Config {
     /// never the session. See the server-side `Config::max_pending_outbound_bytes`.
     pub max_pending_outbound_bytes: usize,
     /// Hard safety cap on the number of inbound payload bytes that may be queued per channel
-    /// while its application buffer is full (Scheme C backpressure, mirrored from the server —
-    /// see the server-side `Config::max_pending_inbound_bytes`). With delivery-gated window
-    /// grants a well-behaved peer holds at most ~`window_size` bytes in flight, so this only
-    /// trips when a peer ignores its advertised window; exceeding it closes that one channel,
-    /// never the session.
+    /// while its application buffer is full (client Scheme C). Server inbound is bounded by
+    /// the Reader lane instead. A well-behaved peer holds at most ~`window_size` bytes in
+    /// flight, so this only trips when a peer ignores its advertised window; exceeding it
+    /// closes that one channel, never the session.
     pub max_pending_inbound_bytes: usize,
     /// Lists of preferred algorithms.
     pub preferred: negotiation::Preferred,
@@ -2506,6 +2579,19 @@ pub struct Config {
     /// traffic continues. Production builds omit this field entirely.
     #[cfg(feature = "_test_hooks")]
     pub rekey_hold: Option<std::sync::Arc<test_hooks::RekeyHoldGate>>,
+    /// Test-only (`--features _test_hooks`): when set, the flag is stored `true`
+    /// immediately after the client queues its DH-init packet (KEXDH_INIT /
+    /// KEX_DH_GEX_INIT). Lets a test-side stream freeze inbound delivery at a
+    /// deterministic point: after DH-init is on the wire, before the server's
+    /// KEXDH_REPLY/NEWKEYS can be read.
+    #[cfg(feature = "_test_hooks")]
+    pub dh_init_sent: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Test-only (`--features _test_hooks`): when set, the next session flush
+    /// queues one extra well-formed KEXINIT packet on the wire **without**
+    /// touching kex state (consumed via `swap(false)`). Used to inject a second
+    /// KEXINIT during a pending server-side install window.
+    #[cfg(feature = "_test_hooks")]
+    pub inject_kexinit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for Config {
@@ -2517,7 +2603,7 @@ impl Default for Config {
                 "_",
                 env!("CARGO_PKG_VERSION")
             ))),
-            limits: Limits::default(),
+            limits: RekeyPolicy::default(),
             window_size: 2097152,
             maximum_packet_size: 32768,
             channel_buffer_size: 100,
@@ -2532,6 +2618,10 @@ impl Default for Config {
             nodelay: false,
             #[cfg(feature = "_test_hooks")]
             rekey_hold: None,
+            #[cfg(feature = "_test_hooks")]
+            dh_init_sent: None,
+            #[cfg(feature = "_test_hooks")]
+            inject_kexinit: None,
         }
     }
 }
@@ -2685,7 +2775,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }
@@ -2704,7 +2794,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }
@@ -2722,7 +2812,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }
@@ -2770,7 +2860,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }
@@ -2793,7 +2883,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }
@@ -2812,7 +2902,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }
@@ -2832,7 +2922,7 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            reply.accept().await;
+            let _ = reply.accept().await;
             Ok(())
         }
     }

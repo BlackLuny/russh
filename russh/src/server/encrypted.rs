@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 use auth::*;
 use byteorder::{BigEndian, ByteOrder};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use cert::PublicKeyOrCertificate;
 use log::{debug, error, info, trace, warn};
 use msg;
@@ -32,13 +32,14 @@ use super::*;
 use crate::helpers::NameList;
 use crate::map_err;
 use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage, ensure_end};
-use crate::pending_inbound::{InboundDelivery, InboundItem};
+use crate::ChannelMsg;
+use tokio::sync::mpsc::error::TrySendError;
 
 impl Session {
     /// Returns false iff a request was rejected.
     pub(crate) async fn server_read_encrypted<H: Handler + Send>(
         &mut self,
-        handler: &mut H,
+        handler: Option<&mut H>,
         pkt: &mut IncomingSshPacket,
     ) -> Result<(), H::Error> {
         self.process_packet(handler, &pkt.buffer).await
@@ -46,7 +47,7 @@ impl Session {
 
     pub(crate) async fn process_packet<H: Handler + Send>(
         &mut self,
-        handler: &mut H,
+        mut handler: Option<&mut H>,
         buf: &[u8],
     ) -> Result<(), H::Error> {
         let rejection_wait_until =
@@ -62,85 +63,117 @@ impl Session {
             rejection_wait_until
         };
 
-        let Some(enc) = self.common.encrypted.as_mut() else {
-            return Err(Error::Inconsistent.into());
-        };
+        // After auth accept: run compress barrier (no unbounded ACK) then auth_succeeded.
+        let mut need_auth_barrier = false;
+        // Residual InitCompression packet body (msg type + rest) if any.
+        let mut residual_auth_packet: Option<(u8, &[u8])> = None;
 
-        // If we've successfully read a packet.
-        match (&mut enc.state, buf.split_first()) {
-            (
-                EncryptedState::WaitingAuthServiceRequest { accepted, .. },
-                Some((&msg::SERVICE_REQUEST, mut r)),
-            ) => {
-                let request = map_err!(String::decode(&mut r))?;
-                map_err!(ensure_end(&r))?;
-                debug!("request: {request:?}");
-                if request == "ssh-userauth" {
-                    let auth_request = server_accept_service(
-                        handler.authentication_banner().await?,
-                        self.common.config.as_ref().methods.clone(),
+        {
+            let Some(enc) = self.common.encrypted.as_mut() else {
+                return Err(Error::Inconsistent.into());
+            };
+
+            // If we've successfully read a packet.
+            match (&mut enc.state, buf.split_first()) {
+                (
+                    EncryptedState::WaitingAuthServiceRequest { accepted, .. },
+                    Some((&msg::SERVICE_REQUEST, mut r)),
+                ) => {
+                    let request = map_err!(String::decode(&mut r))?;
+                    map_err!(ensure_end(&r))?;
+                    debug!("request: {request:?}");
+                    if request == "ssh-userauth" {
+                        let banner = match handler.as_mut() {
+                            Some(h) => h.authentication_banner().await?,
+                            None => None,
+                        };
+                        let auth_request = server_accept_service(
+                            banner,
+                            self.common.config.as_ref().methods.clone(),
+                            &mut enc.write,
+                        )?;
+                        *accepted = true;
+                        enc.state = EncryptedState::WaitingAuthRequest(auth_request);
+                    }
+                }
+                (
+                    EncryptedState::WaitingAuthRequest(_),
+                    Some((&msg::USERAUTH_REQUEST, mut r)),
+                ) => {
+                    enc.server_read_auth_request(
+                        rejection_wait_until,
+                        initial_none_rejection_wait_until,
+                        handler.as_deref_mut().ok_or(Error::Inconsistent)?,
+                        buf,
+                        &mut r,
+                        &mut self.common.auth_user,
+                    )
+                    .await?;
+                    self.common.auth_attempts += 1;
+                    if let EncryptedState::InitCompression = enc.state {
+                        need_auth_barrier = true;
+                    }
+                }
+                (
+                    EncryptedState::WaitingAuthRequest(auth),
+                    Some((&msg::USERAUTH_INFO_RESPONSE, mut r)),
+                ) => {
+                    let resp = read_userauth_info_response(
+                        rejection_wait_until,
+                        handler.as_deref_mut().ok_or(Error::Inconsistent)?,
                         &mut enc.write,
-                    )?;
-                    *accepted = true;
-                    enc.state = EncryptedState::WaitingAuthRequest(auth_request);
-                }
-                Ok(())
-            }
-            (EncryptedState::WaitingAuthRequest(_), Some((&msg::USERAUTH_REQUEST, mut r))) => {
-                enc.server_read_auth_request(
-                    rejection_wait_until,
-                    initial_none_rejection_wait_until,
-                    handler,
-                    buf,
-                    &mut r,
-                    &mut self.common.auth_user,
-                )
-                .await?;
-                self.common.auth_attempts += 1;
-                if let EncryptedState::InitCompression = enc.state {
-                    if enc.client_compression.is_deferred() {
-                        enc.client_compression.init_decompress(&mut enc.decompress);
+                        auth,
+                        &self.common.auth_user,
+                        &mut r,
+                    )
+                    .await?;
+                    if resp {
+                        enc.state = EncryptedState::InitCompression;
+                        need_auth_barrier = true;
                     }
-                    handler.auth_succeeded(self).await?;
                 }
-                Ok(())
+                // Residual: barrier should already have run on auth turn; re-run
+                // fail-closed if somehow still in InitCompression, then dispatch.
+                (EncryptedState::InitCompression, Some((msg, r))) => {
+                    need_auth_barrier = true;
+                    residual_auth_packet = Some((*msg, r));
+                }
+                (EncryptedState::Authenticated, Some((msg, r))) => {
+                    residual_auth_packet = Some((*msg, r));
+                }
+                _ => {}
             }
-            (
-                EncryptedState::WaitingAuthRequest(auth),
-                Some((&msg::USERAUTH_INFO_RESPONSE, mut r)),
-            ) => {
-                let resp = read_userauth_info_response(
-                    rejection_wait_until,
-                    handler,
-                    &mut enc.write,
-                    auth,
-                    &self.common.auth_user,
-                    &mut r,
-                )
-                .await?;
-                if resp {
-                    enc.state = EncryptedState::InitCompression;
-                    if enc.client_compression.is_deferred() {
-                        enc.client_compression.init_decompress(&mut enc.decompress);
-                    }
-                    handler.auth_succeeded(self).await
-                } else {
-                    Ok(())
+        } // enc borrow ends
+
+        if need_auth_barrier {
+            // Ordered barrier: seal USERAUTH_SUCCESS (uncompressed) → FIFO
+            // activate outbound deferred compress → Authenticated.
+            // Must not await ACK inside reply() (watchdog / cancel stay live).
+            if let Err(e) = self.complete_auth_compress_barrier() {
+                debug!("auth compress barrier failed: {e:?}");
+                self.pending_supervisor_cause =
+                    Some(crate::server::DisconnectCause::PeerError);
+                self.common.disconnected = true;
+                return Ok(());
+            }
+            // auth_succeeded only on the auth-accept turn (no residual packet).
+            if residual_auth_packet.is_none() {
+                if let Some(h) = handler.as_mut() {
+                    h.auth_succeeded(self).await?;
                 }
             }
-            (EncryptedState::InitCompression, Some((msg, mut r))) => {
-                if enc.server_compression.is_deferred() {
-                    enc.server_compression
-                        .init_compress(self.common.packet_writer.compress());
-                }
-                enc.state = EncryptedState::Authenticated;
-                self.server_read_authenticated(handler, *msg, &mut r).await
-            }
-            (EncryptedState::Authenticated, Some((msg, mut r))) => {
-                self.server_read_authenticated(handler, *msg, &mut r).await
-            }
-            _ => Ok(()),
         }
+
+        if let Some((msg, mut r)) = residual_auth_packet {
+            // Only dispatch authenticated handlers once past barrier.
+            if matches!(
+                self.common.encrypted.as_ref().map(|e| &e.state),
+                Some(EncryptedState::Authenticated)
+            ) {
+                return self.server_read_authenticated(handler, msg, &mut r).await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -373,11 +406,11 @@ mod tests {
 
         let probe = publickey_probe_packet("alice", &pk_ok_key);
         let mut probe = BytesMut::from(probe.as_slice());
-        session.process_packet(&mut handler, &mut probe).await.unwrap();
+        session.process_packet(Some(&mut handler), &mut probe).await.unwrap();
 
         let signed = publickey_signed_packet("alice", Arc::new(signed_private), &signed_key);
         let mut signed = BytesMut::from(signed.as_slice());
-        session.process_packet(&mut handler, &mut signed).await.unwrap();
+        session.process_packet(Some(&mut handler), &mut signed).await.unwrap();
 
         assert!(
             !handler.final_auth_reached_for_signed_key,
@@ -393,7 +426,7 @@ mod tests {
 
         let mut packet = channel_request_payload(channel.0, b"exec");
         encode_string(&mut packet, b"protected");
-        session.process_packet(&mut handler, &packet).await.unwrap();
+        session.process_packet(Some(&mut handler), &packet).await.unwrap();
 
         assert!(
             !handler.exec_called,
@@ -411,7 +444,7 @@ mod tests {
         packet.push(msg::CHANNEL_WINDOW_ADJUST);
         channel.encode(&mut packet).unwrap();
         123u32.encode(&mut packet).unwrap();
-        session.process_packet(&mut handler, &packet).await.unwrap();
+        session.process_packet(Some(&mut handler), &packet).await.unwrap();
 
         assert!(
             !handler.window_adjusted_called,
@@ -524,6 +557,19 @@ mod tests {
         let handle = Handle {
             sender,
             channel_buffer_size: config.channel_buffer_size,
+            live: std::sync::Arc::new(crate::channels::OutboundLiveSet::default()),
+            use_acked_window: {
+                #[cfg(feature = "_test_hooks")]
+                {
+                    !config.invert_channel_window_mirror
+                }
+                #[cfg(not(feature = "_test_hooks"))]
+                {
+                    true
+                }
+            },
+            #[cfg(feature = "_test_hooks")]
+            observe: config.handle_observe.clone(),
         };
 
         Session {
@@ -551,14 +597,44 @@ mod tests {
             pending_reads: Vec::new(),
             pending_len: 0,
             channels: std::collections::HashMap::new(),
-            inbound: std::collections::HashMap::new(),
+            inbound_gate: std::collections::HashMap::new(),
             inbound_needs_reserve: Vec::new(),
+            backpressured: std::collections::HashSet::new(),
             outbound_acks: std::collections::HashMap::new(),
             open_global_requests: std::collections::VecDeque::new(),
             kex: SessionKexState::Idle,
             rekey_gen: 0,
             rekey_deadline: crate::server::supervisor::RekeyDeadline::default(),
             handshake_deadline_at: None,
+            writer: None,
+            reader: None,
+            peer_credit: None,
+            pending_supervisor_cause: None,
+            pending_outbound: crate::server::session::PendingOutbound::default(),
+            pending_kex_install: None,
+            deferred_window_grants: std::collections::HashSet::new(),
+            deferred_grant_budget: false,
+            #[cfg(feature = "_test_hooks")]
+            full_ledger: None,
+            #[cfg(feature = "_test_hooks")]
+            outbound_log_cursor: 0,
+            sched_next: None,
+            sched_since_boost: crate::BOOST_PERIOD,
+            sched_debt: None,
+            facade_cmd_tx: None,
+            facade_cmd_rx: None,
+            executor: None,
+            next_invoke_gen: 0,
+            pending_harvest: std::collections::HashMap::new(),
+            facade_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            result_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            pending_open_ids: std::collections::HashSet::new(),
+            global_replies: crate::ReplyQueue::default(),
+            openings: std::collections::HashMap::new(),
+            next_channel_gen: 1,
+            conn_budget: None,
+            channel_global_held: std::collections::HashMap::new(),
+            channel_window_covered: std::collections::HashMap::new(),
         }
     }
 
@@ -573,9 +649,8 @@ mod tests {
             session_id: CryptoVec::new(),
             channels: std::collections::HashMap::new(),
             last_channel_id: Wrapping(0),
-            write: Vec::new(),
+            write: bytes::BytesMut::new(),
             write_cursor: 0,
-            last_rekey: russh_util::time::Instant::now(),
             server_compression: Compression::None,
             client_compression: Compression::None,
             decompress: Decompress::None,
@@ -589,16 +664,16 @@ mod tests {
 fn server_accept_service(
     banner: Option<String>,
     methods: MethodSet,
-    buffer: &mut Vec<u8>,
+    buffer: &mut bytes::BytesMut,
 ) -> Result<AuthRequest, crate::Error> {
     push_packet!(buffer, {
-        buffer.push(msg::SERVICE_ACCEPT);
+        buffer.put_u8(msg::SERVICE_ACCEPT);
         "ssh-userauth".encode(buffer)?;
     });
 
     if let Some(banner) = banner {
         push_packet!(buffer, {
-            buffer.push(msg::USERAUTH_BANNER);
+            buffer.put_u8(msg::USERAUTH_BANNER);
             banner.encode(buffer)?;
             "".encode(buffer)?;
         })
@@ -922,7 +997,7 @@ impl Encrypted {
                             algo.extend_from_slice(pubkey_algo.as_bytes());
                             debug!("pubkey_key: {pubkey_key:?}");
                             push_packet!(self.write, {
-                                self.write.push(msg::USERAUTH_PK_OK);
+                                self.write.put_u8(msg::USERAUTH_PK_OK);
                                 map_err!(pubkey_algo.encode(&mut self.write))?;
                                 map_err!(pubkey_key.encode(&mut self.write))?;
                             });
@@ -966,14 +1041,14 @@ impl Encrypted {
 
 async fn reject_auth_request(
     until: Instant,
-    write: &mut Vec<u8>,
+    write: &mut bytes::BytesMut,
     auth_request: &mut AuthRequest,
 ) -> Result<(), Error> {
     debug!("rejecting {auth_request:?}");
     push_packet!(write, {
-        write.push(msg::USERAUTH_FAILURE);
+        write.put_u8(msg::USERAUTH_FAILURE);
         NameList::from(&auth_request.methods).encode(write)?;
-        write.push(auth_request.partial_success as u8);
+        write.put_u8(auth_request.partial_success as u8);
     });
     auth_request.current = None;
     auth_request.rejection_count += 1;
@@ -982,16 +1057,16 @@ async fn reject_auth_request(
     Ok(())
 }
 
-fn server_auth_request_success(buffer: &mut Vec<u8>) {
+fn server_auth_request_success(buffer: &mut bytes::BytesMut) {
     push_packet!(buffer, {
-        buffer.push(msg::USERAUTH_SUCCESS);
+        buffer.put_u8(msg::USERAUTH_SUCCESS);
     })
 }
 
 async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
     until: Instant,
     handler: &mut H,
-    write: &mut Vec<u8>,
+    write: &mut bytes::BytesMut,
     auth_request: &mut AuthRequest,
     user: &str,
     r: &mut R,
@@ -1027,7 +1102,7 @@ async fn read_userauth_info_response<H: Handler + Send, R: Reader>(
 async fn reply_userauth_info_response(
     until: Instant,
     auth_request: &mut AuthRequest,
-    write: &mut Vec<u8>,
+    write: &mut bytes::BytesMut,
     auth: Auth,
 ) -> Result<bool, Error> {
     match auth {
@@ -1088,7 +1163,7 @@ impl Session {
 
     pub(crate) async fn server_read_authenticated<H: Handler + Send, R: Reader>(
         &mut self,
-        handler: &mut H,
+        mut handler: Option<&mut H>,
         msg: u8,
         r: &mut R,
     ) -> Result<(), H::Error> {
@@ -1125,18 +1200,13 @@ impl Session {
                         .as_ref()
                         .is_some_and(|enc| !enc.channel_exists(channel_num));
                     if we_closed_first && self.channels.contains_key(&channel_num) {
-                        match self.deliver_inbound(channel_num, InboundItem::Close) {
-                            InboundDelivery::Queued => {
-                                // Deferred to pump_inbound, after the queued data.
-                            }
-                            InboundDelivery::Delivered
-                            | InboundDelivery::Overflow
-                            | InboundDelivery::ChannelGone => {
-                                debug!("handler.channel_close {channel_num:?} (peer ack of our close)");
-                                handler.channel_close(channel_num, self).await?;
-                                self.finalize_close(channel_num);
-                            }
-                        }
+                        // No-lane / object-test path: no Scheme C queue.
+                        // Full still finalizes so the channels table cannot leak.
+                        let _ = self.try_send_app(channel_num, ChannelMsg::Close);
+                        debug!("handler.channel_close {channel_num:?} (peer ack of our close)");
+                        self.dispatch_close(handler.as_mut().map(|h| &mut **h), channel_num)
+                            .await?;
+                        self.finalize_close(channel_num);
                     }
                     return Ok(());
                 }
@@ -1147,26 +1217,14 @@ impl Session {
                 // `CHANNEL_WINDOW_ADJUST` the closing peer will never send, stranding the
                 // mandatory reply and leaking the channel entry.
                 self.discard_channel_outbound(channel_num)?;
-                // Queue the Close in-order behind any pending inbound data so that already-queued
-                // data is delivered before teardown. On the fast path the Close reaches the channel
-                // buffer immediately, so the `channel_close` callback + teardown run now; when it is
-                // queued, both are deferred to `pump_inbound`'s Close branch (in FIFO order, after
-                // any data ahead of it). Delivering `ChannelMsg::Close` to the channel is what lets
-                // consumers waiting on `Channel::wait()` observe an explicit close instead of `None`.
-                match self.deliver_inbound(channel_num, InboundItem::Close) {
-                    InboundDelivery::Queued => {
-                        // channel_close callback + finalize deferred to pump_inbound.
-                    }
-                    // Delivered (buffer had room) / Overflow / ChannelGone: nothing further will be
-                    // queued, so fire the callback and tear the channel down now.
-                    InboundDelivery::Delivered
-                    | InboundDelivery::Overflow
-                    | InboundDelivery::ChannelGone => {
-                        debug!("handler.channel_close {channel_num:?}");
-                        handler.channel_close(channel_num, self).await?;
-                        self.finalize_close(channel_num);
-                    }
-                }
+                // Production CLOSE is a scoped Reader-lane item. This arm is
+                // the no-lane / ctrl-fallback (object tests, parse miss).
+                // No Scheme C: try_send then finalize so the table cannot leak.
+                let _ = self.try_send_app(channel_num, ChannelMsg::Close);
+                debug!("handler.channel_close {channel_num:?}");
+                self.dispatch_close(handler.as_mut().map(|h| &mut **h), channel_num)
+                    .await?;
+                self.finalize_close(channel_num);
                 Ok(())
             }
             msg::CHANNEL_EOF => {
@@ -1175,21 +1233,12 @@ impl Session {
                 if !self.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                // Eof carries no bytes, so it never overflows; it is delivered in FIFO order.
-                match self.deliver_inbound(channel_num, InboundItem::Eof) {
-                    InboundDelivery::Queued => {
-                        // channel_eof callback deferred to pump_inbound (after any queued data).
-                    }
-                    // Delivered: queued into the app buffer. ChannelGone: no app stream retained
-                    // (handler-callback-only server, or receiver dropped). Either way fire the
-                    // callback now, matching the pre-refactor unconditional `handler.channel_eof`.
-                    // (Eof carries no bytes, so Overflow never occurs.)
-                    InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
-                        debug!("handler.channel_eof {channel_num:?}");
-                        handler.channel_eof(channel_num, self).await?;
-                    }
-                    InboundDelivery::Overflow => {}
-                }
+                // Production EOF is a scoped Reader-lane item. Ctrl fallback:
+                // try_send (Full cannot park — no Scheme C) then callback.
+                let _ = self.try_send_app(channel_num, ChannelMsg::Eof);
+                debug!("handler.channel_eof {channel_num:?}");
+                self.dispatch_eof(handler.as_mut().map(|h| &mut **h), channel_num)
+                    .await?;
                 Ok(())
             }
             msg::CHANNEL_EXTENDED_DATA | msg::CHANNEL_DATA => {
@@ -1207,57 +1256,68 @@ impl Session {
                 let data = map_err!(Bytes::decode(r))?;
                 map_err!(ensure_end(r))?;
 
-                // I1: consume the inbound receive window now (bytes are off the wire). The grant
-                // (I2) is deferred to delivery time so a backpressured channel withholds its own
-                // window and isolates the slow consumer instead of stalling the session loop.
-                if let Some(enc) = self.common.encrypted.as_mut() {
-                    enc.consume_recv_window(channel_num, data.len());
+                // I1: with a Reader the single ledger is consumed at receive
+                // (ChannelLane.window_remaining). This ctrl fallback is only
+                // for malformed / no-lane packets that never hit that path.
+                if self.reader.is_none() {
+                    if let Some(enc) = self.common.encrypted.as_mut() {
+                        enc.consume_recv_window(channel_num, data.len());
+                    }
                 }
 
-                let item = if let Some(ext) = ext {
-                    InboundItem::ExtendedData {
+                if data.is_empty() {
+                    // Zero-byte DATA delivers nothing (would read as EOF).
+                    self.maybe_grant_after_delivery(
+                        channel_num,
+                        handler.as_mut().map(|h| &mut **h),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let msg = if let Some(ext) = ext {
+                    ChannelMsg::ExtendedData {
                         ext,
                         data: data.clone(),
                     }
                 } else {
-                    InboundItem::Data(data.clone())
+                    ChannelMsg::Data { data: data.clone() }
                 };
-                match self.deliver_inbound(channel_num, item) {
-                    InboundDelivery::Delivered | InboundDelivery::ChannelGone => {
-                        // Delivered: the data is in the per-channel application buffer.
-                        // ChannelGone: no application-side `Channel` stream is retained — the very
-                        // common handler-callback-only server pattern (the server drops the
-                        // `Channel` and works purely through `Handler::data`), or the receiver was
-                        // dropped. There is no app buffer to backpressure, so behave like the
-                        // pre-refactor path: grant window and fire the handler callback
-                        // unconditionally (the old code always called `handler.data` after a
-                        // best-effort `chan.send().await.unwrap_or(())`). Skipping the callback here
-                        // wedges every such server (no echo / no progress).
-                        self.maybe_grant_after_delivery(channel_num, handler)?;
+                match self.try_send_app(channel_num, msg) {
+                    Ok(()) | Err(TrySendError::Closed(_)) => {
+                        // Delivered or ChannelGone (handler-only server). This
+                        // is the no-lane / ctrl-fallback DATA path: still
+                        // invoke Handler::data. The Reader Delivered skip
+                        // lives in finish_lane_item.
+                        self.maybe_grant_after_delivery(
+                            channel_num,
+                            handler.as_mut().map(|h| &mut **h),
+                        )
+                        .await?;
                         if let Some(ext) = ext {
-                            handler.extended_data(channel_num, ext, &data, self).await?;
+                            self.dispatch_extended_data(
+                                handler.as_mut().map(|h| &mut **h),
+                                channel_num,
+                                ext,
+                                &data,
+                            )
+                            .await?;
                         } else {
-                            handler.data(channel_num, &data, self).await?;
+                            self.dispatch_data(
+                                handler.as_mut().map(|h| &mut **h),
+                                channel_num,
+                                &data,
+                                false,
+                            )
+                            .await?;
                         }
                     }
-                    InboundDelivery::Queued => {
-                        // Grant withheld (per-channel backpressure); the handler callback is
-                        // deferred to pump_inbound so it never fires before the data is buffered.
-                    }
-                    InboundDelivery::Overflow => {
-                        // Protocol violation: the peer ignored its advertised window. Send a wire
-                        // CHANNEL_CLOSE for this channel, drop its queue, and remove local state —
-                        // close this one channel only, never the session.
-                        log::warn!(
-                            "inbound pending cap exceeded for channel {channel_num:?}; closing channel (peer ignored window)"
+                    Err(TrySendError::Full(_)) => {
+                        // No Scheme C on the no-lane path. Do not block
+                        // `reply()` (structural ban). The peer's window
+                        // already accounts for these bytes.
+                        log::debug!(
+                            "ctrl-fallback DATA dropped (app buffer full, no lane) {channel_num:?}"
                         );
-                        // Discard anything queued outbound for this channel rather than parking
-                        // the close behind it: a peer that ignores its window is not a peer we
-                        // can expect a window adjustment from, so a parked close would strand the
-                        // reply and leak this channel for the rest of the session.
-                        self.discard_channel_outbound(channel_num)?;
-                        self.teardown_inbound_channel(channel_num);
-                        self.channels.remove(&channel_num);
                     }
                 }
                 Ok(())
@@ -1279,21 +1339,28 @@ impl Session {
                     new_size = channel.recipient_window_size.saturating_add(amount);
                     channel.recipient_window_size = new_size;
                 }
-                let common = &mut self.common;
-                if let Some(enc) = common.encrypted.as_mut() {
-                    new_size -= enc
-                        .flush_pending_with_writer(&mut common.packet_writer, channel_num)?
-                        as u32;
+                // P-1: HWM/framing-aware drain only (never unbounded flush_pending).
+                // Errors propagate into reply → first-cause / cancel path.
+                let wrote = self.try_drain_channel_under_budget(channel_num)?;
+                new_size = new_size.saturating_sub(wrote as u32);
+                // Reflect residual window after clamp/drain.
+                if let Some(enc) = self.common.encrypted.as_ref() {
+                    if let Some(ch) = enc.channels.get(&channel_num) {
+                        new_size = ch.recipient_window_size;
+                    }
                 }
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    chan.window_size().update(new_size).await;
-                    // Use try_send to avoid blocking the session loop when channel buffer is full.
-                    // WindowAdjusted is informational - the critical side effect (updating
-                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+                    // Informational only. Server Channel write path uses
+                    // ChannelDataAcked + Session recipient_window_size (S5b).
                     let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                 }
                 debug!("handler.window_adjusted {channel_num:?}");
-                handler.window_adjusted(channel_num, new_size, self).await
+                self.dispatch_window_adjusted(
+                    handler.as_mut().map(|h| &mut **h),
+                    channel_num,
+                    new_size,
+                )
+                .await
             }
 
             msg::CHANNEL_OPEN_CONFIRMATION => {
@@ -1312,8 +1379,12 @@ impl Session {
                 } else {
                     return Err(Error::Inconsistent.into());
                 };
+                if let Some(r) = self.reader.as_ref() {
+                    r.confirm_lane(local_id);
+                }
 
                 if let Some(channel) = self.channels.get(&local_id) {
+                    self.sender.live.insert(local_id);
                     channel
                         .send(ChannelMsg::Open {
                             id: local_id,
@@ -1325,29 +1396,26 @@ impl Session {
                 } else {
                     error!("no channel for id {local_id:?}");
                 }
-                handler
-                    .channel_open_confirmation(
-                        local_id,
-                        msg.maximum_packet_size,
-                        msg.initial_window_size,
-                        self,
-                    )
-                    .await
+                self.dispatch_open_confirmation(
+                    handler.as_mut().map(|h| &mut **h),
+                    local_id,
+                    msg.maximum_packet_size,
+                    msg.initial_window_size,
+                )
+                .await
             }
 
             msg::CHANNEL_REQUEST => {
                 let channel_num = map_err!(ChannelId::decode(r))?;
                 let req_type = map_err!(String::decode(r))?;
                 let wants_reply = map_err!(u8::decode(r))?;
-                if let Some(ref mut enc) = self.common.encrypted {
-                    if let Some(channel) = enc.channels.get_mut(&channel_num) {
-                        channel.wants_reply = wants_reply != 0;
-                    }
-                }
                 if !self.is_established_channel(channel_num) {
                     // Request for a channel that was never opened (or whose open
                     // was denied): drop it without invoking any handler callback.
                     return Ok(());
+                }
+                if wants_reply != 0 {
+                    self.enqueue_channel_obligation(channel_num)?;
                 }
                 match req_type.as_str() {
                     "pty-req" => {
@@ -1414,18 +1482,18 @@ impl Session {
 
                         debug!("handler.pty_request {channel_num:?}");
                         #[allow(clippy::indexing_slicing)] // `modes` length checked
-                        handler
-                            .pty_request(
-                                channel_num,
-                                &term,
-                                col_width,
-                                row_height,
-                                pix_width,
-                                pix_height,
-                                &modes[0..i],
-                                self,
-                            )
-                            .await
+                        self.dispatch_pty(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            &term,
+                            col_width,
+                            row_height,
+                            pix_width,
+                            pix_height,
+                            &modes[0..i],
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "x11-req" => {
                         let single_connection = map_err!(u8::decode(r))? != 0;
@@ -1446,16 +1514,16 @@ impl Session {
                                 .await;
                         }
                         debug!("handler.x11_request {channel_num:?}");
-                        handler
-                            .x11_request(
-                                channel_num,
-                                single_connection,
-                                &x11_auth_protocol,
-                                &x11_auth_cookie,
-                                x11_screen_number,
-                                self,
-                            )
-                            .await
+                        self.dispatch_x11_req(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            single_connection,
+                            &x11_auth_protocol,
+                            &x11_auth_cookie,
+                            x11_screen_number,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "env" => {
                         let env_variable = map_err!(String::decode(r))?;
@@ -1473,9 +1541,14 @@ impl Session {
                         }
 
                         debug!("handler.env_request {channel_num:?}");
-                        handler
-                            .env_request(channel_num, &env_variable, &env_value, self)
-                            .await
+                        self.dispatch_env(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            &env_variable,
+                            &env_value,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "shell" => {
                         map_err!(ensure_end(r))?;
@@ -1485,7 +1558,12 @@ impl Session {
                                 .await;
                         }
                         debug!("handler.shell_request {channel_num:?}");
-                        handler.shell_request(channel_num, self).await
+                        self.dispatch_shell(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "auth-agent-req@openssh.com" => {
                         map_err!(ensure_end(r))?;
@@ -1496,7 +1574,9 @@ impl Session {
                         }
                         debug!("handler.agent_request {channel_num:?}");
 
-                        let response = handler.agent_request(channel_num, self).await?;
+                        let response = self
+                            .dispatch_agent(handler.as_mut().map(|h| &mut **h), channel_num)
+                            .await?;
                         if response {
                             self.request_success()
                         } else {
@@ -1516,7 +1596,13 @@ impl Session {
                                 .await;
                         }
                         debug!("handler.exec_request {channel_num:?}");
-                        handler.exec_request(channel_num, &req, self).await
+                        self.dispatch_exec(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            &req,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "subsystem" => {
                         let name = map_err!(String::decode(r))?;
@@ -1531,7 +1617,13 @@ impl Session {
                                 .await;
                         }
                         debug!("handler.subsystem_request {channel_num:?}");
-                        handler.subsystem_request(channel_num, &name, self).await
+                        self.dispatch_subsystem(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            &name,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "window-change" => {
                         let col_width = map_err!(u32::decode(r))?;
@@ -1552,16 +1644,16 @@ impl Session {
                         }
 
                         debug!("handler.window_change {channel_num:?}");
-                        handler
-                            .window_change_request(
-                                channel_num,
-                                col_width,
-                                row_height,
-                                pix_width,
-                                pix_height,
-                                self,
-                            )
-                            .await
+                        self.dispatch_window_change(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            col_width,
+                            row_height,
+                            pix_width,
+                            pix_height,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     "signal" => {
                         let signal = Sig::from_name(&map_err!(String::decode(r))?);
@@ -1574,11 +1666,27 @@ impl Session {
                             .unwrap_or(())
                         }
                         debug!("handler.signal {channel_num:?} {signal:?}");
-                        handler.signal(channel_num, signal, self).await
+                        self.dispatch_signal(
+                            handler.as_mut().map(|h| &mut **h),
+                            channel_num,
+                            signal,
+                            wants_reply != 0,
+                        )
+                        .await
                     }
                     x => {
                         warn!("unknown channel request {x}");
-                        self.channel_failure(channel_num)?;
+                        if wants_reply != 0 {
+                            if let Some(ch) = self
+                                .common
+                                .encrypted
+                                .as_mut()
+                                .and_then(|enc| enc.channels.get_mut(&channel_num))
+                            {
+                                ch.reply_queue.decide_last_if_pending(false, None);
+                            }
+                            self.flush_channel_replies(channel_num)?;
+                        }
                         Ok(())
                     }
                 }
@@ -1586,6 +1694,9 @@ impl Session {
             msg::GLOBAL_REQUEST => {
                 let req_type = map_err!(String::decode(r))?;
                 self.common.wants_reply = map_err!(u8::decode(r))? != 0;
+                if self.common.wants_reply {
+                    self.enqueue_global_obligation()?;
+                }
                 match req_type.as_str() {
                     "tcpip-forward" => {
                         let address = map_err!(String::decode(r))?;
@@ -1593,50 +1704,89 @@ impl Session {
                         map_err!(ensure_end(r))?;
                         debug!("handler.tcpip_forward {address:?} {port:?}");
                         let mut returned_port = port;
-                        let result = handler
-                            .tcpip_forward(&address, &mut returned_port, self)
-                            .await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, {
-                                    enc.write.push(msg::REQUEST_SUCCESS);
-                                    if self.common.wants_reply && port == 0 && returned_port != 0 {
-                                        map_err!(returned_port.encode(&mut enc.write))?;
-                                    }
-                                })
+                        if self.executor.is_some() {
+                            let _ = self
+                                .dispatch_tcpip_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &address,
+                                    &mut returned_port,
+                                )
+                                .await?;
+                            Ok(())
+                        } else {
+                            let result = self
+                                .dispatch_tcpip_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &address,
+                                    &mut returned_port,
+                                )
+                                .await?;
+                            let extra = if result
+                                && self.common.wants_reply
+                                && port == 0
+                                && returned_port != 0
+                            {
+                                Some(returned_port)
                             } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                                None
+                            };
+                            if self.common.wants_reply {
+                                self.global_replies.decide_oldest_pending(result, extra);
+                                self.flush_global_replies()?;
                             }
+                            Ok(())
                         }
-                        Ok(())
                     }
                     "cancel-tcpip-forward" => {
                         let address = map_err!(String::decode(r))?;
                         let port = map_err!(u32::decode(r))?;
                         map_err!(ensure_end(r))?;
                         debug!("handler.cancel_tcpip_forward {address:?} {port:?}");
-                        let result = handler.cancel_tcpip_forward(&address, port, self).await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                        if self.executor.is_some() {
+                            let _ = self
+                                .dispatch_cancel_tcpip_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &address,
+                                    port,
+                                )
+                                .await?;
+                            Ok(())
+                        } else {
+                            let result = self
+                                .dispatch_cancel_tcpip_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &address,
+                                    port,
+                                )
+                                .await?;
+                            if self.common.wants_reply {
+                                self.global_replies.decide_oldest_pending(result, None);
+                                self.flush_global_replies()?;
                             }
+                            Ok(())
                         }
-                        Ok(())
                     }
                     "streamlocal-forward@openssh.com" => {
                         let server_socket_path = map_err!(String::decode(r))?;
                         map_err!(ensure_end(r))?;
                         debug!("handler.streamlocal_forward {server_socket_path:?}");
-                        let result = handler
-                            .streamlocal_forward(&server_socket_path, self)
-                            .await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                        if self.executor.is_some() {
+                            let _ = self
+                                .dispatch_streamlocal_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &server_socket_path,
+                                )
+                                .await?;
+                        } else {
+                            let result = self
+                                .dispatch_streamlocal_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &server_socket_path,
+                                )
+                                .await?;
+                            if self.common.wants_reply {
+                                self.global_replies.decide_oldest_pending(result, None);
+                                self.flush_global_replies()?;
                             }
                         }
                         Ok(())
@@ -1645,23 +1795,32 @@ impl Session {
                         let socket_path = map_err!(String::decode(r))?;
                         map_err!(ensure_end(r))?;
                         debug!("handler.cancel_streamlocal_forward {socket_path:?}");
-                        let result = handler
-                            .cancel_streamlocal_forward(&socket_path, self)
-                            .await?;
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
-                            } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                        if self.executor.is_some() {
+                            let _ = self
+                                .dispatch_cancel_streamlocal_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &socket_path,
+                                )
+                                .await?;
+                            Ok(())
+                        } else {
+                            let result = self
+                                .dispatch_cancel_streamlocal_forward(
+                                    handler.as_mut().map(|h| &mut **h),
+                                    &socket_path,
+                                )
+                                .await?;
+                            if self.common.wants_reply {
+                                self.global_replies.decide_oldest_pending(result, None);
+                                self.flush_global_replies()?;
                             }
+                            Ok(())
                         }
-                        Ok(())
                     }
                     _ => {
-                        if let Some(ref mut enc) = self.common.encrypted {
-                            push_packet!(enc.write, {
-                                enc.write.push(msg::REQUEST_FAILURE);
-                            });
+                        if self.common.wants_reply {
+                            self.global_replies.decide_last_if_pending(false, None);
+                            self.flush_global_replies()?;
                         }
                         Ok(())
                     }
@@ -1689,6 +1848,30 @@ impl Session {
                         .await
                         .map_err(|_| crate::Error::SendError)?;
                 }
+
+                // Server-open registered an unconfirmed lane. Gate
+                // teardown is a no-op if the id is absent; it does *not*
+                // close the lane. Do not discard outbound: the Handle has
+                // not returned a Channel yet, so nothing is queued, and
+                // close_discarding_pending would emit a spurious CLOSE.
+                self.teardown_inbound_channel(channel_num);
+                if let Some(r) = &self.reader {
+                    r.close_lane(channel_num, r.lane_gen(channel_num).unwrap_or(0));
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(o) = self.common.config.window_observe.as_ref() {
+                        if r.is_confirmed(channel_num).is_none() {
+                            o.note_lane_close(channel_num.number());
+                        }
+                        o.set_lane_count(r.lane_count());
+                    }
+                } else {
+                    #[cfg(feature = "_test_hooks")]
+                    if let Some(o) = self.common.config.window_observe.as_ref() {
+                        o.note_lane_close(channel_num.number());
+                    }
+                }
+                self.release_channel_global(channel_num);
+                self.publish_slots();
 
                 Ok(())
             }
@@ -1768,40 +1951,74 @@ impl Session {
 
     async fn server_handle_channel_open<H: Handler + Send, R: Reader>(
         &mut self,
-        handler: &mut H,
+        handler: Option<&mut H>,
         r: &mut R,
     ) -> Result<(), H::Error> {
         let msg = OpenChannelMessage::parse(r)?;
 
-        let sender_channel = if let Some(ref mut enc) = self.common.encrypted {
-            enc.new_channel_id()
-        } else {
-            unreachable!()
-        };
-        let channel_params = ChannelParams {
-            recipient_channel: msg.recipient_channel,
+        // Unsupported types fail immediately: no slot, no handle, no handler.
+        let supported = matches!(
+            msg.typ,
+            ChannelType::Session
+                | ChannelType::X11 { .. }
+                | ChannelType::DirectTcpip(_)
+                | ChannelType::ForwardedTcpIp(_)
+                | ChannelType::DirectStreamLocal(_)
+        );
+        if !supported {
+            if let Some(ref mut enc) = self.common.encrypted {
+                match &msg.typ {
+                    ChannelType::Unknown { typ } => {
+                        debug!("unknown channel type: {typ}");
+                        msg.unknown_type(&mut enc.write)?;
+                    }
+                    _ => {
+                        msg.fail(
+                            &mut enc.write,
+                            msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                            b"Unsupported channel type",
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
 
-            // "sender" is the local end, i.e. we're the sender, the remote is the recipient.
+        let Some((sender_channel, lease)) = self.try_reserve_opening(msg.recipient_channel) else {
+            if let Some(ref mut enc) = self.common.encrypted {
+                msg.fail(
+                    &mut enc.write,
+                    msg::SSH_OPEN_RESOURCE_SHORTAGE,
+                    b"Too many channels",
+                )?;
+            }
+            self.record_outbound_from_write();
+            return Ok(());
+        };
+        let generation = lease.generation;
+        let channel_params = ChannelParams::new(
+            msg.recipient_channel,
             sender_channel,
+            msg.recipient_window_size,
+            self.common.config.window_size,
+            msg.recipient_maximum_packet_size,
+            self.common.config.maximum_packet_size,
+            true,
+        );
 
-            recipient_window_size: msg.recipient_window_size,
-            sender_window_size: self.common.config.window_size,
-            recipient_maximum_packet_size: msg.recipient_maximum_packet_size,
-            sender_maximum_packet_size: self.common.config.maximum_packet_size,
-            confirmed: true,
-            wants_reply: false,
-            pending_data: std::collections::VecDeque::new(),
-            pending_eof: false,
-            pending_close: false,
-        };
-
-        let (channel, channel_ref) = Channel::new(
+        let (channel, channel_ref) = Channel::new_server(
             sender_channel,
             self.sender.sender.clone(),
             channel_params.recipient_maximum_packet_size,
             channel_params.recipient_window_size,
             self.common.config.channel_buffer_size,
+            self.sender.live.clone(),
+            self.sender.use_acked_window,
         );
+        // Handler may `data()` immediately after `accept()` queues the
+        // reply (S4b: accept does not wait for finalize). Mark live now;
+        // reject / expire removes it.
+        self.sender.live.insert(sender_channel);
 
         let pending = PendingChannelOpen {
             recipient_channel: msg.recipient_channel,
@@ -1810,6 +2027,8 @@ impl Session {
             packet_size: self.common.config.maximum_packet_size,
             channel_ref,
             channel_params,
+            generation,
+            lease: Some(lease),
         };
         let reply = ChannelOpenHandle::new(
             self.open_reply_tx.clone(),
@@ -1819,74 +2038,50 @@ impl Session {
 
         match &msg.typ {
             ChannelType::Session => {
-                handler.channel_open_session(channel, reply, self).await
+                self.dispatch_open_session(handler, channel, reply).await
             }
             ChannelType::X11 {
                 originator_address,
                 originator_port,
             } => {
-                handler
-                    .channel_open_x11(channel, originator_address, *originator_port, reply, self)
-                    .await
+                self.dispatch_open_x11(
+                    handler,
+                    channel,
+                    originator_address,
+                    *originator_port,
+                    reply,
+                )
+                .await
             }
             ChannelType::DirectTcpip(d) => {
-                handler
-                    .channel_open_direct_tcpip(
-                        channel,
-                        &d.host_to_connect,
-                        d.port_to_connect,
-                        &d.originator_address,
-                        d.originator_port,
-                        reply,
-                        self,
-                    )
-                    .await
+                self.dispatch_open_direct_tcpip(
+                    handler,
+                    channel,
+                    &d.host_to_connect,
+                    d.port_to_connect,
+                    &d.originator_address,
+                    d.originator_port,
+                    reply,
+                )
+                .await
             }
             ChannelType::ForwardedTcpIp(d) => {
-                handler
-                    .channel_open_forwarded_tcpip(
-                        channel,
-                        &d.host_to_connect,
-                        d.port_to_connect,
-                        &d.originator_address,
-                        d.originator_port,
-                        reply,
-                        self,
-                    )
-                    .await
+                self.dispatch_open_forwarded_tcpip(
+                    handler,
+                    channel,
+                    &d.host_to_connect,
+                    d.port_to_connect,
+                    &d.originator_address,
+                    d.originator_port,
+                    reply,
+                )
+                .await
             }
             ChannelType::DirectStreamLocal(d) => {
-                handler
-                    .channel_open_direct_streamlocal(channel, &d.socket_path, reply, self)
+                self.dispatch_open_direct_streamlocal(handler, channel, &d.socket_path, reply)
                     .await
             }
-            ChannelType::ForwardedStreamLocal(_) => {
-                if let Some(ref mut enc) = self.common.encrypted {
-                    msg.fail(
-                        &mut enc.write,
-                        msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
-                        b"Unsupported channel type",
-                    )?;
-                }
-                Ok(())
-            }
-            ChannelType::AgentForward => {
-                if let Some(ref mut enc) = self.common.encrypted {
-                    msg.fail(
-                        &mut enc.write,
-                        msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
-                        b"Unsupported channel type",
-                    )?;
-                }
-                Ok(())
-            }
-            ChannelType::Unknown { typ } => {
-                debug!("unknown channel type: {typ}");
-                if let Some(ref mut enc) = self.common.encrypted {
-                    msg.unknown_type(&mut enc.write)?;
-                }
-                Ok(())
-            }
+            _ => Ok(()),
         }
     }
 }

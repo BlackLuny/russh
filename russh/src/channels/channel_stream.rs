@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::io::{ChannelCloseOnDrop, ChannelRx, ChannelTx};
-use super::{ChannelId, ChannelMsg};
+use super::{ChannelAcked, ChannelId, ChannelMsg};
 
 /// AsyncRead/AsyncWrite wrapper for SSH Channels
 pub struct ChannelStream<S>
@@ -40,7 +40,7 @@ where
 
 impl<S> AsyncWrite for ChannelStream<S>
 where
-    S: From<(ChannelId, ChannelMsg)> + 'static + Send + Sync,
+    S: From<(ChannelId, ChannelMsg)> + ChannelAcked + 'static + Send + Sync,
 {
     fn poll_write(
         mut self: Pin<&mut Self>,
