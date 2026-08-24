@@ -1,0 +1,23 @@
+{
+  "scenario": "churn",
+  "workers": 143,
+  "inflight_target": 100,
+  "inflight_end": 0,
+  "inflight_max": 131,
+  "elapsed_secs": 7200.017429590225,
+  "duration_requested_secs": 7200.0,
+  "sample_secs": 300.0,
+  "opened": 41248,
+  "closed": 41248,
+  "bytes_tx": 93540774912,
+  "bytes_rx": 93540774912,
+  "mismatches": 0,
+  "connect_fail": 0,
+  "addr_in_use": 0,
+  "timeouts": 0,
+  "anomaly_samples": 0,
+  "proxy_exit": -15,
+  "ssh_exit": 0,
+  "error_excerpts": [],
+  "ok": true
+}

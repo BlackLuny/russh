@@ -1,0 +1,509 @@
+inbound_tcp_proxy listening on 127.0.0.1:35513
+ssh client connected from Some(127.0.0.1:57378)
+auth_publickey user=soak -> accept
+direct-tcpip opened total=1 127.0.0.1:34475 -> 127.0.0.1:34767 chan=ChannelId(2)
+direct-tcpip opened total=2 127.0.0.1:34757 -> 127.0.0.1:34767 chan=ChannelId(3)
+direct-tcpip opened total=3 127.0.0.1:50777 -> 127.0.0.1:34767 chan=ChannelId(4)
+direct-tcpip closed total=1 dest=127.0.0.1:34767 ssh->tcp=1872896 tcp->ssh=1872896
+direct-tcpip closed total=2 dest=127.0.0.1:34767 ssh->tcp=3056640 tcp->ssh=3056640
+direct-tcpip closed total=3 dest=127.0.0.1:34767 ssh->tcp=2059264 tcp->ssh=2059264
+direct-tcpip opened total=200 127.0.0.1:38421 -> 127.0.0.1:34767 chan=ChannelId(201)
+direct-tcpip closed total=200 dest=127.0.0.1:34767 ssh->tcp=3844096 tcp->ssh=3844096
+direct-tcpip opened total=400 127.0.0.1:38515 -> 127.0.0.1:34767 chan=ChannelId(401)
+direct-tcpip closed total=400 dest=127.0.0.1:34767 ssh->tcp=1599488 tcp->ssh=1599488
+[2026-08-18T10:29:49.041Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=600 127.0.0.1:46855 -> 127.0.0.1:34767 chan=ChannelId(601)
+direct-tcpip closed total=600 dest=127.0.0.1:34767 ssh->tcp=3105792 tcp->ssh=3105792
+direct-tcpip opened total=800 127.0.0.1:60057 -> 127.0.0.1:34767 chan=ChannelId(801)
+direct-tcpip closed total=800 dest=127.0.0.1:34767 ssh->tcp=2840576 tcp->ssh=2840576
+[2026-08-18T10:31:10.385Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=1000 127.0.0.1:41247 -> 127.0.0.1:34767 chan=ChannelId(1001)
+direct-tcpip closed total=1000 dest=127.0.0.1:34767 ssh->tcp=2964480 tcp->ssh=2964480
+direct-tcpip opened total=1200 127.0.0.1:46913 -> 127.0.0.1:34767 chan=ChannelId(1201)
+direct-tcpip closed total=1200 dest=127.0.0.1:34767 ssh->tcp=1963008 tcp->ssh=1963008
+direct-tcpip opened total=1400 127.0.0.1:57727 -> 127.0.0.1:34767 chan=ChannelId(1401)
+[2026-08-18T10:32:31.495Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=1400 dest=127.0.0.1:34767 ssh->tcp=2318336 tcp->ssh=2318336
+direct-tcpip opened total=1600 127.0.0.1:34549 -> 127.0.0.1:34767 chan=ChannelId(1601)
+direct-tcpip closed total=1600 dest=127.0.0.1:34767 ssh->tcp=1012736 tcp->ssh=1012736
+direct-tcpip opened total=1800 127.0.0.1:41507 -> 127.0.0.1:34767 chan=ChannelId(1801)
+direct-tcpip closed total=1800 dest=127.0.0.1:34767 ssh->tcp=2706432 tcp->ssh=2706432
+[2026-08-18T10:33:52.738Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=2000 127.0.0.1:37185 -> 127.0.0.1:34767 chan=ChannelId(2001)
+direct-tcpip closed total=2000 dest=127.0.0.1:34767 ssh->tcp=3771392 tcp->ssh=3771392
+direct-tcpip opened total=2200 127.0.0.1:33033 -> 127.0.0.1:34767 chan=ChannelId(2201)
+direct-tcpip closed total=2200 dest=127.0.0.1:34767 ssh->tcp=1240064 tcp->ssh=1240064
+[2026-08-18T10:35:13.959Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=2400 127.0.0.1:56461 -> 127.0.0.1:34767 chan=ChannelId(2401)
+direct-tcpip closed total=2400 dest=127.0.0.1:34767 ssh->tcp=776192 tcp->ssh=776192
+direct-tcpip opened total=2600 127.0.0.1:57837 -> 127.0.0.1:34767 chan=ChannelId(2601)
+direct-tcpip closed total=2600 dest=127.0.0.1:34767 ssh->tcp=1221632 tcp->ssh=1221632
+direct-tcpip opened total=2800 127.0.0.1:49753 -> 127.0.0.1:34767 chan=ChannelId(2801)
+[2026-08-18T10:36:34.746Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=2800 dest=127.0.0.1:34767 ssh->tcp=741376 tcp->ssh=741376
+direct-tcpip opened total=3000 127.0.0.1:60103 -> 127.0.0.1:34767 chan=ChannelId(3001)
+direct-tcpip closed total=3000 dest=127.0.0.1:34767 ssh->tcp=1869824 tcp->ssh=1869824
+direct-tcpip opened total=3200 127.0.0.1:46117 -> 127.0.0.1:34767 chan=ChannelId(3201)
+direct-tcpip closed total=3200 dest=127.0.0.1:34767 ssh->tcp=3073024 tcp->ssh=3073024
+[2026-08-18T10:37:55.774Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=3400 127.0.0.1:38337 -> 127.0.0.1:34767 chan=ChannelId(3401)
+direct-tcpip closed total=3400 dest=127.0.0.1:34767 ssh->tcp=1657856 tcp->ssh=1657856
+direct-tcpip opened total=3600 127.0.0.1:54263 -> 127.0.0.1:34767 chan=ChannelId(3601)
+direct-tcpip closed total=3600 dest=127.0.0.1:34767 ssh->tcp=3563520 tcp->ssh=3563520
+[2026-08-18T10:39:16.512Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=3800 127.0.0.1:55809 -> 127.0.0.1:34767 chan=ChannelId(3801)
+direct-tcpip closed total=3800 dest=127.0.0.1:34767 ssh->tcp=2169856 tcp->ssh=2169856
+direct-tcpip opened total=4000 127.0.0.1:51493 -> 127.0.0.1:34767 chan=ChannelId(4001)
+direct-tcpip closed total=4000 dest=127.0.0.1:34767 ssh->tcp=1849344 tcp->ssh=1849344
+direct-tcpip opened total=4200 127.0.0.1:39517 -> 127.0.0.1:34767 chan=ChannelId(4201)
+[2026-08-18T10:40:38.363Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=4200 dest=127.0.0.1:34767 ssh->tcp=628736 tcp->ssh=628736
+direct-tcpip opened total=4400 127.0.0.1:51129 -> 127.0.0.1:34767 chan=ChannelId(4401)
+direct-tcpip closed total=4400 dest=127.0.0.1:34767 ssh->tcp=3761152 tcp->ssh=3761152
+direct-tcpip opened total=4600 127.0.0.1:60827 -> 127.0.0.1:34767 chan=ChannelId(4601)
+direct-tcpip closed total=4600 dest=127.0.0.1:34767 ssh->tcp=1781760 tcp->ssh=1781760
+[2026-08-18T10:41:59.422Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=4800 127.0.0.1:39679 -> 127.0.0.1:34767 chan=ChannelId(4801)
+direct-tcpip closed total=4800 dest=127.0.0.1:34767 ssh->tcp=3162112 tcp->ssh=3162112
+direct-tcpip opened total=5000 127.0.0.1:51037 -> 127.0.0.1:34767 chan=ChannelId(5001)
+direct-tcpip closed total=5000 dest=127.0.0.1:34767 ssh->tcp=3476480 tcp->ssh=3476480
+[2026-08-18T10:43:20.469Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=5200 127.0.0.1:35833 -> 127.0.0.1:34767 chan=ChannelId(5201)
+direct-tcpip closed total=5200 dest=127.0.0.1:34767 ssh->tcp=2323456 tcp->ssh=2323456
+direct-tcpip opened total=5400 127.0.0.1:37023 -> 127.0.0.1:34767 chan=ChannelId(5401)
+direct-tcpip closed total=5400 dest=127.0.0.1:34767 ssh->tcp=1986560 tcp->ssh=1986560
+direct-tcpip opened total=5600 127.0.0.1:51933 -> 127.0.0.1:34767 chan=ChannelId(5601)
+[2026-08-18T10:44:41.562Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=5600 dest=127.0.0.1:34767 ssh->tcp=1721344 tcp->ssh=1721344
+direct-tcpip opened total=5800 127.0.0.1:55615 -> 127.0.0.1:34767 chan=ChannelId(5801)
+direct-tcpip closed total=5800 dest=127.0.0.1:34767 ssh->tcp=2646016 tcp->ssh=2646016
+direct-tcpip opened total=6000 127.0.0.1:43771 -> 127.0.0.1:34767 chan=ChannelId(6001)
+direct-tcpip closed total=6000 dest=127.0.0.1:34767 ssh->tcp=3468288 tcp->ssh=3468288
+[2026-08-18T10:46:02.783Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=6200 127.0.0.1:53723 -> 127.0.0.1:34767 chan=ChannelId(6201)
+direct-tcpip closed total=6200 dest=127.0.0.1:34767 ssh->tcp=3243008 tcp->ssh=3243008
+direct-tcpip opened total=6400 127.0.0.1:52949 -> 127.0.0.1:34767 chan=ChannelId(6401)
+direct-tcpip closed total=6400 dest=127.0.0.1:34767 ssh->tcp=1271808 tcp->ssh=1271808
+[2026-08-18T10:47:24.354Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=6600 127.0.0.1:51867 -> 127.0.0.1:34767 chan=ChannelId(6601)
+direct-tcpip closed total=6600 dest=127.0.0.1:34767 ssh->tcp=3197952 tcp->ssh=3197952
+direct-tcpip opened total=6800 127.0.0.1:39059 -> 127.0.0.1:34767 chan=ChannelId(6801)
+direct-tcpip closed total=6800 dest=127.0.0.1:34767 ssh->tcp=2011136 tcp->ssh=2011136
+direct-tcpip opened total=7000 127.0.0.1:42813 -> 127.0.0.1:34767 chan=ChannelId(7001)
+[2026-08-18T10:48:45.437Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=7000 dest=127.0.0.1:34767 ssh->tcp=1018880 tcp->ssh=1018880
+direct-tcpip opened total=7200 127.0.0.1:47543 -> 127.0.0.1:34767 chan=ChannelId(7201)
+direct-tcpip closed total=7200 dest=127.0.0.1:34767 ssh->tcp=2644992 tcp->ssh=2644992
+direct-tcpip opened total=7400 127.0.0.1:57873 -> 127.0.0.1:34767 chan=ChannelId(7401)
+direct-tcpip closed total=7400 dest=127.0.0.1:34767 ssh->tcp=1243136 tcp->ssh=1243136
+[2026-08-18T10:50:08.311Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=7600 127.0.0.1:47049 -> 127.0.0.1:34767 chan=ChannelId(7601)
+direct-tcpip closed total=7600 dest=127.0.0.1:34767 ssh->tcp=2624512 tcp->ssh=2624512
+direct-tcpip opened total=7800 127.0.0.1:35669 -> 127.0.0.1:34767 chan=ChannelId(7801)
+direct-tcpip closed total=7800 dest=127.0.0.1:34767 ssh->tcp=2896896 tcp->ssh=2896896
+[2026-08-18T10:51:30.115Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=8000 127.0.0.1:35481 -> 127.0.0.1:34767 chan=ChannelId(8001)
+direct-tcpip closed total=8000 dest=127.0.0.1:34767 ssh->tcp=1824768 tcp->ssh=1824768
+direct-tcpip opened total=8200 127.0.0.1:35465 -> 127.0.0.1:34767 chan=ChannelId(8201)
+direct-tcpip closed total=8200 dest=127.0.0.1:34767 ssh->tcp=2695168 tcp->ssh=2695168
+direct-tcpip opened total=8400 127.0.0.1:47535 -> 127.0.0.1:34767 chan=ChannelId(8401)
+[2026-08-18T10:52:51.488Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=8400 dest=127.0.0.1:34767 ssh->tcp=2279424 tcp->ssh=2279424
+direct-tcpip opened total=8600 127.0.0.1:42673 -> 127.0.0.1:34767 chan=ChannelId(8601)
+direct-tcpip closed total=8600 dest=127.0.0.1:34767 ssh->tcp=1065984 tcp->ssh=1065984
+direct-tcpip opened total=8800 127.0.0.1:60571 -> 127.0.0.1:34767 chan=ChannelId(8801)
+direct-tcpip closed total=8800 dest=127.0.0.1:34767 ssh->tcp=1005568 tcp->ssh=1005568
+[2026-08-18T10:54:16.627Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=9000 127.0.0.1:39841 -> 127.0.0.1:34767 chan=ChannelId(9001)
+direct-tcpip closed total=9000 dest=127.0.0.1:34767 ssh->tcp=1091584 tcp->ssh=1091584
+direct-tcpip opened total=9200 127.0.0.1:44457 -> 127.0.0.1:34767 chan=ChannelId(9201)
+direct-tcpip closed total=9200 dest=127.0.0.1:34767 ssh->tcp=3357696 tcp->ssh=3357696
+direct-tcpip opened total=9400 127.0.0.1:49503 -> 127.0.0.1:34767 chan=ChannelId(9401)
+[2026-08-18T10:55:38.055Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=9400 dest=127.0.0.1:34767 ssh->tcp=3561472 tcp->ssh=3561472
+direct-tcpip opened total=9600 127.0.0.1:46713 -> 127.0.0.1:34767 chan=ChannelId(9601)
+direct-tcpip closed total=9600 dest=127.0.0.1:34767 ssh->tcp=728064 tcp->ssh=728064
+direct-tcpip opened total=9800 127.0.0.1:56773 -> 127.0.0.1:34767 chan=ChannelId(9801)
+[2026-08-18T10:56:59.054Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=9800 dest=127.0.0.1:34767 ssh->tcp=1985536 tcp->ssh=1985536
+direct-tcpip opened total=10000 127.0.0.1:52587 -> 127.0.0.1:34767 chan=ChannelId(10001)
+direct-tcpip closed total=10000 dest=127.0.0.1:34767 ssh->tcp=2790400 tcp->ssh=2790400
+direct-tcpip opened total=10200 127.0.0.1:60921 -> 127.0.0.1:34767 chan=ChannelId(10201)
+direct-tcpip closed total=10200 dest=127.0.0.1:34767 ssh->tcp=3360768 tcp->ssh=3360768
+[2026-08-18T10:58:20.705Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=10400 127.0.0.1:34085 -> 127.0.0.1:34767 chan=ChannelId(10401)
+direct-tcpip closed total=10400 dest=127.0.0.1:34767 ssh->tcp=3107840 tcp->ssh=3107840
+direct-tcpip opened total=10600 127.0.0.1:37097 -> 127.0.0.1:34767 chan=ChannelId(10601)
+direct-tcpip closed total=10600 dest=127.0.0.1:34767 ssh->tcp=2688000 tcp->ssh=2688000
+direct-tcpip opened total=10800 127.0.0.1:58439 -> 127.0.0.1:34767 chan=ChannelId(10801)
+[2026-08-18T10:59:41.598Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=10800 dest=127.0.0.1:34767 ssh->tcp=3027968 tcp->ssh=3027968
+direct-tcpip opened total=11000 127.0.0.1:45227 -> 127.0.0.1:34767 chan=ChannelId(11001)
+direct-tcpip closed total=11000 dest=127.0.0.1:34767 ssh->tcp=3576832 tcp->ssh=3576832
+direct-tcpip opened total=11200 127.0.0.1:58057 -> 127.0.0.1:34767 chan=ChannelId(11201)
+[2026-08-18T11:01:03.122Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=11200 dest=127.0.0.1:34767 ssh->tcp=1046528 tcp->ssh=1046528
+direct-tcpip opened total=11400 127.0.0.1:40691 -> 127.0.0.1:34767 chan=ChannelId(11401)
+direct-tcpip closed total=11400 dest=127.0.0.1:34767 ssh->tcp=2380800 tcp->ssh=2380800
+direct-tcpip opened total=11600 127.0.0.1:58961 -> 127.0.0.1:34767 chan=ChannelId(11601)
+direct-tcpip closed total=11600 dest=127.0.0.1:34767 ssh->tcp=728064 tcp->ssh=728064
+[2026-08-18T11:02:24.651Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=11800 127.0.0.1:59799 -> 127.0.0.1:34767 chan=ChannelId(11801)
+direct-tcpip closed total=11800 dest=127.0.0.1:34767 ssh->tcp=3863552 tcp->ssh=3863552
+direct-tcpip opened total=12000 127.0.0.1:55531 -> 127.0.0.1:34767 chan=ChannelId(12001)
+direct-tcpip closed total=12000 dest=127.0.0.1:34767 ssh->tcp=3039232 tcp->ssh=3039232
+[2026-08-18T11:03:45.921Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=12200 127.0.0.1:42223 -> 127.0.0.1:34767 chan=ChannelId(12201)
+direct-tcpip closed total=12200 dest=127.0.0.1:34767 ssh->tcp=1695744 tcp->ssh=1695744
+direct-tcpip opened total=12400 127.0.0.1:57743 -> 127.0.0.1:34767 chan=ChannelId(12401)
+direct-tcpip closed total=12400 dest=127.0.0.1:34767 ssh->tcp=1984512 tcp->ssh=1984512
+direct-tcpip opened total=12600 127.0.0.1:46749 -> 127.0.0.1:34767 chan=ChannelId(12601)
+[2026-08-18T11:05:07.313Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=12600 dest=127.0.0.1:34767 ssh->tcp=2185216 tcp->ssh=2185216
+direct-tcpip opened total=12800 127.0.0.1:50513 -> 127.0.0.1:34767 chan=ChannelId(12801)
+direct-tcpip closed total=12800 dest=127.0.0.1:34767 ssh->tcp=1380352 tcp->ssh=1380352
+direct-tcpip opened total=13000 127.0.0.1:41699 -> 127.0.0.1:34767 chan=ChannelId(13001)
+direct-tcpip closed total=13000 dest=127.0.0.1:34767 ssh->tcp=2716672 tcp->ssh=2716672
+[2026-08-18T11:06:28.709Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=13200 127.0.0.1:46119 -> 127.0.0.1:34767 chan=ChannelId(13201)
+direct-tcpip closed total=13200 dest=127.0.0.1:34767 ssh->tcp=2834432 tcp->ssh=2834432
+direct-tcpip opened total=13400 127.0.0.1:33927 -> 127.0.0.1:34767 chan=ChannelId(13401)
+direct-tcpip closed total=13400 dest=127.0.0.1:34767 ssh->tcp=1000448 tcp->ssh=1000448
+[2026-08-18T11:07:50.564Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=13600 127.0.0.1:50319 -> 127.0.0.1:34767 chan=ChannelId(13601)
+direct-tcpip closed total=13600 dest=127.0.0.1:34767 ssh->tcp=1746944 tcp->ssh=1746944
+direct-tcpip opened total=13800 127.0.0.1:55575 -> 127.0.0.1:34767 chan=ChannelId(13801)
+direct-tcpip closed total=13800 dest=127.0.0.1:34767 ssh->tcp=1329152 tcp->ssh=1329152
+direct-tcpip opened total=14000 127.0.0.1:36197 -> 127.0.0.1:34767 chan=ChannelId(14001)
+[2026-08-18T11:09:11.760Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=14000 dest=127.0.0.1:34767 ssh->tcp=3844096 tcp->ssh=3844096
+direct-tcpip opened total=14200 127.0.0.1:57177 -> 127.0.0.1:34767 chan=ChannelId(14201)
+direct-tcpip closed total=14200 dest=127.0.0.1:34767 ssh->tcp=2191360 tcp->ssh=2191360
+direct-tcpip opened total=14400 127.0.0.1:58497 -> 127.0.0.1:34767 chan=ChannelId(14401)
+direct-tcpip closed total=14400 dest=127.0.0.1:34767 ssh->tcp=3815424 tcp->ssh=3815424
+[2026-08-18T11:10:32.865Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=14600 127.0.0.1:52395 -> 127.0.0.1:34767 chan=ChannelId(14601)
+direct-tcpip closed total=14600 dest=127.0.0.1:34767 ssh->tcp=2750464 tcp->ssh=2750464
+direct-tcpip opened total=14800 127.0.0.1:47477 -> 127.0.0.1:34767 chan=ChannelId(14801)
+direct-tcpip closed total=14800 dest=127.0.0.1:34767 ssh->tcp=1059840 tcp->ssh=1059840
+[2026-08-18T11:11:54.124Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=15000 127.0.0.1:37187 -> 127.0.0.1:34767 chan=ChannelId(15001)
+direct-tcpip closed total=15000 dest=127.0.0.1:34767 ssh->tcp=3735552 tcp->ssh=3735552
+direct-tcpip opened total=15200 127.0.0.1:54965 -> 127.0.0.1:34767 chan=ChannelId(15201)
+direct-tcpip closed total=15200 dest=127.0.0.1:34767 ssh->tcp=3019776 tcp->ssh=3019776
+direct-tcpip opened total=15400 127.0.0.1:46189 -> 127.0.0.1:34767 chan=ChannelId(15401)
+[2026-08-18T11:13:15.173Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=15400 dest=127.0.0.1:34767 ssh->tcp=3074048 tcp->ssh=3074048
+direct-tcpip opened total=15600 127.0.0.1:60499 -> 127.0.0.1:34767 chan=ChannelId(15601)
+direct-tcpip closed total=15600 dest=127.0.0.1:34767 ssh->tcp=3460096 tcp->ssh=3460096
+direct-tcpip opened total=15800 127.0.0.1:47367 -> 127.0.0.1:34767 chan=ChannelId(15801)
+[2026-08-18T11:14:36.575Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=15800 dest=127.0.0.1:34767 ssh->tcp=1598464 tcp->ssh=1598464
+direct-tcpip opened total=16000 127.0.0.1:58563 -> 127.0.0.1:34767 chan=ChannelId(16001)
+direct-tcpip closed total=16000 dest=127.0.0.1:34767 ssh->tcp=3869696 tcp->ssh=3869696
+direct-tcpip opened total=16200 127.0.0.1:52979 -> 127.0.0.1:34767 chan=ChannelId(16201)
+direct-tcpip closed total=16200 dest=127.0.0.1:34767 ssh->tcp=3390464 tcp->ssh=3390464
+[2026-08-18T11:15:57.866Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=16400 127.0.0.1:42991 -> 127.0.0.1:34767 chan=ChannelId(16401)
+direct-tcpip closed total=16400 dest=127.0.0.1:34767 ssh->tcp=3454976 tcp->ssh=3454976
+direct-tcpip opened total=16600 127.0.0.1:51253 -> 127.0.0.1:34767 chan=ChannelId(16601)
+direct-tcpip closed total=16600 dest=127.0.0.1:34767 ssh->tcp=2081792 tcp->ssh=2081792
+direct-tcpip opened total=16800 127.0.0.1:39811 -> 127.0.0.1:34767 chan=ChannelId(16801)
+[2026-08-18T11:17:19.331Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=16800 dest=127.0.0.1:34767 ssh->tcp=2713600 tcp->ssh=2713600
+direct-tcpip opened total=17000 127.0.0.1:41453 -> 127.0.0.1:34767 chan=ChannelId(17001)
+direct-tcpip closed total=17000 dest=127.0.0.1:34767 ssh->tcp=3118080 tcp->ssh=3118080
+direct-tcpip opened total=17200 127.0.0.1:52297 -> 127.0.0.1:34767 chan=ChannelId(17201)
+[2026-08-18T11:18:40.960Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=17200 dest=127.0.0.1:34767 ssh->tcp=2523136 tcp->ssh=2523136
+direct-tcpip opened total=17400 127.0.0.1:32985 -> 127.0.0.1:34767 chan=ChannelId(17401)
+direct-tcpip closed total=17400 dest=127.0.0.1:34767 ssh->tcp=2846720 tcp->ssh=2846720
+direct-tcpip opened total=17600 127.0.0.1:51067 -> 127.0.0.1:34767 chan=ChannelId(17601)
+direct-tcpip closed total=17600 dest=127.0.0.1:34767 ssh->tcp=1989632 tcp->ssh=1989632
+[2026-08-18T11:20:03.855Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=17800 127.0.0.1:52453 -> 127.0.0.1:34767 chan=ChannelId(17801)
+direct-tcpip closed total=17800 dest=127.0.0.1:34767 ssh->tcp=1099776 tcp->ssh=1099776
+direct-tcpip opened total=18000 127.0.0.1:34349 -> 127.0.0.1:34767 chan=ChannelId(18001)
+direct-tcpip closed total=18000 dest=127.0.0.1:34767 ssh->tcp=2522112 tcp->ssh=2522112
+direct-tcpip opened total=18200 127.0.0.1:34481 -> 127.0.0.1:34767 chan=ChannelId(18201)
+[2026-08-18T11:21:32.546Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=18200 dest=127.0.0.1:34767 ssh->tcp=1812480 tcp->ssh=1812480
+direct-tcpip opened total=18400 127.0.0.1:35535 -> 127.0.0.1:34767 chan=ChannelId(18401)
+direct-tcpip closed total=18400 dest=127.0.0.1:34767 ssh->tcp=2387968 tcp->ssh=2387968
+direct-tcpip opened total=18600 127.0.0.1:36027 -> 127.0.0.1:34767 chan=ChannelId(18601)
+direct-tcpip closed total=18600 dest=127.0.0.1:34767 ssh->tcp=1271808 tcp->ssh=1271808
+[2026-08-18T11:22:59.734Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=18800 127.0.0.1:59349 -> 127.0.0.1:34767 chan=ChannelId(18801)
+direct-tcpip closed total=18800 dest=127.0.0.1:34767 ssh->tcp=1253376 tcp->ssh=1253376
+direct-tcpip opened total=19000 127.0.0.1:60321 -> 127.0.0.1:34767 chan=ChannelId(19001)
+direct-tcpip closed total=19000 dest=127.0.0.1:34767 ssh->tcp=3424256 tcp->ssh=3424256
+direct-tcpip opened total=19200 127.0.0.1:39927 -> 127.0.0.1:34767 chan=ChannelId(19201)
+[2026-08-18T11:24:21.260Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=19200 dest=127.0.0.1:34767 ssh->tcp=2464768 tcp->ssh=2464768
+direct-tcpip opened total=19400 127.0.0.1:43889 -> 127.0.0.1:34767 chan=ChannelId(19401)
+direct-tcpip closed total=19400 dest=127.0.0.1:34767 ssh->tcp=3162112 tcp->ssh=3162112
+direct-tcpip opened total=19600 127.0.0.1:44203 -> 127.0.0.1:34767 chan=ChannelId(19601)
+direct-tcpip closed total=19600 dest=127.0.0.1:34767 ssh->tcp=2259968 tcp->ssh=2259968
+[2026-08-18T11:25:41.955Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=19800 127.0.0.1:32795 -> 127.0.0.1:34767 chan=ChannelId(19801)
+direct-tcpip closed total=19800 dest=127.0.0.1:34767 ssh->tcp=2428928 tcp->ssh=2428928
+direct-tcpip opened total=20000 127.0.0.1:33195 -> 127.0.0.1:34767 chan=ChannelId(20001)
+direct-tcpip closed total=20000 dest=127.0.0.1:34767 ssh->tcp=867328 tcp->ssh=867328
+[2026-08-18T11:27:01.719Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=20200 127.0.0.1:35195 -> 127.0.0.1:34767 chan=ChannelId(20201)
+direct-tcpip closed total=20200 dest=127.0.0.1:34767 ssh->tcp=3941376 tcp->ssh=3941376
+direct-tcpip opened total=20400 127.0.0.1:50939 -> 127.0.0.1:34767 chan=ChannelId(20401)
+direct-tcpip closed total=20400 dest=127.0.0.1:34767 ssh->tcp=1449984 tcp->ssh=1449984
+direct-tcpip opened total=20600 127.0.0.1:35101 -> 127.0.0.1:34767 chan=ChannelId(20601)
+[2026-08-18T11:28:22.309Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=20600 dest=127.0.0.1:34767 ssh->tcp=3383296 tcp->ssh=3383296
+direct-tcpip opened total=20800 127.0.0.1:57769 -> 127.0.0.1:34767 chan=ChannelId(20801)
+direct-tcpip closed total=20800 dest=127.0.0.1:34767 ssh->tcp=2843648 tcp->ssh=2843648
+direct-tcpip opened total=21000 127.0.0.1:53695 -> 127.0.0.1:34767 chan=ChannelId(21001)
+[2026-08-18T11:29:43.526Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=21000 dest=127.0.0.1:34767 ssh->tcp=1246208 tcp->ssh=1246208
+direct-tcpip opened total=21200 127.0.0.1:45847 -> 127.0.0.1:34767 chan=ChannelId(21201)
+direct-tcpip closed total=21200 dest=127.0.0.1:34767 ssh->tcp=2365440 tcp->ssh=2365440
+direct-tcpip opened total=21400 127.0.0.1:58891 -> 127.0.0.1:34767 chan=ChannelId(21401)
+direct-tcpip closed total=21400 dest=127.0.0.1:34767 ssh->tcp=2951168 tcp->ssh=2951168
+[2026-08-18T11:31:04.445Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=21600 127.0.0.1:42313 -> 127.0.0.1:34767 chan=ChannelId(21601)
+direct-tcpip closed total=21600 dest=127.0.0.1:34767 ssh->tcp=707584 tcp->ssh=707584
+direct-tcpip opened total=21800 127.0.0.1:55295 -> 127.0.0.1:34767 chan=ChannelId(21801)
+direct-tcpip closed total=21800 dest=127.0.0.1:34767 ssh->tcp=2160640 tcp->ssh=2160640
+direct-tcpip opened total=22000 127.0.0.1:40559 -> 127.0.0.1:34767 chan=ChannelId(22001)
+[2026-08-18T11:32:24.792Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=22000 dest=127.0.0.1:34767 ssh->tcp=1468416 tcp->ssh=1468416
+direct-tcpip opened total=22200 127.0.0.1:46333 -> 127.0.0.1:34767 chan=ChannelId(22201)
+direct-tcpip closed total=22200 dest=127.0.0.1:34767 ssh->tcp=2202624 tcp->ssh=2202624
+direct-tcpip opened total=22400 127.0.0.1:40301 -> 127.0.0.1:34767 chan=ChannelId(22401)
+[2026-08-18T11:33:45.687Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=22400 dest=127.0.0.1:34767 ssh->tcp=744448 tcp->ssh=744448
+direct-tcpip opened total=22600 127.0.0.1:53609 -> 127.0.0.1:34767 chan=ChannelId(22601)
+direct-tcpip closed total=22600 dest=127.0.0.1:34767 ssh->tcp=800768 tcp->ssh=800768
+direct-tcpip opened total=22800 127.0.0.1:33377 -> 127.0.0.1:34767 chan=ChannelId(22801)
+direct-tcpip closed total=22800 dest=127.0.0.1:34767 ssh->tcp=1769472 tcp->ssh=1769472
+[2026-08-18T11:35:06.635Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=23000 127.0.0.1:51649 -> 127.0.0.1:34767 chan=ChannelId(23001)
+direct-tcpip closed total=23000 dest=127.0.0.1:34767 ssh->tcp=1799168 tcp->ssh=1799168
+direct-tcpip opened total=23200 127.0.0.1:53761 -> 127.0.0.1:34767 chan=ChannelId(23201)
+direct-tcpip closed total=23200 dest=127.0.0.1:34767 ssh->tcp=3446784 tcp->ssh=3446784
+direct-tcpip opened total=23400 127.0.0.1:35737 -> 127.0.0.1:34767 chan=ChannelId(23401)
+[2026-08-18T11:36:27.906Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=23400 dest=127.0.0.1:34767 ssh->tcp=2313216 tcp->ssh=2313216
+direct-tcpip opened total=23600 127.0.0.1:59567 -> 127.0.0.1:34767 chan=ChannelId(23601)
+direct-tcpip closed total=23600 dest=127.0.0.1:34767 ssh->tcp=1793024 tcp->ssh=1793024
+direct-tcpip opened total=23800 127.0.0.1:42709 -> 127.0.0.1:34767 chan=ChannelId(23801)
+[2026-08-18T11:37:48.929Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=23800 dest=127.0.0.1:34767 ssh->tcp=3265536 tcp->ssh=3265536
+direct-tcpip opened total=24000 127.0.0.1:59761 -> 127.0.0.1:34767 chan=ChannelId(24001)
+direct-tcpip closed total=24000 dest=127.0.0.1:34767 ssh->tcp=2067456 tcp->ssh=2067456
+direct-tcpip opened total=24200 127.0.0.1:47945 -> 127.0.0.1:34767 chan=ChannelId(24201)
+direct-tcpip closed total=24200 dest=127.0.0.1:34767 ssh->tcp=1841152 tcp->ssh=1841152
+[2026-08-18T11:39:08.934Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=24400 127.0.0.1:50631 -> 127.0.0.1:34767 chan=ChannelId(24401)
+direct-tcpip closed total=24400 dest=127.0.0.1:34767 ssh->tcp=3231744 tcp->ssh=3231744
+direct-tcpip opened total=24600 127.0.0.1:56789 -> 127.0.0.1:34767 chan=ChannelId(24601)
+direct-tcpip closed total=24600 dest=127.0.0.1:34767 ssh->tcp=1416192 tcp->ssh=1416192
+direct-tcpip opened total=24800 127.0.0.1:48475 -> 127.0.0.1:34767 chan=ChannelId(24801)
+[2026-08-18T11:40:29.613Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=24800 dest=127.0.0.1:34767 ssh->tcp=2191360 tcp->ssh=2191360
+direct-tcpip opened total=25000 127.0.0.1:57451 -> 127.0.0.1:34767 chan=ChannelId(25001)
+direct-tcpip closed total=25000 dest=127.0.0.1:34767 ssh->tcp=3092480 tcp->ssh=3092480
+direct-tcpip opened total=25200 127.0.0.1:47301 -> 127.0.0.1:34767 chan=ChannelId(25201)
+[2026-08-18T11:41:50.081Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=25200 dest=127.0.0.1:34767 ssh->tcp=2172928 tcp->ssh=2172928
+direct-tcpip opened total=25400 127.0.0.1:35187 -> 127.0.0.1:34767 chan=ChannelId(25401)
+direct-tcpip closed total=25400 dest=127.0.0.1:34767 ssh->tcp=3443712 tcp->ssh=3443712
+direct-tcpip opened total=25600 127.0.0.1:45087 -> 127.0.0.1:34767 chan=ChannelId(25601)
+direct-tcpip closed total=25600 dest=127.0.0.1:34767 ssh->tcp=1087488 tcp->ssh=1087488
+[2026-08-18T11:43:11.027Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=25800 127.0.0.1:54451 -> 127.0.0.1:34767 chan=ChannelId(25801)
+direct-tcpip closed total=25800 dest=127.0.0.1:34767 ssh->tcp=1282048 tcp->ssh=1282048
+direct-tcpip opened total=26000 127.0.0.1:54731 -> 127.0.0.1:34767 chan=ChannelId(26001)
+direct-tcpip closed total=26000 dest=127.0.0.1:34767 ssh->tcp=1118208 tcp->ssh=1118208
+[2026-08-18T11:44:32.063Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=26200 127.0.0.1:56637 -> 127.0.0.1:34767 chan=ChannelId(26201)
+direct-tcpip closed total=26200 dest=127.0.0.1:34767 ssh->tcp=683008 tcp->ssh=683008
+direct-tcpip opened total=26400 127.0.0.1:38645 -> 127.0.0.1:34767 chan=ChannelId(26401)
+direct-tcpip closed total=26400 dest=127.0.0.1:34767 ssh->tcp=2594816 tcp->ssh=2594816
+direct-tcpip opened total=26600 127.0.0.1:33425 -> 127.0.0.1:34767 chan=ChannelId(26601)
+[2026-08-18T11:45:52.886Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=26600 dest=127.0.0.1:34767 ssh->tcp=2297856 tcp->ssh=2297856
+direct-tcpip opened total=26800 127.0.0.1:33265 -> 127.0.0.1:34767 chan=ChannelId(26801)
+direct-tcpip closed total=26800 dest=127.0.0.1:34767 ssh->tcp=2664448 tcp->ssh=2664448
+direct-tcpip opened total=27000 127.0.0.1:60287 -> 127.0.0.1:34767 chan=ChannelId(27001)
+direct-tcpip closed total=27000 dest=127.0.0.1:34767 ssh->tcp=759808 tcp->ssh=759808
+[2026-08-18T11:47:14.590Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=27200 127.0.0.1:53079 -> 127.0.0.1:34767 chan=ChannelId(27201)
+direct-tcpip closed total=27200 dest=127.0.0.1:34767 ssh->tcp=1486848 tcp->ssh=1486848
+direct-tcpip opened total=27400 127.0.0.1:56633 -> 127.0.0.1:34767 chan=ChannelId(27401)
+direct-tcpip closed total=27400 dest=127.0.0.1:34767 ssh->tcp=2552832 tcp->ssh=2552832
+direct-tcpip opened total=27600 127.0.0.1:52681 -> 127.0.0.1:34767 chan=ChannelId(27601)
+[2026-08-18T11:48:35.907Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=27600 dest=127.0.0.1:34767 ssh->tcp=3828736 tcp->ssh=3828736
+direct-tcpip opened total=27800 127.0.0.1:45705 -> 127.0.0.1:34767 chan=ChannelId(27801)
+direct-tcpip closed total=27800 dest=127.0.0.1:34767 ssh->tcp=2616320 tcp->ssh=2616320
+direct-tcpip opened total=28000 127.0.0.1:43785 -> 127.0.0.1:34767 chan=ChannelId(28001)
+[2026-08-18T11:49:56.865Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=28000 dest=127.0.0.1:34767 ssh->tcp=838656 tcp->ssh=838656
+direct-tcpip opened total=28200 127.0.0.1:39069 -> 127.0.0.1:34767 chan=ChannelId(28201)
+direct-tcpip closed total=28200 dest=127.0.0.1:34767 ssh->tcp=1192960 tcp->ssh=1192960
+direct-tcpip opened total=28400 127.0.0.1:45297 -> 127.0.0.1:34767 chan=ChannelId(28401)
+direct-tcpip closed total=28400 dest=127.0.0.1:34767 ssh->tcp=3275776 tcp->ssh=3275776
+[2026-08-18T11:51:17.245Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=28600 127.0.0.1:46545 -> 127.0.0.1:34767 chan=ChannelId(28601)
+direct-tcpip closed total=28600 dest=127.0.0.1:34767 ssh->tcp=3276800 tcp->ssh=3276800
+direct-tcpip opened total=28800 127.0.0.1:60821 -> 127.0.0.1:34767 chan=ChannelId(28801)
+direct-tcpip closed total=28800 dest=127.0.0.1:34767 ssh->tcp=2713600 tcp->ssh=2713600
+[2026-08-18T11:52:38.101Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=29000 127.0.0.1:43047 -> 127.0.0.1:34767 chan=ChannelId(29001)
+direct-tcpip closed total=29000 dest=127.0.0.1:34767 ssh->tcp=2069504 tcp->ssh=2069504
+direct-tcpip opened total=29200 127.0.0.1:53323 -> 127.0.0.1:34767 chan=ChannelId(29201)
+direct-tcpip closed total=29200 dest=127.0.0.1:34767 ssh->tcp=2902016 tcp->ssh=2902016
+direct-tcpip opened total=29400 127.0.0.1:54219 -> 127.0.0.1:34767 chan=ChannelId(29401)
+[2026-08-18T11:53:59.053Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=29400 dest=127.0.0.1:34767 ssh->tcp=2585600 tcp->ssh=2585600
+direct-tcpip opened total=29600 127.0.0.1:48301 -> 127.0.0.1:34767 chan=ChannelId(29601)
+direct-tcpip closed total=29600 dest=127.0.0.1:34767 ssh->tcp=2151424 tcp->ssh=2151424
+direct-tcpip opened total=29800 127.0.0.1:50015 -> 127.0.0.1:34767 chan=ChannelId(29801)
+direct-tcpip closed total=29800 dest=127.0.0.1:34767 ssh->tcp=2138112 tcp->ssh=2138112
+[2026-08-18T11:55:19.659Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=30000 127.0.0.1:40909 -> 127.0.0.1:34767 chan=ChannelId(30001)
+direct-tcpip closed total=30000 dest=127.0.0.1:34767 ssh->tcp=3693568 tcp->ssh=3693568
+direct-tcpip opened total=30200 127.0.0.1:51999 -> 127.0.0.1:34767 chan=ChannelId(30201)
+direct-tcpip closed total=30200 dest=127.0.0.1:34767 ssh->tcp=2461696 tcp->ssh=2461696
+[2026-08-18T11:56:41.126Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=30400 127.0.0.1:60101 -> 127.0.0.1:34767 chan=ChannelId(30401)
+direct-tcpip closed total=30400 dest=127.0.0.1:34767 ssh->tcp=2684928 tcp->ssh=2684928
+direct-tcpip opened total=30600 127.0.0.1:44943 -> 127.0.0.1:34767 chan=ChannelId(30601)
+direct-tcpip closed total=30600 dest=127.0.0.1:34767 ssh->tcp=3768320 tcp->ssh=3768320
+direct-tcpip opened total=30800 127.0.0.1:45945 -> 127.0.0.1:34767 chan=ChannelId(30801)
+[2026-08-18T11:58:02.593Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=30800 dest=127.0.0.1:34767 ssh->tcp=2439168 tcp->ssh=2439168
+direct-tcpip opened total=31000 127.0.0.1:54153 -> 127.0.0.1:34767 chan=ChannelId(31001)
+direct-tcpip closed total=31000 dest=127.0.0.1:34767 ssh->tcp=3859456 tcp->ssh=3859456
+direct-tcpip opened total=31200 127.0.0.1:42079 -> 127.0.0.1:34767 chan=ChannelId(31201)
+direct-tcpip closed total=31200 dest=127.0.0.1:34767 ssh->tcp=3336192 tcp->ssh=3336192
+[2026-08-18T11:59:23.547Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=31400 127.0.0.1:43083 -> 127.0.0.1:34767 chan=ChannelId(31401)
+direct-tcpip closed total=31400 dest=127.0.0.1:34767 ssh->tcp=3258368 tcp->ssh=3258368
+direct-tcpip opened total=31600 127.0.0.1:59577 -> 127.0.0.1:34767 chan=ChannelId(31601)
+direct-tcpip closed total=31600 dest=127.0.0.1:34767 ssh->tcp=2297856 tcp->ssh=2297856
+[2026-08-18T12:00:44.746Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=31800 127.0.0.1:51861 -> 127.0.0.1:34767 chan=ChannelId(31801)
+direct-tcpip closed total=31800 dest=127.0.0.1:34767 ssh->tcp=2775040 tcp->ssh=2775040
+direct-tcpip opened total=32000 127.0.0.1:59363 -> 127.0.0.1:34767 chan=ChannelId(32001)
+direct-tcpip closed total=32000 dest=127.0.0.1:34767 ssh->tcp=1655808 tcp->ssh=1655808
+direct-tcpip opened total=32200 127.0.0.1:43807 -> 127.0.0.1:34767 chan=ChannelId(32201)
+[2026-08-18T12:02:05.825Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=32200 dest=127.0.0.1:34767 ssh->tcp=2222080 tcp->ssh=2222080
+direct-tcpip opened total=32400 127.0.0.1:49331 -> 127.0.0.1:34767 chan=ChannelId(32401)
+direct-tcpip closed total=32400 dest=127.0.0.1:34767 ssh->tcp=1014784 tcp->ssh=1014784
+direct-tcpip opened total=32600 127.0.0.1:60369 -> 127.0.0.1:34767 chan=ChannelId(32601)
+[2026-08-18T12:03:26.929Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=32600 dest=127.0.0.1:34767 ssh->tcp=3423232 tcp->ssh=3423232
+direct-tcpip opened total=32800 127.0.0.1:54703 -> 127.0.0.1:34767 chan=ChannelId(32801)
+direct-tcpip closed total=32800 dest=127.0.0.1:34767 ssh->tcp=2289664 tcp->ssh=2289664
+direct-tcpip opened total=33000 127.0.0.1:56959 -> 127.0.0.1:34767 chan=ChannelId(33001)
+direct-tcpip closed total=33000 dest=127.0.0.1:34767 ssh->tcp=3171328 tcp->ssh=3171328
+[2026-08-18T12:04:48.046Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=33200 127.0.0.1:47213 -> 127.0.0.1:34767 chan=ChannelId(33201)
+direct-tcpip closed total=33200 dest=127.0.0.1:34767 ssh->tcp=1568768 tcp->ssh=1568768
+direct-tcpip opened total=33400 127.0.0.1:55027 -> 127.0.0.1:34767 chan=ChannelId(33401)
+direct-tcpip closed total=33400 dest=127.0.0.1:34767 ssh->tcp=2427904 tcp->ssh=2427904
+direct-tcpip opened total=33600 127.0.0.1:50987 -> 127.0.0.1:34767 chan=ChannelId(33601)
+[2026-08-18T12:06:09.231Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=33600 dest=127.0.0.1:34767 ssh->tcp=2512896 tcp->ssh=2512896
+direct-tcpip opened total=33800 127.0.0.1:40341 -> 127.0.0.1:34767 chan=ChannelId(33801)
+direct-tcpip closed total=33800 dest=127.0.0.1:34767 ssh->tcp=3352576 tcp->ssh=3352576
+direct-tcpip opened total=34000 127.0.0.1:34631 -> 127.0.0.1:34767 chan=ChannelId(34001)
+[2026-08-18T12:07:30.162Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=34000 dest=127.0.0.1:34767 ssh->tcp=923648 tcp->ssh=923648
+direct-tcpip opened total=34200 127.0.0.1:54493 -> 127.0.0.1:34767 chan=ChannelId(34201)
+direct-tcpip closed total=34200 dest=127.0.0.1:34767 ssh->tcp=1298432 tcp->ssh=1298432
+direct-tcpip opened total=34400 127.0.0.1:50959 -> 127.0.0.1:34767 chan=ChannelId(34401)
+direct-tcpip closed total=34400 dest=127.0.0.1:34767 ssh->tcp=1013760 tcp->ssh=1013760
+[2026-08-18T12:08:51.322Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=34600 127.0.0.1:53147 -> 127.0.0.1:34767 chan=ChannelId(34601)
+direct-tcpip closed total=34600 dest=127.0.0.1:34767 ssh->tcp=3349504 tcp->ssh=3349504
+direct-tcpip opened total=34800 127.0.0.1:42849 -> 127.0.0.1:34767 chan=ChannelId(34801)
+direct-tcpip closed total=34800 dest=127.0.0.1:34767 ssh->tcp=1858560 tcp->ssh=1858560
+direct-tcpip opened total=35000 127.0.0.1:57077 -> 127.0.0.1:34767 chan=ChannelId(35001)
+[2026-08-18T12:10:12.374Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=35000 dest=127.0.0.1:34767 ssh->tcp=2523136 tcp->ssh=2523136
+direct-tcpip opened total=35200 127.0.0.1:44561 -> 127.0.0.1:34767 chan=ChannelId(35201)
+direct-tcpip closed total=35200 dest=127.0.0.1:34767 ssh->tcp=3577856 tcp->ssh=3577856
+direct-tcpip opened total=35400 127.0.0.1:54165 -> 127.0.0.1:34767 chan=ChannelId(35401)
+[2026-08-18T12:11:33.416Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=35400 dest=127.0.0.1:34767 ssh->tcp=2827264 tcp->ssh=2827264
+direct-tcpip opened total=35600 127.0.0.1:50763 -> 127.0.0.1:34767 chan=ChannelId(35601)
+direct-tcpip closed total=35600 dest=127.0.0.1:34767 ssh->tcp=3189760 tcp->ssh=3189760
+direct-tcpip opened total=35800 127.0.0.1:51539 -> 127.0.0.1:34767 chan=ChannelId(35801)
+direct-tcpip closed total=35800 dest=127.0.0.1:34767 ssh->tcp=831488 tcp->ssh=831488
+[2026-08-18T12:12:54.893Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=36000 127.0.0.1:41001 -> 127.0.0.1:34767 chan=ChannelId(36001)
+direct-tcpip closed total=36000 dest=127.0.0.1:34767 ssh->tcp=1120256 tcp->ssh=1120256
+direct-tcpip opened total=36200 127.0.0.1:51785 -> 127.0.0.1:34767 chan=ChannelId(36201)
+direct-tcpip closed total=36200 dest=127.0.0.1:34767 ssh->tcp=2066432 tcp->ssh=2066432
+direct-tcpip opened total=36400 127.0.0.1:48485 -> 127.0.0.1:34767 chan=ChannelId(36401)
+[2026-08-18T12:14:15.922Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=36400 dest=127.0.0.1:34767 ssh->tcp=3087360 tcp->ssh=3087360
+direct-tcpip opened total=36600 127.0.0.1:48997 -> 127.0.0.1:34767 chan=ChannelId(36601)
+direct-tcpip closed total=36600 dest=127.0.0.1:34767 ssh->tcp=2910208 tcp->ssh=2910208
+direct-tcpip opened total=36800 127.0.0.1:39687 -> 127.0.0.1:34767 chan=ChannelId(36801)
+[2026-08-18T12:15:36.374Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=36800 dest=127.0.0.1:34767 ssh->tcp=1453056 tcp->ssh=1453056
+direct-tcpip opened total=37000 127.0.0.1:36711 -> 127.0.0.1:34767 chan=ChannelId(37001)
+direct-tcpip closed total=37000 dest=127.0.0.1:34767 ssh->tcp=3644416 tcp->ssh=3644416
+direct-tcpip opened total=37200 127.0.0.1:52963 -> 127.0.0.1:34767 chan=ChannelId(37201)
+direct-tcpip closed total=37200 dest=127.0.0.1:34767 ssh->tcp=3692544 tcp->ssh=3692544
+[2026-08-18T12:16:57.748Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=37400 127.0.0.1:42053 -> 127.0.0.1:34767 chan=ChannelId(37401)
+direct-tcpip closed total=37400 dest=127.0.0.1:34767 ssh->tcp=868352 tcp->ssh=868352
+direct-tcpip opened total=37600 127.0.0.1:59809 -> 127.0.0.1:34767 chan=ChannelId(37601)
+direct-tcpip closed total=37600 dest=127.0.0.1:34767 ssh->tcp=2768896 tcp->ssh=2768896
+[2026-08-18T12:18:19.202Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=37800 127.0.0.1:40595 -> 127.0.0.1:34767 chan=ChannelId(37801)
+direct-tcpip closed total=37800 dest=127.0.0.1:34767 ssh->tcp=1739776 tcp->ssh=1739776
+direct-tcpip opened total=38000 127.0.0.1:41117 -> 127.0.0.1:34767 chan=ChannelId(38001)
+direct-tcpip closed total=38000 dest=127.0.0.1:34767 ssh->tcp=3211264 tcp->ssh=3211264
+direct-tcpip opened total=38200 127.0.0.1:51931 -> 127.0.0.1:34767 chan=ChannelId(38201)
+[2026-08-18T12:19:39.215Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=38200 dest=127.0.0.1:34767 ssh->tcp=2516992 tcp->ssh=2516992
+direct-tcpip opened total=38400 127.0.0.1:50359 -> 127.0.0.1:34767 chan=ChannelId(38401)
+direct-tcpip closed total=38400 dest=127.0.0.1:34767 ssh->tcp=1459200 tcp->ssh=1459200
+direct-tcpip opened total=38600 127.0.0.1:54171 -> 127.0.0.1:34767 chan=ChannelId(38601)
+direct-tcpip closed total=38600 dest=127.0.0.1:34767 ssh->tcp=1138688 tcp->ssh=1138688
+[2026-08-18T12:21:00.516Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=38800 127.0.0.1:57411 -> 127.0.0.1:34767 chan=ChannelId(38801)
+direct-tcpip closed total=38800 dest=127.0.0.1:34767 ssh->tcp=3074048 tcp->ssh=3074048
+direct-tcpip opened total=39000 127.0.0.1:60763 -> 127.0.0.1:34767 chan=ChannelId(39001)
+direct-tcpip closed total=39000 dest=127.0.0.1:34767 ssh->tcp=2927616 tcp->ssh=2927616
+[2026-08-18T12:22:21.734Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=39200 127.0.0.1:58461 -> 127.0.0.1:34767 chan=ChannelId(39201)
+direct-tcpip closed total=39200 dest=127.0.0.1:34767 ssh->tcp=3526656 tcp->ssh=3526656
+direct-tcpip opened total=39400 127.0.0.1:43771 -> 127.0.0.1:34767 chan=ChannelId(39401)
+direct-tcpip closed total=39400 dest=127.0.0.1:34767 ssh->tcp=1728512 tcp->ssh=1728512
+direct-tcpip opened total=39600 127.0.0.1:46697 -> 127.0.0.1:34767 chan=ChannelId(39601)
+[2026-08-18T12:23:42.809Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=39600 dest=127.0.0.1:34767 ssh->tcp=1589248 tcp->ssh=1589248
+direct-tcpip opened total=39800 127.0.0.1:43093 -> 127.0.0.1:34767 chan=ChannelId(39801)
+direct-tcpip closed total=39800 dest=127.0.0.1:34767 ssh->tcp=1596416 tcp->ssh=1596416
+direct-tcpip opened total=40000 127.0.0.1:42535 -> 127.0.0.1:34767 chan=ChannelId(40001)
+[2026-08-18T12:25:03.913Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=40000 dest=127.0.0.1:34767 ssh->tcp=1202176 tcp->ssh=1202176
+direct-tcpip opened total=40200 127.0.0.1:36153 -> 127.0.0.1:34767 chan=ChannelId(40201)
+direct-tcpip closed total=40200 dest=127.0.0.1:34767 ssh->tcp=2720768 tcp->ssh=2720768
+direct-tcpip opened total=40400 127.0.0.1:59539 -> 127.0.0.1:34767 chan=ChannelId(40401)
+direct-tcpip closed total=40400 dest=127.0.0.1:34767 ssh->tcp=2276352 tcp->ssh=2276352
+[2026-08-18T12:26:25.284Z INFO  russh::server] Client has initiated re-key
+direct-tcpip opened total=40600 127.0.0.1:40087 -> 127.0.0.1:34767 chan=ChannelId(40601)
+direct-tcpip closed total=40600 dest=127.0.0.1:34767 ssh->tcp=843776 tcp->ssh=843776
+direct-tcpip opened total=40800 127.0.0.1:46605 -> 127.0.0.1:34767 chan=ChannelId(40801)
+direct-tcpip closed total=40800 dest=127.0.0.1:34767 ssh->tcp=819200 tcp->ssh=819200
+direct-tcpip opened total=41000 127.0.0.1:46529 -> 127.0.0.1:34767 chan=ChannelId(41001)
+[2026-08-18T12:27:46.913Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed total=41000 dest=127.0.0.1:34767 ssh->tcp=2060288 tcp->ssh=2060288
+direct-tcpip opened total=41200 127.0.0.1:57281 -> 127.0.0.1:34767 chan=ChannelId(41201)
+direct-tcpip closed total=41200 dest=127.0.0.1:34767 ssh->tcp=1214464 tcp->ssh=1214464

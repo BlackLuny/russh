@@ -1,0 +1,20 @@
+inbound_tcp_proxy listening on 127.0.0.1:43447
+ssh client connected from Some(127.0.0.1:41622)
+ssh session error: Disconnected
+ssh client connected from Some(127.0.0.1:41626)
+auth_publickey user=soak -> accept
+direct-tcpip #1 127.0.0.1:53726 -> 127.0.0.1:46049 chan=ChannelId(2)
+direct-tcpip #2 127.0.0.1:53730 -> 127.0.0.1:46049 chan=ChannelId(3)
+direct-tcpip closed dest=127.0.0.1:46049 ssh->tcp=0 tcp->ssh=0
+[2026-08-18T08:21:17.609Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:32:06.526Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:42:50.684Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:53:34.451Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:04:10.767Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:14:57.220Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:25:36.412Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:36:21.641Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:46:55.515Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:57:39.018Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:08:22.294Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed dest=127.0.0.1:46049 ssh->tcp=12015370240 tcp->ssh=12015370240

@@ -1,0 +1,126 @@
+inbound_tcp_proxy listening on 127.0.0.1:40227
+ssh client connected from Some(127.0.0.1:46134)
+ssh session error: Disconnected
+ssh client connected from Some(127.0.0.1:46148)
+auth_publickey user=soak -> accept
+direct-tcpip #1 127.0.0.1:41480 -> 127.0.0.1:52959 chan=ChannelId(2)
+direct-tcpip #2 127.0.0.1:49048 -> 127.0.0.1:52959 chan=ChannelId(3)
+direct-tcpip #3 127.0.0.1:50058 -> 127.0.0.1:52959 chan=ChannelId(4)
+direct-tcpip #4 127.0.0.1:46348 -> 127.0.0.1:52959 chan=ChannelId(5)
+direct-tcpip #5 127.0.0.1:46004 -> 127.0.0.1:52959 chan=ChannelId(6)
+direct-tcpip #6 127.0.0.1:58702 -> 127.0.0.1:52959 chan=ChannelId(7)
+direct-tcpip #7 127.0.0.1:37540 -> 127.0.0.1:52959 chan=ChannelId(8)
+direct-tcpip #8 127.0.0.1:50866 -> 127.0.0.1:52959 chan=ChannelId(9)
+direct-tcpip #9 127.0.0.1:41482 -> 127.0.0.1:52959 chan=ChannelId(10)
+direct-tcpip #10 127.0.0.1:49058 -> 127.0.0.1:52959 chan=ChannelId(11)
+direct-tcpip #11 127.0.0.1:50070 -> 127.0.0.1:52959 chan=ChannelId(12)
+direct-tcpip #12 127.0.0.1:46360 -> 127.0.0.1:52959 chan=ChannelId(13)
+direct-tcpip #13 127.0.0.1:46010 -> 127.0.0.1:52959 chan=ChannelId(14)
+direct-tcpip #14 127.0.0.1:58704 -> 127.0.0.1:52959 chan=ChannelId(15)
+direct-tcpip #15 127.0.0.1:37554 -> 127.0.0.1:52959 chan=ChannelId(16)
+direct-tcpip #16 127.0.0.1:50870 -> 127.0.0.1:52959 chan=ChannelId(17)
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=0 tcp->ssh=0
+[2026-08-18T08:11:55.372Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:13:14.561Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:14:34.754Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:15:53.362Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:17:13.240Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:18:34.896Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:19:56.376Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:21:17.114Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:22:39.439Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:24:01.185Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:25:21.318Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:26:41.751Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:28:02.405Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:29:22.693Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:30:44.056Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:32:06.010Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:33:27.035Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:34:46.150Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:36:07.616Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:37:27.420Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:38:46.782Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:40:06.851Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:41:27.901Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:42:50.221Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:44:09.818Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:45:29.438Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:46:51.457Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:48:12.403Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:49:33.264Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:50:55.365Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:52:14.830Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:53:33.987Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:54:53.653Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:56:12.848Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:57:31.785Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T08:58:51.885Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:00:11.385Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:01:30.521Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:02:49.691Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:04:10.296Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:05:33.339Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:06:53.776Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:08:16.389Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:09:35.721Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:10:56.925Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:12:17.648Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:13:37.142Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:14:56.755Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:16:16.130Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:17:35.373Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:18:55.094Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:20:14.311Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:21:33.428Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:22:54.031Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:24:16.815Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:25:35.946Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:26:56.169Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:28:15.994Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:29:37.298Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:30:56.568Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:32:19.150Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:33:39.283Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:35:00.205Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:36:21.168Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:37:40.949Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:39:00.174Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:40:19.488Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:41:38.785Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:42:57.712Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:44:16.758Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:45:35.955Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:46:55.054Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:48:14.113Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:49:33.344Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:50:52.376Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:52:11.862Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:53:32.514Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:54:57.165Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:56:18.754Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:57:38.552Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T09:59:00.758Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:00:20.125Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:01:39.155Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:02:57.994Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:04:16.888Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:05:36.689Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:07:02.130Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:08:21.832Z INFO  russh::server] Client has initiated re-key
+[2026-08-18T10:09:41.266Z INFO  russh::server] Client has initiated re-key
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015304704 tcp->ssh=12015304704
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015304704 tcp->ssh=12015304704
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015239168 tcp->ssh=12015239168
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015304704 tcp->ssh=12015304704
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015239168 tcp->ssh=12015239168
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015304704 tcp->ssh=12015304704
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015239168 tcp->ssh=12015239168
+direct-tcpip closed dest=127.0.0.1:52959 ssh->tcp=12015239168 tcp->ssh=12015239168

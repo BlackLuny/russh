@@ -1,0 +1,151 @@
+{
+  "git_head": "2a29cc47c5bb2b5795469c511795b327aed68713",
+  "git_describe": "2a29cc4",
+  "openssh": "OpenSSH_9.6p1 Ubuntu-3ubuntu13.16, OpenSSL 3.0.13 30 Jan 2024",
+  "duration_secs": 7200.0,
+  "sample_secs": 300.0,
+  "results": [
+    {
+      "scenario": "1stream",
+      "streams": 1,
+      "elapsed_secs": 7200.3290021419525,
+      "duration_requested_secs": 7200.0,
+      "sample_secs": 300.0,
+      "stall_secs": 30.0,
+      "bytes_tx": 12015370240,
+      "bytes_rx": 12013273088,
+      "avg_mbps_tx": 13.349801362049616,
+      "avg_mbps_rx": 13.34747129963233,
+      "mismatches": 0,
+      "stream_errors": 0,
+      "anomaly_samples": 0,
+      "proxy_exit": -15,
+      "ssh_exit": 0,
+      "ok": true,
+      "per_stream": [
+        {
+          "idx": 0,
+          "bytes_tx": 12015370240,
+          "bytes_rx": 12013273088,
+          "idle_secs": 0.02,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        }
+      ],
+      "error_excerpts": []
+    },
+    {
+      "scenario": "8stream",
+      "streams": 8,
+      "elapsed_secs": 7200.1788494586945,
+      "duration_requested_secs": 7200.0,
+      "sample_secs": 300.0,
+      "stall_secs": 30.0,
+      "bytes_tx": 96122175488,
+      "bytes_rx": 96106381312,
+      "avg_mbps_tx": 106.79976428110689,
+      "avg_mbps_rx": 106.78221563257443,
+      "mismatches": 0,
+      "stream_errors": 0,
+      "anomaly_samples": 0,
+      "proxy_exit": -15,
+      "ssh_exit": 0,
+      "ok": true,
+      "per_stream": [
+        {
+          "idx": 0,
+          "bytes_tx": 12015239168,
+          "bytes_rx": 12013338624,
+          "idle_secs": 0.018,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 1,
+          "bytes_tx": 12015304704,
+          "bytes_rx": 12013404160,
+          "idle_secs": 0.018,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 2,
+          "bytes_tx": 12015304704,
+          "bytes_rx": 12013404160,
+          "idle_secs": 0.018,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 3,
+          "bytes_tx": 12015304704,
+          "bytes_rx": 12013404160,
+          "idle_secs": 0.018,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 4,
+          "bytes_tx": 12015304704,
+          "bytes_rx": 12013404160,
+          "idle_secs": 0.018,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 5,
+          "bytes_tx": 12015239168,
+          "bytes_rx": 12013142016,
+          "idle_secs": 0.02,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 6,
+          "bytes_tx": 12015239168,
+          "bytes_rx": 12013142016,
+          "idle_secs": 0.02,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        },
+        {
+          "idx": 7,
+          "bytes_tx": 12015239168,
+          "bytes_rx": 12013142016,
+          "idle_secs": 0.02,
+          "mismatches": 0,
+          "stalled": false,
+          "dead": false,
+          "error_count": 0,
+          "last_error": null
+        }
+      ],
+      "error_excerpts": []
+    }
+  ],
+  "all_ok": true
+}

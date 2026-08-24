@@ -1,0 +1,33 @@
+[churn] start workers=143 target_inflight=100 life=5.0-30.0s cool=5.0-10.0s duration=7200.0s ssh=127.0.0.1:35513 echo=34767 local=55915
+[churn] t=5.0min sample=1 inflight=99/100 opened=1766 estab=398 tw=706 fw1=0 fw2=0 cw=0 tx=3716.17 MiB rate=103.91 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=10.0min sample=2 inflight=94/100 opened=3499 estab=378 tw=695 fw1=0 fw2=0 cw=0 tx=7453.78 MiB rate=104.51 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=15.0min sample=3 inflight=104/100 opened=5225 estab=418 tw=692 fw1=0 fw2=0 cw=0 tx=11173.86 MiB rate=104.02 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=20.0min sample=4 inflight=98/100 opened=6929 estab=394 tw=671 fw1=0 fw2=0 cw=0 tx=14895.78 MiB rate=104.07 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=25.0min sample=5 inflight=96/100 opened=8674 estab=386 tw=706 fw1=0 fw2=0 cw=0 tx=18559.88 MiB rate=102.46 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=30.0min sample=6 inflight=96/100 opened=10393 estab=386 tw=706 fw1=0 fw2=0 cw=0 tx=22259.73 MiB rate=103.46 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=35.0min sample=7 inflight=112/100 opened=12101 estab=450 tw=670 fw1=0 fw2=0 cw=0 tx=25978.68 MiB rate=103.99 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=40.0min sample=8 inflight=100/100 opened=13799 estab=406 tw=690 fw1=0 fw2=0 cw=0 tx=29689.81 MiB rate=103.77 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=45.0min sample=9 inflight=101/100 opened=15499 estab=410 tw=680 fw1=0 fw2=0 cw=0 tx=33416.88 MiB rate=104.22 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=50.0min sample=10 inflight=101/100 opened=17200 estab=402 tw=678 fw1=0 fw2=0 cw=0 tx=37129.23 MiB rate=103.80 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=55.0min sample=11 inflight=101/100 opened=18924 estab=406 tw=706 fw1=0 fw2=0 cw=0 tx=40663.84 MiB rate=98.83 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=60.0min sample=12 inflight=93/100 opened=20661 estab=374 tw=698 fw1=0 fw2=0 cw=0 tx=44414.45 MiB rate=104.87 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=65.0min sample=13 inflight=102/100 opened=22374 estab=410 tw=686 fw1=0 fw2=0 cw=0 tx=48158.07 MiB rate=104.68 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=70.0min sample=14 inflight=101/100 opened=24096 estab=406 tw=670 fw1=0 fw2=0 cw=0 tx=51894.75 MiB rate=104.49 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=75.0min sample=15 inflight=96/100 opened=25824 estab=386 tw=710 fw1=0 fw2=0 cw=0 tx=55647.41 MiB rate=104.93 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=80.0min sample=16 inflight=106/100 opened=27566 estab=426 tw=704 fw1=0 fw2=0 cw=0 tx=59368.47 MiB rate=104.05 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=85.0min sample=17 inflight=96/100 opened=29274 estab=382 tw=690 fw1=0 fw2=0 cw=0 tx=63114.39 MiB rate=104.74 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=90.0min sample=18 inflight=96/100 opened=30986 estab=386 tw=700 fw1=0 fw2=0 cw=0 tx=66839.83 MiB rate=104.17 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=95.0min sample=19 inflight=93/100 opened=32689 estab=374 tw=706 fw1=0 fw2=0 cw=0 tx=70569.18 MiB rate=104.28 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=100.0min sample=20 inflight=101/100 opened=34418 estab=406 tw=677 fw1=0 fw2=0 cw=0 tx=74298.64 MiB rate=104.28 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=105.0min sample=21 inflight=102/100 opened=36137 estab=410 tw=685 fw1=0 fw2=0 cw=0 tx=78024.83 MiB rate=104.19 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=110.0min sample=22 inflight=101/100 opened=37854 estab=406 tw=688 fw1=0 fw2=0 cw=0 tx=81754.91 MiB rate=104.30 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=115.0min sample=23 inflight=107/100 opened=39549 estab=430 tw=675 fw1=0 fw2=0 cw=0 tx=85492.68 MiB rate=104.52 Mbit/s proxy=up ssh=up flags=ok
+[churn] t=120.0min sample=24 inflight=106/100 opened=41248 estab=426 tw=686 fw1=0 fw2=0 cw=0 tx=89207.43 MiB rate=103.87 Mbit/s proxy=up ssh=up flags=ok
+[churn] done ok=True anomalies=0 opened=41248 closed=41248 inflight_max=131 tx=89207.43 MiB tw_fails=0
+{
+  "all_ok": true,
+  "scenarios": [
+    "churn"
+  ]
+}
+CHURN_EXIT:0
